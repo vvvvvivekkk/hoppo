@@ -301,18 +301,46 @@ proves their open socket is dropped and their refresh token and access token
 stop working. A failure is one `FAIL` line naming the route and what came
 back. Each run leaves one more approved shop behind.
 
+## `walk-api.py` - the web app's calls, in the web app's order
+
+```bash
+python3 -I apps/api/test/walk-api.py [API_BASE]
+```
+
+Not a race and not a re-test of the API: it makes the calls `apps/web` makes,
+in the order its screens make them, and checks that every field a screen reads
+is actually in the response (about 180 checks). A screen can typecheck against
+a hand-written response type and still read a field the server never sends.
+It signs in as the student, browses, quotes, is refused a stale total
+(`PRICE_CHANGED`, with both totals in `details`), places an order, has the
+shop accept and ready it, takes it as the rider once the dispatcher offers it,
+picks up, is refused a wrong handover code, completes with the right one, and
+confirms the student's order detail never carries the rider's contact number.
+The rider stands at a delivery point the API returned and goes online before
+the shop readies the order, because an offer only goes to riders who were in
+range and online when it was broadcast. A failure is a list of lines such as
+`order detail: missing field task.status` or `accept: 409 NOT_OFFERED_TO_YOU`.
+Standard library only; it needs the accounts `fixtures.py` creates.
+
+The second walk drives the web app itself in a headless browser at a phone
+viewport (sign-up errors, the verify gates, search, cart, checkout, a
+two-person delivery with a real offer over the rider's socket and the handover
+code over the student's, a ceiling on `GET /auth/me`, and the screens' wording
+for a changed price, an escalated delivery, an order collected in person and a
+rider timed out for silence). It needs Playwright, which is not a dependency
+of this repository, so it lives outside it (`$WALK_DIR/pw/browser.mjs`);
+`run-all.sh` runs it when it is there and prints `SKIP` when it is not.
+
 ### `run-all.sh` - everything, in order
 
 Runs `fixtures.py`, both walks, the access checks and the nine harnesses in
 sequence against one API base and one web origin, prints one `PASS` / `FAIL`
 / `BLOCKED` line each, and exits non-zero unless all of them passed (3 if the
-fixtures could not be created, in which case nothing else is run). A check that dies because
-the watch-mode API restarted under it is retried once after twenty seconds.
-The two walks live outside the repository (`WALK_DIR`, default
-`/home/claude/walk`) because the browser walk needs Playwright, which is not a
-repository dependency; `SKIP_WALKS=1` runs the harnesses alone, and
-`SKIP_SLOW=1` leaves out `race-unfulfilled.py`. A full run takes about twelve
-minutes. Full output
+fixtures could not be created, in which case nothing else is run). A check
+that dies because the watch-mode API restarted under it is retried once after
+twenty seconds. `SKIP_WALKS=1` runs the harnesses alone, `SKIP_BROWSER=1`
+leaves out only the browser walk, and `SKIP_SLOW=1` leaves out
+`race-unfulfilled.py`. A full run takes about fifteen minutes. Full output
 for each check is kept in the log directory it prints.
 
 Run it on a quiet stack. The harnesses and walks use the seeded rider

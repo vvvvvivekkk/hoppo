@@ -209,9 +209,38 @@ def make_room(who: str, route: str, needed: int) -> None:
 
 
 def require_api() -> None:
-    status, _ = http("GET", "/health")
+    """
+    Is everything these checks stand on actually up? PostgreSQL, Redis and the
+    API, asked in that order and each by name, so that "the container
+    restarted and took the database with it" reads as exactly that rather
+    than as forty failed assertions.
+    """
+    if not DATABASE_URL:
+        raise Blocked("database: no DATABASE_URL in the environment or apps/api/.env")
+    try:
+        out = subprocess.run(["psql", DATABASE_URL, "-qtAc", "SELECT 1"], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        raise Blocked("database: the psql client is not installed")
+    except subprocess.TimeoutExpired:
+        raise Blocked("database: PostgreSQL did not answer within 15 seconds")
+    if out.returncode != 0 or out.stdout.strip() != "1":
+        reason = (out.stderr.strip().splitlines() or ["no answer"])[-1]
+        raise Blocked(f"database: PostgreSQL is not up or not reachable ({reason})")
+    try:
+        pong = subprocess.run(["redis-cli", "-u", REDIS_URL, "--no-auth-warning", "PING"],
+                              capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        raise Blocked("redis: the redis-cli client is not installed")
+    except subprocess.TimeoutExpired:
+        raise Blocked("redis: Redis did not answer within 10 seconds")
+    if pong.stdout.strip() != "PONG":
+        reason = ((pong.stderr or pong.stdout).strip().splitlines() or ["no answer"])[-1]
+        raise Blocked(f"redis: Redis is not up or not reachable at {REDIS_URL} ({reason})")
+    status, body = http("GET", "/health")
     if status != 200:
-        raise Blocked(f"API not answering at {BASE} (GET /health -> {status})")
+        why = body.get("message") if status == 0 else f"GET /health -> {status}"
+        raise Blocked(f"api: the API is not answering at {BASE} ({why}); if it runs in watch mode, "
+                      "check its log for a compile error")
 
 
 # --------------------------------------------------------------------------

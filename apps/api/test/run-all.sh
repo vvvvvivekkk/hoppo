@@ -13,9 +13,10 @@
 # own). The browser walk drives WEB_URL, and that web app talks to whatever
 # API it was built to talk to (NEXT_PUBLIC_API_URL) - pass the matching pair.
 #
-#   WALK_DIR  where flow.py and pw/browser.mjs live (default /home/claude/walk).
-#             They are kept outside the repository because the browser walk
-#             needs Playwright, which is deliberately not a repo dependency.
+#   WALK_DIR  where pw/browser.mjs lives (default /home/claude/walk). The
+#             browser walk is kept outside the repository because it needs
+#             Playwright, which is deliberately not a repo dependency; the API
+#             walk (walk-api.py) is in this directory.
 #   SKIP_WALKS=1     harnesses only
 #   SKIP_SLOW=1      leave out race-unfulfilled (about four minutes on its own)
 #   SKIP_BROWSER=1   everything but the browser walk
@@ -31,7 +32,7 @@ WEB="${2:-${WEB_URL:-http://localhost:3000}}"
 WALK_DIR="${WALK_DIR:-/home/claude/walk}"
 LOG_DIR="${LOG_DIR:-$(mktemp -d /tmp/hoppo-run-all.XXXXXX)}"
 mkdir -p "$LOG_DIR"
-export HOPPO_API_BASE="$BASE" WEB_URL="$WEB"
+export HOPPO_API_BASE="$BASE" WEB_URL="$WEB" HOPPO_REPO="$(cd "$HERE/../../.." && pwd)"
 
 echo "API  $BASE"
 echo "WEB  $WEB"
@@ -77,16 +78,19 @@ run() {  # name, timeout seconds, command...
 # fixtures cannot be put in place, stop here and say so.
 timeout 600 python3 -I "$HERE/fixtures.py" "$BASE" >"$LOG_DIR/fixtures.log" 2>&1
 fixtures_code=$?
-if [ "$fixtures_code" -ne 0 ] && grep -qiE 'not answering|not reachable|connection refused' "$LOG_DIR/fixtures.log"; then
+if [ "$fixtures_code" -ne 0 ] && grep -qiE 'BLOCKED - api:|lost the API|not reachable at http|NO_RESPONSE|-> 0 ' "$LOG_DIR/fixtures.log"; then
   echo "        fixtures lost the API; waiting 20s and running them once more"
   sleep 20
   timeout 600 python3 -I "$HERE/fixtures.py" "$BASE" >"$LOG_DIR/fixtures.log" 2>&1
   fixtures_code=$?
 fi
 if [ "$fixtures_code" -ne 0 ]; then
-  printf '%-7s %-22s %s\n' BLOCKED fixtures "$(grep -E '^RESULT:' "$LOG_DIR/fixtures.log" | tail -1)"
+  # One line saying which of database / redis / api / a fixture it was.
+  reason="$(grep -aE '^RESULT:' "$LOG_DIR/fixtures.log" | tail -1)"
+  [ -z "$reason" ] && reason="RESULT: BLOCKED - fixtures.py crashed: $(tail -1 "$LOG_DIR/fixtures.log")"
+  printf '%-7s %-22s %s\n' BLOCKED fixtures "$reason"
   echo
-  echo "The fixtures could not be created, so nothing else was run. See $LOG_DIR/fixtures.log"
+  echo "Nothing else was run. See $LOG_DIR/fixtures.log"
   exit 3
 fi
 record fixtures 0 "$LOG_DIR/fixtures.log"
@@ -95,11 +99,7 @@ record fixtures 0 "$LOG_DIR/fixtures.log"
 # login route allows ten a minute per address; and they use the one seeded
 # rider, who should not be looking at offers left over from a race.
 if [ "${SKIP_WALKS:-0}" != 1 ]; then
-  if [ -f "$WALK_DIR/flow.py" ]; then
-    run walk-api 300 python3 -I "$WALK_DIR/flow.py" "$BASE"
-  else
-    summary+=("SKIP    walk-api               $WALK_DIR/flow.py not found"); echo "${summary[-1]}"
-  fi
+  run walk-api 300 python3 -I "$HERE/walk-api.py" "$BASE"
   if [ "${SKIP_BROWSER:-0}" != 1 ]; then
     if [ -f "$WALK_DIR/pw/browser.mjs" ] && [ -d "$WALK_DIR/pw/node_modules/playwright" ]; then
       run walk-browser 600 bash -c "cd '$WALK_DIR/pw' && node browser.mjs '$WEB' '$BASE'"
