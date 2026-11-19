@@ -36,6 +36,16 @@ export class ApiError extends Error {
     );
   }
 
+  /**
+   * FR-SVER-08: the account itself is suspended or closed, as opposed to the
+   * session merely having expired. Null for every other error.
+   */
+  get accountBlocked(): 'SUSPENDED' | 'DEACTIVATED' | null {
+    if (this.code === 'ACCOUNT_SUSPENDED') return 'SUSPENDED';
+    if (this.code === 'ACCOUNT_DEACTIVATED') return 'DEACTIVATED';
+    return null;
+  }
+
   /** FR-SVER-01: the caller is registered but not yet verified. */
   get needsVerification(): boolean {
     return this.code === 'VERIFICATION_REQUIRED';
@@ -44,6 +54,37 @@ export class ApiError extends Error {
   /** FR-DLV-04: another rider won the task. Not an error to apologise for. */
   get isAlreadyTaken(): boolean {
     return this.code === 'ALREADY_TAKEN';
+  }
+
+  /**
+   * FR-DLV-04: an accept that lost for a reason other than another rider
+   * winning — the offer lapsed, was never this rider's, or the task moved on.
+   * The offer card should be dropped, not retried. `ALREADY_TAKEN` is kept
+   * apart under `isAlreadyTaken` because it reads differently ("too slow").
+   */
+  get isOfferGone(): boolean {
+    return [
+      'OFFER_EXPIRED',
+      'NOT_OFFERED_TO_YOU',
+      'NOT_YET_OFFERED',
+      'OFFER_CLOSED',
+      'TASK_CANCELLED',
+      'TASK_FINISHED',
+    ].includes(this.code);
+  }
+
+  /**
+   * The order moved on between the screen loading and the button being
+   * pressed (409). Reload the order and show its real state rather than an
+   * error.
+   */
+  get isStaleState(): boolean {
+    return this.code === 'ORDER_STATE_CHANGED' || this.code === 'ORDER_NOT_READY';
+  }
+
+  /** FR-SVER-08: boolean form of `accountBlocked`. */
+  get isAccountBlocked(): boolean {
+    return this.accountBlocked !== null;
   }
 
   get isRateLimited(): boolean {

@@ -68,6 +68,12 @@ export const redisKeys = {
   dispatchChannel: (collegeId: string) => `dispatch:${collegeId}`,
   /** Short-lived guard so two dispatcher ticks cannot process one task. */
   dispatchLock: (taskId: string) => `lock:dispatch:${taskId}`,
+  /**
+   * Set of rider ids one task was offered to in its current search (M8). The
+   * string is the one DispatchService already writes; do not change it
+   * without draining the live keys.
+   */
+  offeredRiders: (taskId: string) => `dispatch:offered:${taskId}`,
 } as const;
 
 /** Notification categories a student may toggle (FR-NOTF-03). */

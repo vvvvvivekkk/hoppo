@@ -155,10 +155,7 @@ export function endpoints(client: ApiClient) {
         categoryId: string,
         body: { name?: string; sortOrder?: number },
       ) =>
-        client.patch<CatalogCategory>(
-          `/shops/${listingId}/catalog/categories/${categoryId}`,
-          body,
-        ),
+        client.patch<CatalogCategory>(`/shops/${listingId}/catalog/categories/${categoryId}`, body),
 
       deleteCategory: (listingId: string, categoryId: string) =>
         client.delete<{ deleted: boolean; itemsUncategorised: number; message: string }>(
@@ -185,10 +182,11 @@ export function endpoints(client: ApiClient) {
       setHours: (
         listingId: string,
         hours: { dayOfWeek: number; openMinute: number; closeMinute: number }[],
-      ) => client.put<{ hours: Catalog['hours']; message: string }>(
-        `/shops/${listingId}/catalog/hours`,
-        { hours },
-      ),
+      ) =>
+        client.put<{ hours: Catalog['hours']; message: string }>(
+          `/shops/${listingId}/catalog/hours`,
+          { hours },
+        ),
 
       setClosure: (listingId: string, reopenAt: string, note?: string) =>
         client.post<{ temporarilyClosedUntil: string; note: string | null; message: string }>(
@@ -293,7 +291,11 @@ export function endpoints(client: ApiClient) {
         client.get<{
           status: 'UNSUBMITTED' | 'PENDING' | 'VERIFIED' | 'REJECTED';
           verifiedAt: string | null;
-          profile: { rollNumber: string | null; department: string | null; yearOfStudy: number | null };
+          profile: {
+            rollNumber: string | null;
+            department: string | null;
+            yearOfStudy: number | null;
+          };
           latestSubmission: {
             id: string;
             status: string;
@@ -304,6 +306,12 @@ export function endpoints(client: ApiClient) {
           } | null;
           submissionsUsed: number;
           submissionsAllowed: number;
+          /**
+           * When the rolling submission window next frees an attempt. The API
+           * does not send this on `/verification/me` yet (only inside the
+           * `SUBMISSION_LIMIT_REACHED` error), so treat it as usually absent.
+           */
+          retryAt?: string | null;
           unlocked: {
             browseShops: boolean;
             placeOrders: boolean;
@@ -352,8 +360,7 @@ export function endpoints(client: ApiClient) {
         client.get<{ query: string; items: ItemSearchResult[] }>('/browse/items', { q }),
 
       /** The drop points offered at checkout. */
-      deliveryPoints: () =>
-        client.get<{ points: DeliveryPoint[] }>('/browse/delivery-points'),
+      deliveryPoints: () => client.get<{ points: DeliveryPoint[] }>('/browse/delivery-points'),
     },
 
     orders: {
@@ -361,7 +368,13 @@ export function endpoints(client: ApiClient) {
       quote: (body: OrderRequestBody) => client.post<OrderQuote>('/orders/quote', body),
 
       /** FR-ORD-04 */
-      place: (body: OrderRequestBody & { paymentMethod: string; expectedTotalMinor: number; studentNote?: string }) =>
+      place: (
+        body: OrderRequestBody & {
+          paymentMethod: string;
+          expectedTotalMinor: number;
+          studentNote?: string;
+        },
+      ) =>
         client.post<{
           orderId: string;
           reference: string;
@@ -384,7 +397,10 @@ export function endpoints(client: ApiClient) {
         ),
 
       /** FR-DLV-07 */
-      resolveUnfulfilled: (orderId: string, choice: 'KEEP_WAITING' | 'COLLECT_IN_PERSON' | 'CANCEL') =>
+      resolveUnfulfilled: (
+        orderId: string,
+        choice: 'KEEP_WAITING' | 'COLLECT_IN_PERSON' | 'CANCEL',
+      ) =>
         client.post<{ orderId: string; choice: string; message: string }>(
           `/orders/${orderId}/unfulfilled`,
           { choice },
@@ -464,7 +480,12 @@ export function endpoints(client: ApiClient) {
     },
 
     uploads: {
-      url: (body: { kind: string; contentType: string; sizeBytes: number; originalFilename?: string }) =>
+      url: (body: {
+        kind: string;
+        contentType: string;
+        sizeBytes: number;
+        originalFilename?: string;
+      }) =>
         client.post<{ uploadUrl: string; key: string; expiresInSeconds: number }>(
           '/uploads/url',
           body,

@@ -20,8 +20,16 @@ export interface TokenStore {
 export interface ApiClientOptions {
   baseUrl: string;
   tokens: TokenStore;
-  /** Called when the session is unrecoverable, so the UI can send them to login. */
-  onAuthFailure?: () => void;
+  /**
+   * Called when the session is unrecoverable, so the UI can send them to login.
+   *
+   * Handed the error that ended it when there is one, because "your session
+   * expired" and "your account was suspended" need different screens: the
+   * API's JWT guard answers a suspended account with a 401 carrying
+   * `ACCOUNT_SUSPENDED`, and without the error here the UI could only treat
+   * both as a plain sign-out.
+   */
+  onAuthFailure?: (error?: ApiError) => void;
   /** Request timeout in milliseconds. */
   timeoutMs?: number;
 }
@@ -110,16 +118,20 @@ export class ApiClient {
       }
 
       await this.options.tokens.clear();
-      this.options.onAuthFailure?.();
+
+      try {
+        return await this.unwrap<T>(response);
+      } catch (error) {
+        this.options.onAuthFailure?.(error instanceof ApiError ? error : undefined);
+        throw error;
+      }
     }
 
     return this.unwrap<T>(response);
   }
 
   private async send(path: string, opts: RequestOptions): Promise<Response> {
-    const url = new URL(
-      `${this.options.baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`,
-    );
+    const url = new URL(`${this.options.baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`);
 
     for (const [key, value] of Object.entries(opts.query ?? {})) {
       if (value !== undefined) url.searchParams.set(key, String(value));
@@ -133,9 +145,7 @@ export class ApiClient {
     }
 
     const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 20_000);
-    const signal = opts.signal
-      ? AbortSignal.any([opts.signal, timeout])
-      : timeout;
+    const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
 
     try {
       return await fetch(url, {
@@ -189,14 +199,11 @@ export class ApiClient {
       if (!current?.refreshToken) return false;
 
       try {
-        const response = await fetch(
-          `${this.options.baseUrl.replace(/\/$/, '')}/auth/refresh`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refreshToken: current.refreshToken }),
-          },
-        );
+        const response = await fetch(`${this.options.baseUrl.replace(/\/$/, '')}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: current.refreshToken }),
+        });
 
         if (!response.ok) return false;
 

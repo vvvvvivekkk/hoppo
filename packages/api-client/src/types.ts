@@ -285,6 +285,12 @@ export interface ShopDetail {
     sortOrder: number;
     items: CatalogItem[];
   }[];
+  /**
+   * Items the shop has not filed under any category. A shop that never set
+   * categories up has its whole menu here, so a screen that renders only
+   * `categories` shows it as empty.
+   */
+  uncategorised: CatalogItem[];
 }
 
 export interface ItemSearchResult {
@@ -501,4 +507,48 @@ export interface TaskOffer {
   expectedReadyAt: string | null;
   expiresAt: string;
   acceptanceWindowSeconds: number;
+  /**
+   * ADR-006: on a cash order, what the rider hands the shop and what they
+   * collect at the door. Optional because older API builds do not send them;
+   * absent or zero means there is no cash leg to show.
+   */
+  cashToPayShopMinor?: number;
+  cashToCollectMinor?: number;
 }
+
+/**
+ * `task:offer:withdrawn` (FR-DLV-05), as DispatchGateway.withdrawOffer emits
+ * it. The winner's copy carries their own id and `won: true`; every other
+ * rider's carries `winnerUserId: null` and `won: false` — nobody is told who
+ * won.
+ */
+export interface TaskOfferWithdrawn {
+  taskId: string;
+  winnerUserId: string | null;
+  won: boolean;
+}
+
+/**
+ * `task:status`, which carries two different payloads on one event name.
+ *
+ * DispatchGateway.notifyTaskStatus sends `{ taskId, status, ...extra }`; the
+ * extras the API sends today are `reason` (a rider released or the task
+ * escalated), `riderId` (on ASSIGNED) and `choices` (on UNFULFILLED).
+ * DispatchGateway.notifyWorkModeDisabled (FR-WM-06) sends the second shape,
+ * which has no task in it at all. Tell them apart with `'type' in event` or
+ * `event.type === 'WORK_MODE_DISABLED'`.
+ */
+export type TaskStatusEvent =
+  | {
+      type?: undefined;
+      taskId: string;
+      status: string;
+      reason?: string;
+      riderId?: string;
+      choices?: string[];
+    }
+  | {
+      type: 'WORK_MODE_DISABLED';
+      reason: 'IDLE_TIMEOUT';
+      afterMinutes: number;
+    };
