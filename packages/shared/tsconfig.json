@@ -3,8 +3,15 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./src",
-    "module": "esnext",
-    "moduleResolution": "bundler"
+    // CommonJS, because the API runs this directly under Node. Bundlers
+    // (Next.js, Metro for Expo) consume CommonJS without complaint, so one
+    // build output serves every consumer.
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "**/*.spec.ts"]

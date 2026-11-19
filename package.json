@@ -12,7 +12,7 @@
     "dev:dashboard": "pnpm --filter @hoppo/dashboard dev",
     "dev:admin": "pnpm --filter @hoppo/admin dev",
     "dev:mobile": "pnpm --filter @hoppo/mobile start",
-    "build": "pnpm -r build",
+    "build": "pnpm --filter @hoppo/shared build && pnpm -r --filter \"!@hoppo/shared\" build",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",

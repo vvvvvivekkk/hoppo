@@ -1,0 +1,13 @@
+{
+  // Build output comes from tsconfig.json, whose rootDir is src/ so that
+  // `node dist/main.js` works. The seed lives in prisma/, outside that root,
+  // so typechecking it needs a config without rootDir. Same compiler
+  // settings, no emit.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": null,
+    "incremental": false
+  },
+  "include": ["src/**/*", "prisma/**/*"]
+}

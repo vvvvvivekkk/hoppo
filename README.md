@@ -17,8 +17,8 @@ that document so any line can be traced to the thing it implements.
 | Phase | Scope | State |
 |---|---|---|
 | 1A | Monorepo, data model, integrity constraints, shared business rules | **done** |
-| 1B | Auth, tenancy enforcement, student verification | next |
-| 1C | Shop registration with radius validation, catalog | |
+| 1B | Auth, tenancy enforcement, student verification | **done** |
+| 1C | Shop registration with radius validation, catalog | next |
 | 1D | Ordering, dispatcher, first-accept assignment, OTP handover | |
 | 1E | Shop dashboard, admin console | |
 | 1F | Student mobile app | |
@@ -93,6 +93,17 @@ After seeding, the password for all of these is `Hoppo@dev123`:
 The seed also creates three shops: two inside the 3 km radius (92 m and 751 m
 from campus, both approved) and one 16.6 km away that is rejected — so the
 radius rule is visible without having to set it up by hand.
+
+### Browsing the API
+
+With the API running, `http://localhost:4000/api/docs` lists every endpoint
+with its request and response shapes. It is disabled in production, because it
+is a complete map of the service for anyone probing it.
+
+Health checks are at `/api/v1/health` (liveness — is the process up) and
+`/api/v1/health/ready` (readiness — can this instance serve, including whether
+PostGIS is actually present; without it, shop registration cannot validate a
+radius).
 
 ---
 
@@ -234,6 +245,16 @@ regardless. This is not legal advice; it is the conservative design.
   deployment (`NFR-M-01`).
 - **snake_case in the database, camelCase in TypeScript.** Each side gets the
   convention it expects; Prisma's `@map` bridges them.
+- **Every query is tenant-scoped, and the rule is short enough to check.**
+  Every Prisma query in a feature module either spreads `tenant.scope(user)`
+  into its `where`, or passes its result through `tenant.assertSameTenant`.
+  There is no third option, and that makes constraint `C-1` reviewable rather
+  than a matter of trust.
+- **Guards are global; endpoints opt out.** Authentication, roles and
+  verification are applied in `AppModule`, and an endpoint opts out with
+  `@Public()`. A new endpoint that forgets a decorator is merely inconvenient;
+  a new endpoint that forgets to *add* a guard is a data leak. The safe case is
+  the default.
 
 ## Licence
 
