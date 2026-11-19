@@ -12,9 +12,16 @@ import {
   VerificationQueueQueryDto,
 } from './dto/verification.dto';
 
-/** The student's own view of their verification (S-07, S-08, S-09). */
+/**
+ * The student's own view of their verification (S-07, S-08, S-09).
+ *
+ * @Roles('STUDENT') on the controller: identity verification and rider terms
+ * exist only for student accounts. Without it these were open to any
+ * signed-in role and relied on "no student profile" turning into a 404.
+ */
 @ApiTags('verification')
 @Controller('verification')
+@Roles('STUDENT')
 export class VerificationController {
   constructor(private readonly verification: VerificationService) {}
 

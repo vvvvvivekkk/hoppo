@@ -6,6 +6,7 @@ import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AllowUnapprovedShop } from '../common/decorators/allow-unapproved-shop.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import {
   LoginDto,
@@ -115,7 +116,8 @@ export class AuthController {
     return this.auth.refresh(dto.refreshToken, this.ctx(req));
   }
 
-  /** FR-AUTH-05 */
+  /** FR-AUTH-05. Open to an unapproved shop account: anyone may sign out. */
+  @AllowUnapprovedShop()
   @Post('logout')
   @HttpCode(200)
   @ApiOperation({ summary: 'Log out of this device, or all devices' })
@@ -150,7 +152,14 @@ export class AuthController {
     return this.auth.resetPassword(dto, this.ctx(req));
   }
 
-  /** Who am I — used by every client on launch to restore session state. */
+  /**
+   * Who am I — used by every client on launch to restore session state.
+   *
+   * Open to an unapproved shop account, which needs it to restore its session
+   * and reach the "awaiting approval" screen. It returns the caller's own
+   * record and nothing about the college beyond its name.
+   */
+  @AllowUnapprovedShop()
   @Get('me')
   @ApiOperation({ summary: 'The authenticated user' })
   async me(@CurrentUser() user: AuthenticatedUser) {

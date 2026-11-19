@@ -2,6 +2,8 @@ import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@
 import { Reflector } from '@nestjs/core';
 import { REQUIRE_VERIFIED_KEY } from '../decorators/require-verified.decorator';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
+import { ROLES_KEY } from '../decorators/roles.decorator';
+import type { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '../types/authenticated-user';
 
 /**
@@ -33,8 +35,36 @@ export class VerifiedGuard implements CanActivate {
     const user = context.switchToHttp().getRequest().user as AuthenticatedUser | undefined;
     if (!user) throw new ForbiddenException('Not authenticated');
 
-    // Staff roles are not subject to student verification.
-    if (user.role !== 'STUDENT') return true;
+    // @RequireVerified means "a verified student". A shop, administrator or
+    // super-administrator login is not one, so it does not pass — this used
+    // to wave every non-student role through, which made the gate only as
+    // good as each controller remembering to add @Roles('STUDENT') as well.
+    //
+    // The one exception is a route that names the caller's role itself. A
+    // handler-level @Roles('STUDENT', 'SHOP_OWNER', ...) under a class-level
+    // @RequireVerified (GET /orders/:orderId) is an explicit statement that
+    // those staff roles belong there, and student verification has no meaning
+    // for them. A super administrator follows RolesGuard's rule: wherever any
+    // staff role is listed, they may go too.
+    if (user.role !== 'STUDENT') {
+      const roles =
+        this.reflector.getAllAndOverride<UserRole[]>(ROLES_KEY, [
+          context.getHandler(),
+          context.getClass(),
+        ]) ?? [];
+
+      const explicitlyAllowed =
+        user.role === 'SUPER_ADMIN'
+          ? roles.some((role) => role !== 'STUDENT')
+          : roles.includes(user.role);
+
+      if (explicitlyAllowed) return true;
+
+      throw new ForbiddenException({
+        code: 'STUDENT_ACCOUNT_REQUIRED',
+        message: 'This action is only available to verified student accounts.',
+      });
+    }
 
     if (!user.isVerified) {
       throw new ForbiddenException({

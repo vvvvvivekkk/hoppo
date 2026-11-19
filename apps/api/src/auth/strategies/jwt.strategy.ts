@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
+import { ShopAccessService, isShopRole } from '../../common/access/shop-access.service';
 import type { AccessTokenPayload, AuthenticatedUser } from '../../common/types/authenticated-user';
 
 /**
@@ -23,6 +24,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   constructor(
     config: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly shopAccess: ShopAccessService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -62,6 +64,14 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       });
     }
 
+    // A shop account exists from the moment of (public) registration, long
+    // before an administrator approves the shop. Whether it has been approved
+    // is looked up here, per request, so approval takes effect without a new
+    // login and ShopApprovalGuard can refuse everything else until then.
+    const shopApproved = isShopRole(user.role)
+      ? await this.shopAccess.hasApprovedShop(user.id)
+      : undefined;
+
     return {
       userId: user.id,
       collegeId: user.collegeId,
@@ -69,6 +79,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       // Read from the database, not from the token: a student verified two
       // minutes ago should not have to log out and back in to place an order.
       isVerified: user.studentProfile?.verificationStatus === 'VERIFIED',
+      ...(shopApproved === undefined ? {} : { shopApproved }),
     };
   }
 }

@@ -9,6 +9,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { AuditModule } from './audit/audit.module';
 import { TenantModule } from './common/tenant/tenant.module';
+import { AccessModule } from './common/access/access.module';
 import { AuthModule } from './auth/auth.module';
 import { VerificationModule } from './verification/verification.module';
 import { StorageModule } from './storage/storage.module';
@@ -22,6 +23,7 @@ import { HealthModule } from './health/health.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
+import { ShopApprovalGuard } from './common/guards/shop-approval.guard';
 import { VerifiedGuard } from './common/guards/verified.guard';
 import { UserThrottlerGuard } from './common/guards/user-throttler.guard';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -48,6 +50,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     RedisModule,
     AuditModule,
     TenantModule,
+    AccessModule,
     StorageModule,
     GeocodingModule,
 
@@ -68,10 +71,13 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     // and an IP bucket would let one rider consume the whole college's
     // allowance. See UserThrottlerGuard.
     //
-    // Then role, then verification. Each later guard relies on request.user
-    // existing, which only the authentication guard sets.
+    // Then shop approval, role, and verification. Each later guard relies on
+    // request.user existing, which only the authentication guard sets. Shop
+    // approval sits before the role check so that an unapproved shop account
+    // is told SHOP_NOT_APPROVED everywhere, not a different error per route.
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: UserThrottlerGuard },
+    { provide: APP_GUARD, useClass: ShopApprovalGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
     { provide: APP_GUARD, useClass: VerifiedGuard },
 

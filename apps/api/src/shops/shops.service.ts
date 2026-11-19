@@ -9,6 +9,8 @@ import { LocationType, Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import {
   DEFAULT_TIMEZONE,
+  RADIUS_MAX_M,
+  RADIUS_MIN_M,
   formatDistance,
   isRadiusInPermittedRange,
   resolveOpenState,
@@ -18,6 +20,7 @@ import { StorageService } from '../storage/storage.service';
 import { GeocodingService } from '../geocoding/geocoding.service';
 import { AuditAction, AuditService } from '../audit/audit.service';
 import { TenantService } from '../common/tenant/tenant.service';
+import { clampPageLimit } from '../common/pagination';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import type {
   DistanceCheckDto,
@@ -368,7 +371,11 @@ export class ShopsService {
   // =======================================================================
 
   /** FR-SHOP-10, FR-ADM-01, FR-ADM-02 */
-  async queue(user: AuthenticatedUser, limit = 25, cursor?: string) {
+  async queue(user: AuthenticatedUser, requestedLimit = 25, cursor?: string) {
+    // Clamped here as well as in the controller: `take: limit + 1` must never
+    // see NaN or an unbounded number, whoever the caller is.
+    const limit = clampPageLimit(requestedLimit);
+
     const where: Prisma.ShopListingWhereInput = {
       ...this.tenant.scope(user),
       status: 'PENDING_VERIFICATION',
@@ -648,6 +655,33 @@ export class ShopsService {
   // =======================================================================
   // Radius administration — FR-TEN-04, FR-TEN-05
   // =======================================================================
+
+  /**
+   * The college's current serviceable radius, with the permitted range.
+   *
+   * Scoped by the college on the token (C-1): there is no id in the request
+   * to tamper with. A super administrator belongs to no college, so
+   * `requireCollegeId` refuses them — the same as the PATCH below.
+   */
+  async currentRadius(user: AuthenticatedUser) {
+    const collegeId = this.tenant.requireCollegeId(user);
+
+    const config = await this.prisma.collegeConfig.findUnique({
+      where: { collegeId },
+      select: { serviceableRadiusM: true },
+    });
+
+    // The same fallback every other reader of the radius uses.
+    const serviceableRadiusM = config?.serviceableRadiusM ?? 3000;
+
+    return {
+      collegeId,
+      serviceableRadiusM,
+      serviceableRadiusLabel: formatDistance(serviceableRadiusM),
+      minRadiusM: RADIUS_MIN_M,
+      maxRadiusM: RADIUS_MAX_M,
+    };
+  }
 
   /**
    * FR-TEN-04 lets an administrator change the radius within 1 km to 5 km.
@@ -942,14 +976,47 @@ export class ShopsService {
           },
           orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
         },
+        // Items filed under no category. A shop that never set categories up
+        // has its whole menu here, and returning only `categories` made such
+        // a shop look empty to every student who opened it. Same shape and
+        // the same filter as the categorised items above.
+        items: {
+          where: { isDeleted: false, categoryId: null },
+          select: {
+            id: true,
+            name: true,
+            description: true,
+            priceMinor: true,
+            prepMinutes: true,
+            imageUrl: true,
+            isAvailable: true,
+            sortOrder: true,
+          },
+          orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        },
       },
     });
 
     this.tenant.assertSameTenant(user, listing, 'Shop');
 
-    // A student may not open a shop that is not approved, even by direct link.
-    if (listing!.status !== 'ACTIVE' && user.role === 'STUDENT') {
-      throw new NotFoundException({ code: 'SHOP_NOT_AVAILABLE', message: 'Shop not found' });
+    // Nobody opens a listing that is not approved by direct link, except the
+    // people who legitimately need to see it before approval: the shop's own
+    // owner and staff, and administrators. This used to exempt every
+    // non-student role, which let any shop owner in the college read a
+    // competitor's pending or suspended listing.
+    if (listing!.status !== 'ACTIVE') {
+      const isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+      const worksHere =
+        !isAdmin &&
+        (user.role === 'SHOP_OWNER' || user.role === 'SHOP_STAFF') &&
+        (await this.prisma.shopStaff.findUnique({
+          where: { shopId_userId: { shopId: listing!.shop.id, userId: user.userId } },
+          select: { userId: true },
+        })) !== null;
+
+      if (!isAdmin && !worksHere) {
+        throw new NotFoundException({ code: 'SHOP_NOT_AVAILABLE', message: 'Shop not found' });
+      }
     }
 
     const openState = resolveOpenState({
@@ -975,6 +1042,7 @@ export class ShopsService {
       closureNote: listing!.temporarilyClosedUntil ? listing!.closureNote : null,
       hours: listing!.hours,
       categories: listing!.categories,
+      uncategorised: listing!.items,
     };
   }
 

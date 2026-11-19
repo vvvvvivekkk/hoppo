@@ -4,6 +4,8 @@ import { Throttle } from '@nestjs/throttler';
 import { ShopsService } from './shops.service';
 import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
+import { AllowUnapprovedShop } from '../common/decorators/allow-unapproved-shop.decorator';
+import { clampPageLimit } from '../common/pagination';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import {
@@ -46,7 +48,14 @@ export class ShopsController {
     return this.shops.register(dto);
   }
 
-  /** D-07: the owner's own shops and their verification state. */
+  /**
+   * D-07: the owner's own shops and their verification state.
+   *
+   * @AllowUnapprovedShop because this is the screen an owner waits on: it is
+   * the one shop endpoint that must work before approval, and it returns only
+   * rows reached through the caller's own shop_staff membership.
+   */
+  @AllowUnapprovedShop()
   @Roles('SHOP_OWNER', 'SHOP_STAFF')
   @Get('mine')
   @ApiOperation({ summary: 'Shops I manage' })
@@ -123,7 +132,9 @@ export class AdminShopsController {
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
   ) {
-    return this.shops.queue(user, limit ? Number(limit) : 25, cursor);
+    // The raw query string is untrusted: "abc" was NaN (a 500 from Prisma)
+    // and a very large number was an unbounded read of the queue.
+    return this.shops.queue(user, clampPageLimit(limit), cursor);
   }
 
   /** NFR-S-03: access is logged. */
@@ -172,6 +183,16 @@ export class AdminShopsController {
 @Roles('ADMIN')
 export class AdminCollegeController {
   constructor(private readonly shops: ShopsService) {}
+
+  /**
+   * FR-TEN-04: the radius as it stands, so the settings screen can show it
+   * and tell a reduction from a widening before the administrator saves.
+   */
+  @Get('radius')
+  @ApiOperation({ summary: "My college's current serviceable radius" })
+  radius(@CurrentUser() user: AuthenticatedUser) {
+    return this.shops.currentRadius(user);
+  }
 
   /** FR-TEN-04, FR-TEN-05 */
   @Patch('radius')

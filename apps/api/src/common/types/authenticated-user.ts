@@ -15,6 +15,13 @@ export interface AuthenticatedUser {
   role: UserRole;
   /** True when the student's identity verification has been approved. */
   isVerified: boolean;
+  /**
+   * For SHOP_OWNER / SHOP_STAFF: true once an administrator has approved a
+   * listing of a shop this account belongs to. Read from the database on
+   * every request, never from the token. Absent for other roles, and
+   * ShopApprovalGuard treats absent as "not approved".
+   */
+  shopApproved?: boolean;
   /** Token family, so a refresh rotation can revoke the whole chain. */
   familyId?: string;
 }
