@@ -43,3 +43,7 @@ coverage/
 # local uploads during development
 uploads/
 tmp/
+
+# Runtime and build junk
+dump.rdb
+__pycache__/
