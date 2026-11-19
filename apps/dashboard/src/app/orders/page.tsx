@@ -2,7 +2,7 @@
 
 import { formatMinor } from '@hoppo/shared';
 import { ApiError, type MyShop, type ShopQueueOrder } from '@hoppo/api-client';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Banner, Button, Card, EmptyState, Status } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
@@ -24,6 +24,10 @@ export default function OrdersPage() {
   const [shops, setShops] = useState<MyShop[] | null>(null);
   const [shopError, setShopError] = useState<{ message: string; awaiting: boolean } | null>(null);
   const [retrying, setRetrying] = useState(false);
+  // The queue endpoint itself answered "not approved" for a listing that
+  // /shops/mine reads as ACTIVE. The queue is taken down when that happens,
+  // so nothing keeps asking an endpoint that has said no.
+  const [refused, setRefused] = useState(false);
 
   const loadShops = useCallback(async () => {
     try {
@@ -50,7 +54,9 @@ export default function OrdersPage() {
 
   const listing = shops?.flatMap((s) => s.listings).find((l) => l.id === listingId) ?? null;
   const waitingOnAdmin =
-    shopError?.awaiting === true || (listing !== null && listing.status !== 'ACTIVE');
+    refused ||
+    shopError?.awaiting === true ||
+    (listing !== null && listing.status !== 'ACTIVE');
 
   // An owner waiting for approval leaves this page open. Re-read the
   // registration every so often so that approval shows up without a reload.
@@ -112,14 +118,24 @@ export default function OrdersPage() {
     return <RegistrationStatus shopName={shopName} listing={listing} />;
   }
 
+  if (refused) {
+    return (
+      <div className="space-y-4">
+        <RegistrationStatus shopName={shopName} listing={listing} refused />
+        <Button tone="secondary" onClick={() => setRefused(false)}>
+          Check again
+        </Button>
+      </div>
+    );
+  }
+
   return (
     <Queue
       listingId={listing.id}
-      // The queue itself can be refused as "not approved" while /shops/mine
-      // still reads ACTIVE. Re-read the registration when that happens, and
-      // show its status in place of the queue.
-      onRefused={() => void loadShops()}
-      refusedPanel={<RegistrationStatus shopName={shopName} listing={listing} refused />}
+      onRefused={() => {
+        setRefused(true);
+        void loadShops();
+      }}
     />
   );
 }
@@ -135,8 +151,6 @@ export default function OrdersPage() {
 const ORDER_MOVED_ON: Record<string, string> = {
   ORDER_STATE_CHANGED:
     'That order changed while you were answering it — the student may have cancelled. The queue below is up to date.',
-  ORDER_NOT_READY:
-    'That order is not at that stage yet. The queue below is up to date.',
   NOT_AWAITING_ACCEPTANCE:
     'That order had already been answered. The queue below is up to date.',
   ACCEPT_WINDOW_EXPIRED:
@@ -149,11 +163,9 @@ const ORDER_GONE =
 function Queue({
   listingId,
   onRefused,
-  refusedPanel,
 }: {
   listingId: string;
   onRefused: () => void;
-  refusedPanel: ReactNode;
 }) {
   const { api } = useApi();
 
@@ -262,7 +274,9 @@ function Queue({
     }
   }
 
-  if (refused) return <>{refusedPanel}</>;
+  // The page replaces the queue with the registration status on this render
+  // or the next; until it has, show nothing rather than a stale queue.
+  if (refused) return null;
 
   const active = (data?.items ?? []).filter((o) => o.status !== 'PLACED');
 

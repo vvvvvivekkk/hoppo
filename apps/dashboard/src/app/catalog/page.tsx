@@ -5,7 +5,7 @@ import type { CatalogItem } from '@hoppo/api-client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, EmptyState, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
-import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
+import { canOperate, isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
 import { useListing } from '@/lib/use-listing';
 
 /**
@@ -29,8 +29,13 @@ export default function CatalogPage() {
   // handled before React re-renders would both read busy === false.
   const running = useRef(false);
 
+  // Asked of /shops/mine, which always answers. The menu and hours of a
+  // listing that is not ACTIVE are refused by the API, so they are not
+  // requested at all.
+  const operable = canOperate(listing);
+
   const load = useCallback(async () => {
-    if (!listingId) return;
+    if (!listingId || !operable) return;
     try {
       setCatalog(await api.catalog.get(listingId));
       setError(null);
@@ -44,7 +49,7 @@ export default function CatalogPage() {
         setError(describeError(e));
       }
     }
-  }, [api, listingId, reload]);
+  }, [api, listingId, operable, reload]);
 
   useEffect(() => {
     void load();
@@ -93,14 +98,16 @@ export default function CatalogPage() {
   // LISTING_NOT_EDITABLE), and one the API has just refused as unapproved
   // cannot either. Show where the registration stands rather than a form
   // whose every button fails.
-  if (refused || listing.status === 'REJECTED' || listing.status === 'SUSPENDED') {
+  if (refused || !operable) {
     return (
       <div className="space-y-6">
         <h1 className="text-3xl font-black tracking-tight">Menu</h1>
         <RegistrationStatus shopName={shop?.name} listing={listing} refused={refused} />
-        <p className="text-[var(--color-ink-faint)]">
-          The menu can be edited once the shop is approved.
-        </p>
+        {(refused || listing.status === 'PENDING_VERIFICATION') && (
+          <p className="text-[var(--color-ink-faint)]">
+            The menu can be edited once the shop is approved.
+          </p>
+        )}
       </div>
     );
   }

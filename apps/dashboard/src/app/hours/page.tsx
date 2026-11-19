@@ -4,7 +4,7 @@ import { formatMinuteOfDay } from '@hoppo/shared';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
-import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
+import { canOperate, isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
 import { useListing } from '@/lib/use-listing';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -67,8 +67,13 @@ export default function HoursPage() {
   const [loaded, setLoaded] = useState(false);
   const [refused, setRefused] = useState(false);
 
+  // Asked of /shops/mine, which always answers. The menu and hours of a
+  // listing that is not ACTIVE are refused by the API, so they are not
+  // requested at all.
+  const operable = canOperate(listing);
+
   const load = useCallback(async () => {
-    if (!listingId) return;
+    if (!listingId || !operable) return;
     try {
       const catalog = await api.catalog.get(listingId);
       const grouped: Record<number, Window[]> = {};
@@ -93,7 +98,7 @@ export default function HoursPage() {
         setError(describeError(e));
       }
     }
-  }, [api, listingId, reload]);
+  }, [api, listingId, operable, reload]);
 
   /** One change at a time, and never a second copy of the same one. */
   async function run(action: () => Promise<void>) {
@@ -196,14 +201,16 @@ export default function HoursPage() {
   }
   if (!listingId || !listing) return <Banner tone="warn">Register a shop first.</Banner>;
 
-  if (refused || listing.status === 'REJECTED' || listing.status === 'SUSPENDED') {
+  if (refused || !operable) {
     return (
       <div className="space-y-6">
         <h1 className="text-3xl font-black tracking-tight">Opening hours</h1>
         <RegistrationStatus shopName={shop?.name} listing={listing} refused={refused} />
-        <p className="text-[var(--color-ink-faint)]">
-          Opening hours can be set once the shop is approved.
-        </p>
+        {(refused || listing.status === 'PENDING_VERIFICATION') && (
+          <p className="text-[var(--color-ink-faint)]">
+            Opening hours can be set once the shop is approved.
+          </p>
+        )}
       </div>
     );
   }

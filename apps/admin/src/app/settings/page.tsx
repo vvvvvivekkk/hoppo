@@ -32,18 +32,14 @@ export default function SettingsPage() {
 
   const load = useCallback(async () => {
     try {
-      // The current radius has no endpoint of its own. Every flagged shop
-      // carries it, and so does every shop waiting in the approval queue, so
-      // both are read; with neither there is nothing to read it from, and the
-      // field says "not known" rather than showing a guess.
-      const [result, waiting] = await Promise.all([
+      // Two independent reads. The radius comes from its own endpoint; it is
+      // not inferred from whichever shops happen to be flagged or waiting.
+      const [current, result] = await Promise.all([
+        api.admin.radius(),
         api.admin.flaggedShops(),
-        api.admin.shopQueue(1).catch(() => null),
       ]);
+      setRadius(current.serviceableRadiusM);
       setFlagged(result.items);
-      setRadius(
-        (prev) => prev ?? result.items[0]?.currentRadiusM ?? waiting?.items[0]?.radiusM ?? null,
-      );
       setError(null);
     } catch (e) {
       setError(describeError(e));
@@ -103,7 +99,7 @@ export default function SettingsPage() {
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-semibold">Current</span>
             <span className="nums rounded-md bg-[var(--color-surface-sunken)] px-3 py-1 text-xl font-black">
-              {radius !== null ? formatDistance(radius) : 'not known yet'}
+              {radius !== null ? formatDistance(radius) : 'not loaded'}
             </span>
           </div>
 
@@ -120,9 +116,10 @@ export default function SettingsPage() {
           </div>
 
           {/*
-            With the current radius unknown, this page cannot tell whether a
-            choice widens or narrows it — so the FR-TEN-05 warning is given
-            regardless, instead of being silently skipped.
+            Only reachable when the radius read itself failed (the error is in
+            the banner above). Without it this page cannot tell a reduction
+            from a widening, so the FR-TEN-05 warning is given regardless
+            rather than silently skipped.
           */}
           {radius === null && pending !== null && (
             <Banner tone="warn">

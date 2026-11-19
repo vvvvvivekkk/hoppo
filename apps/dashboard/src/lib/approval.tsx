@@ -10,15 +10,15 @@ type Listing = MyShop['listings'][number];
  * The API's ways of saying "this shop is not approved (yet)".
  *
  * These are refusals, but they are not errors: the owner did nothing wrong
- * and there is nothing to retry. `LISTING_NOT_ACTIVE` is what the catalog
- * service sends today; `SHOP_NOT_APPROVED` is the code the shop endpoints are
- * moving to. Both mean the same thing to the person at the counter — the
- * registration is still with the campus administrator.
+ * and there is nothing to retry. `SHOP_NOT_APPROVED` is what the API's
+ * ShopApprovalGuard answers a shop account with on every endpoint except
+ * /shops/mine, /auth/me and /auth/logout until an administrator has approved
+ * a listing. `LISTING_NOT_ACTIVE` is the catalog service's own refusal, now
+ * only reachable by an account that has another, approved listing. Both mean
+ * the same thing to the person at the counter.
  */
-const AWAITING_APPROVAL_CODES = new Set(['SHOP_NOT_APPROVED', 'LISTING_NOT_ACTIVE']);
-
 export function isAwaitingApproval(error: unknown): boolean {
-  return error instanceof ApiError && AWAITING_APPROVAL_CODES.has(error.code);
+  return error instanceof ApiError && error.isAwaitingShopApproval;
 }
 
 /** The administrator's controlled list of reasons, in words (FR-SHOP-11). */
@@ -32,6 +32,18 @@ const REJECTION_REASONS: Record<string, string> = {
 
 function rejectionReason(reason: string): string {
   return REJECTION_REASONS[reason] ?? reason.toLowerCase().replace(/_/g, ' ');
+}
+
+/**
+ * Whether the API will serve this listing's queue, menu and hours at all.
+ *
+ * Only an ACTIVE listing: a pending or rejected one is refused with
+ * SHOP_NOT_APPROVED, and a suspended one with LISTING_NOT_EDITABLE. The
+ * screens ask /shops/mine (always allowed) and use this to decide whether to
+ * make the other requests, rather than making them to find out.
+ */
+export function canOperate(listing: Listing | null): boolean {
+  return listing?.status === 'ACTIVE';
 }
 
 /**

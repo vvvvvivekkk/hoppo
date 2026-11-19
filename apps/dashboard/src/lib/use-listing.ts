@@ -42,6 +42,16 @@ export function useListing() {
   const shop = shops?.find((s) => s.listings.some((l) => l.id === listingId)) ?? null;
   const listing = shop?.listings.find((l) => l.id === listingId) ?? null;
 
+  // An owner waiting on approval leaves the tab open. /shops/mine is the one
+  // shop endpoint the API serves before approval, so it is what gets re-read;
+  // the screen then unlocks by itself when the administrator approves.
+  const awaitingDecision = listing?.status === 'PENDING_VERIFICATION';
+  useEffect(() => {
+    if (!awaitingDecision) return;
+    const timer = setInterval(() => void reload(), 15_000);
+    return () => clearInterval(timer);
+  }, [awaitingDecision, reload]);
+
   return {
     shops,
     shop,
