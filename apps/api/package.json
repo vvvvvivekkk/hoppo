@@ -8,7 +8,7 @@
     "start": "node dist/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "lint": "eslint \"src/**/*.ts\" --max-warnings 0",
+    "lint": "eslint \"src/**/*.ts\" --config ../../eslint.config.mjs --max-warnings 0",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "test": "jest",
     "test:watch": "jest --watch",

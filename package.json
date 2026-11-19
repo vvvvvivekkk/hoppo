@@ -9,24 +9,27 @@
   },
   "scripts": {
     "dev:api": "pnpm --filter @hoppo/api start:dev",
+    "dev:web": "pnpm --filter @hoppo/web dev",
     "dev:dashboard": "pnpm --filter @hoppo/dashboard dev",
     "dev:admin": "pnpm --filter @hoppo/admin dev",
-    "dev:mobile": "pnpm --filter @hoppo/mobile start",
-    "build": "pnpm --filter @hoppo/shared build && pnpm -r --filter \"!@hoppo/shared\" --filter \"!@hoppo/mobile\" build",
-    "lint": "pnpm -r --filter \"!@hoppo/mobile\" lint",
-    "test": "pnpm -r --filter \"!@hoppo/mobile\" test",
-    "typecheck": "pnpm -r --filter \"!@hoppo/mobile\" typecheck",
+    "build": "pnpm --filter @hoppo/shared build && pnpm -r --filter \"!@hoppo/shared\" build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "check:routes": "python3 packages/api-client/test/check-routes.py",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",
     "db:migrate": "pnpm --filter @hoppo/api prisma:migrate",
     "db:generate": "pnpm --filter @hoppo/api prisma:generate",
     "db:seed": "pnpm --filter @hoppo/api prisma:seed",
     "db:studio": "pnpm --filter @hoppo/api prisma:studio",
-    "db:reset": "pnpm --filter @hoppo/api prisma:reset",
-    "check:routes": "python3 packages/api-client/test/check-routes.py"
+    "db:reset": "pnpm --filter @hoppo/api prisma:reset"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^9.39.5",
     "prettier": "^3.4.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.73.0"
   }
 }

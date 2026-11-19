@@ -1048,4 +1048,35 @@ export class ShopsService {
       }),
     };
   }
+
+  /**
+   * The college's delivery points, for the checkout drop-point picker.
+   *
+   * The order endpoints have always accepted a `deliveryPointId`, and the
+   * seed has always created points — but nothing listed them, so a student
+   * had no way to learn an id and the picker could not be built. Found while
+   * writing that screen.
+   *
+   * Scoped to the caller's college like everything else (C-1), and inactive
+   * points are filtered out here rather than hidden in the UI, so a point an
+   * administrator retires stops being orderable immediately.
+   */
+  async deliveryPoints(user: AuthenticatedUser) {
+    const collegeId = this.tenant.requireCollegeId(user);
+
+    const points = await this.prisma.deliveryPoint.findMany({
+      where: { collegeId, isActive: true },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        latitude: true,
+        longitude: true,
+        sortOrder: true,
+      },
+      orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    });
+
+    return { points };
+  }
 }

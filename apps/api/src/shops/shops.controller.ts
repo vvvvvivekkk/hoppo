@@ -88,6 +88,19 @@ export class BrowseController {
     return this.shops.searchItems(user, q ?? '');
   }
 
+  /**
+   * The drop points a student can choose at checkout.
+   *
+   * The order endpoints accepted a `deliveryPointId` from the start and the
+   * seed created points, but nothing listed them — so the picker had no way
+   * to learn an id. Found while building that screen, not by reading the SRS.
+   */
+  @Get('delivery-points')
+  @ApiOperation({ summary: 'Active delivery points at my college' })
+  deliveryPoints(@CurrentUser() user: AuthenticatedUser) {
+    return this.shops.deliveryPoints(user);
+  }
+
   @Get('shops/:listingId')
   @ApiOperation({ summary: 'One shop with its catalog' })
   shopDetail(@CurrentUser() user: AuthenticatedUser, @Param('listingId') listingId: string) {

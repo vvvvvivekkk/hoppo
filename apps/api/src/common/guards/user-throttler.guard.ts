@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { ThrottlerGuard } from '@nestjs/throttler';
-import type { ExecutionContext } from '@nestjs/common';
 import type { AuthenticatedUser } from '../types/authenticated-user';
 
 /**

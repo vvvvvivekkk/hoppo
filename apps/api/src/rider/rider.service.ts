@@ -4,7 +4,6 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
-  NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
@@ -335,7 +334,10 @@ export class RiderService {
    * entitled to try.
    */
   async acceptTask(user: AuthenticatedUser, taskId: string) {
-    const collegeId = this.tenant.requireCollegeId(user);
+    // Called for the throw, not the value: C-1 requires a caller with no
+    // college to be rejected before anything else happens. Do not remove
+    // this because the result looks unused — binding it is what was unused.
+    this.tenant.requireCollegeId(user);
 
     const state = await this.prisma.riderState.findUnique({
       where: { userId: user.userId },

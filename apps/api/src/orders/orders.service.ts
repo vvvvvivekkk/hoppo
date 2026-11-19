@@ -33,7 +33,6 @@ import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import type {
   AcceptOrderDto,
   CancelOrderDto,
-  CreateTaskDto,
   PlaceOrderDto,
   QuoteOrderDto,
   RejectOrderDto,

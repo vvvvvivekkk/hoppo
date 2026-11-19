@@ -22,11 +22,11 @@ app/(tabs)/_layout.tsx: error TS2786: 'Tabs' cannot be used as a JSX component.
 That `bigint` is the giveaway: React 19 widened `ReactNode` to include it, so
 React 18's narrower `ReactNode` no longer satisfies it.
 
-The real fixes are all structural, and none is a five-minute change:
+The real fixes are all structural:
 
-1. **Move the mobile app out of the workspace** into its own repo or a nested
-   install, consuming `@hoppo/api-client` as a published package rather than a
-   workspace link. Cleanest, and the usual answer.
+1. **Take the mobile app out of the workspace**, so its dependencies are never
+   hoisted, and install it on its own when somebody picks it up. Cleanest, and
+   the usual answer.
 2. **Drop `node-linker=hoisted`** so pnpm's isolated layout gives each app its
    own `@types/react`. Metro then needs careful `resolver` configuration and
    tends to break in ways that are tedious to diagnose.
@@ -34,6 +34,38 @@ The real fixes are all structural, and none is a five-minute change:
 
 None of that changes what a student can do, which is why the browser app came
 first.
+
+## Fix 1 has been applied, and it was not optional
+
+`pnpm-workspace.yaml` now excludes `apps/mobile`. That was not tidiness. While
+this app was a workspace member, React 18.3 won the single hoisted copy at the
+repository root, and **every Next.js build broke** — not just this app's
+typecheck:
+
+```
+[TypeError: Cannot read properties of null (reading 'useRef')]
+Error occurred prerendering page "/404"
+```
+
+The shop dashboard built cleanly at the end of Phase 1E and failed after this
+app was added, with nothing of its own changed. Excluding it from the scripts
+was not enough, because the scripts were never the problem: the *install* was.
+One unbuildable app in a hoisted workspace is a problem for every app in it.
+
+## Running this app again
+
+It is no longer installed by the repository root, so:
+
+```bash
+cd apps/mobile
+npm install          # or pnpm install --ignore-workspace
+npx expo start
+```
+
+`@hoppo/shared` and `@hoppo/api-client` are workspace links in its
+`package.json` and will not resolve from outside the workspace. They have to
+become file references, a published package, or copied source — which is the
+first thing to deal with, before the React version question.
 
 ## What is here
 
@@ -51,18 +83,8 @@ Written and worth keeping, but unverified:
 | `app/(verify)/status.tsx` | `S-08`/`S-09`: waiting and rejected, with attempts left |
 | `app/(tabs)/*` | `UI-1` bottom navigation, and `S-10`/`S-11` shop browse |
 
-Two pieces of reasoning in here are worth reading even if the app never runs,
-because `apps/web` reuses both: the socket client drops an offer whose window
-has already closed (a reconnect can deliver a stale one, and a countdown
-starting at zero invites a tap that fails), and the token store keeps an
-in-memory cache because `SecureStore` is async while the client's `get()` is
-synchronous.
-
-## Resuming it
-
-The web app is the reference for behaviour — it covers the same screens and
-is tested against the live API. Pick a structural fix above, then port the
-flows across rather than rebuilding them.
-
-Excluded from the root `typecheck` and `build` scripts so it cannot fail CI
-while parked. That exclusion is the thing to remove first.
+The web app is the reference for behaviour. Two pieces of reasoning in here are
+worth keeping even if this app never runs, and `apps/web` reuses both: the
+socket client drops an offer whose window has already closed, and the token
+store keeps an in-memory cache because `SecureStore` is async while the
+client's `get()` is synchronous.

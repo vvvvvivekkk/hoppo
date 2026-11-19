@@ -1,5 +1,19 @@
 packages:
   - "apps/*"
+  # Excluded, not deleted. The Expo app pins React 18.3 while the Next.js apps
+  # are on React 19, and `node-linker=hoisted` puts exactly one copy of React
+  # at the workspace root. While apps/mobile was a member, that copy was 18.3,
+  # and every Next build then failed when prerendering its own error page:
+  #
+  #   [TypeError: Cannot read properties of null (reading 'useRef')]
+  #   Error occurred prerendering page "/404"
+  #
+  # That is the same version conflict that stopped the Expo app typechecking,
+  # reaching back to break three apps that work. Excluding it from the
+  # workspace is what apps/mobile/README.md calls structural fix 1: the source
+  # stays in the repository, its dependencies are never hoisted here, and it
+  # is installed on its own when somebody picks it back up.
+  - "!apps/mobile"
   - "packages/*"
 
 # pnpm 10 blocks post-install scripts by default. These four genuinely need

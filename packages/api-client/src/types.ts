@@ -302,6 +302,15 @@ export interface ItemSearchResult {
   shopIsOpen: boolean;
 }
 
+export interface DeliveryPoint {
+  id: string;
+  name: string;
+  description: string | null;
+  latitude: number;
+  longitude: number;
+  sortOrder: number;
+}
+
 export interface OrderRequestBody {
   listingId: string;
   lines: { catalogItemId: string; quantity: number; note?: string }[];

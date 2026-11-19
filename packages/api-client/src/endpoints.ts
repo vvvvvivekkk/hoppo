@@ -7,6 +7,7 @@ import type {
   CatalogCategory,
   CatalogItem,
   College,
+  DeliveryPoint,
   FlaggedShop,
   ItemSearchResult,
   MyOrder,
@@ -349,6 +350,10 @@ export function endpoints(client: ApiClient) {
 
       items: (q: string) =>
         client.get<{ query: string; items: ItemSearchResult[] }>('/browse/items', { q }),
+
+      /** The drop points offered at checkout. */
+      deliveryPoints: () =>
+        client.get<{ points: DeliveryPoint[] }>('/browse/delivery-points'),
     },
 
     orders: {

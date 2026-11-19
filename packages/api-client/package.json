@@ -7,7 +7,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "eslint \"src/**/*.ts\" --max-warnings 0"
+    "lint": "eslint \"src/**/*.ts\" --config ../../eslint.config.mjs --max-warnings 0"
   },
   "dependencies": {
     "@hoppo/shared": "workspace:*"

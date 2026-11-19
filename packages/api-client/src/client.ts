@@ -84,6 +84,20 @@ export class ApiClient {
     return this.options.tokens.get()?.refreshToken;
   }
 
+  /**
+   * The current access token, for the Socket.IO handshake.
+   *
+   * Read fresh on every reconnection attempt rather than captured once: the
+   * gateway verifies the token at connect time only, so a socket that opened
+   * with a valid token keeps working as that token expires — but a reconnect
+   * an hour later, after a phone came out of a tunnel, would hand over the
+   * expired one and be rejected. Refresh has usually happened by then via an
+   * ordinary request, so re-reading is all it takes.
+   */
+  currentAccessToken(): string | undefined {
+    return this.options.tokens.get()?.accessToken;
+  }
+
   async request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     const response = await this.send(path, opts);
 

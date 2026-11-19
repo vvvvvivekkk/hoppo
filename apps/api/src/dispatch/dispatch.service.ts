@@ -1,6 +1,5 @@
 import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { Prisma } from '@prisma/client';
 import {
   OrderEvent,
   OrderStatus,
@@ -8,9 +7,7 @@ import {
   TaskStatus,
   assertOrderTransition,
   assertTaskTransition,
-  quoteFee,
   redisKeys,
-  type FeeBand,
 } from '@hoppo/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
@@ -346,21 +343,11 @@ export class DispatchService {
     // which is why baseFeeMinor is left untouched.
     const radiusM = initialProximityM + opts.round * proximityIncrementM;
 
-    const bands: FeeBand[] = task.college.feeBands.map((b) => ({
-      minDistanceM: b.minDistanceM,
-      maxDistanceM: b.maxDistanceM,
-      feeMinor: b.feeMinor,
-    }));
-
-    const fee = quoteFee({
-      bands,
-      distanceM: task.distanceM,
-      broadcastRound: opts.round,
-      feeIncrementMinor,
-    });
-
-    // The offer fee is derived from the task's own base rather than the band,
-    // so a band edited mid-flight cannot reduce what a rider was promised.
+    // The offer fee is derived from the task's own base rather than re-quoted
+    // from the college's current fee bands, so a band edited mid-flight cannot
+    // change what a rider was already promised. `quoteFee` used to be called
+    // here and its result thrown away — dead since that decision, and only
+    // visible once `pnpm lint` started working.
     const offeredFeeMinor = task.baseFeeMinor + opts.round * feeIncrementMinor;
 
     const eligible = await this.findEligibleRiders({
@@ -782,7 +769,10 @@ export class DispatchService {
   ): Promise<void> {
     const key = redisKeys.dispatchLock(taskId);
 
-    let acquired = false;
+    // No initialiser: both the try and the catch assign it before it is
+    // read, so `= false` was dead and read as if the unlocked path were the
+    // default. It is not — a Redis failure deliberately proceeds unlocked.
+    let acquired: boolean;
     try {
       acquired = await this.redis.acquireLock(key, ttlSeconds);
     } catch (error) {
