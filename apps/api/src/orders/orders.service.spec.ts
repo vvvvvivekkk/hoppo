@@ -85,7 +85,9 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
   const logs: Row[] = seed.logs ?? [];
   const headReads: unknown[] = [];
   let orderReads = 0;
-  let afterFirstOrderRead: (() => void) | null = null;
+  // Things "someone else" does to the rows straight after this request's
+  // n-th read of the order, keyed by n.
+  const afterOrderRead = new Map<number, () => void>();
 
   const prisma: Row = {
     $transaction: (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
@@ -94,7 +96,7 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
       findUnique: jest.fn(async () => {
         const snapshot = { ...order, task: { ...task } };
         orderReads += 1;
-        if (orderReads === 1 && afterFirstOrderRead) afterFirstOrderRead();
+        afterOrderRead.get(orderReads)?.();
         return snapshot;
       }),
       updateMany: jest.fn(async ({ where, data }: { where: Row; data: Row }) => {
@@ -170,10 +172,18 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
     headReads,
     /** Someone else ends the order between this request's read and its transaction. */
     orderMovesAfterFirstRead(status: string) {
-      afterFirstOrderRead = () => {
+      afterOrderRead.set(1, () => {
         order.status = status;
         task.status = 'CANCELLED';
-      };
+      });
+    },
+    /**
+     * A change that commits after the n-th read of the order and before the
+     * write that follows it. The request is left holding a stale snapshot,
+     * which is the one situation only the WHERE clause can catch.
+     */
+    afterOrderRead(n: number, change: (rows: { order: Row; task: Row }) => void) {
+      afterOrderRead.set(n, () => change({ order, task }));
     },
   };
 }
@@ -399,5 +409,193 @@ describe('ledger entries written by the orders service', () => {
       expect(Array.isArray(orderBy)).toBe(true);
       expect(orderBy).toEqual([{ createdAt: 'desc' }, { seq: 'desc' }]);
     }
+  });
+});
+
+// ===========================================================================
+// 5. The WHERE clause is what decides
+// ===========================================================================
+
+/**
+ * In each of these the service has read a status that was true at the time
+ * and is no longer: another request committed in the gap between the read
+ * and the write. No check made on the stale snapshot can notice. Only an
+ * UPDATE that names the expected status in its WHERE can — it matches no row
+ * and the request is refused.
+ *
+ * Each test goes red if `status` is taken out of the corresponding `where`:
+ * the write then lands on a row it should not touch.
+ */
+describe('a write based on a stale read is refused by the conditional UPDATE', () => {
+  it('cancel: the order is accepted by the shop after the in-transaction read', async () => {
+    // Cash, so no wallet lock serialises the two requests.
+    const ctx = build({
+      order: { paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      entries: [],
+    });
+    // Read 1 is cancelByStudent's own; read 2 is inside transitionOrderAndTask.
+    ctx.afterOrderRead(2, ({ order }) => {
+      order.status = 'PREPARING';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.cancelByStudent(STUDENT, 'order-1', {})),
+      'ORDER_STATE_CHANGED',
+    );
+
+    // The order the shop is now cooking was not cancelled underneath it.
+    expect(ctx.order.status).toBe('PREPARING');
+    expect(ctx.order.cancelledBy).toBeUndefined();
+    expect(ctx.task.status).toBe('CREATED');
+  });
+
+  it('cancel of a WALLET order: no release is written when the UPDATE matches nothing', async () => {
+    const ctx = build();
+    ctx.afterOrderRead(2, ({ order }) => {
+      order.status = 'PREPARING';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.cancelByStudent(STUDENT, 'order-1', {})),
+      'ORDER_STATE_CHANGED',
+    );
+
+    expect(ctx.order).toMatchObject({ status: 'PREPARING', paymentStatus: 'HELD' });
+    expect(ctx.entries.filter((e) => e.type === 'ORDER_RELEASE')).toHaveLength(0);
+  });
+
+  it('mark ready: the order is cancelled after it was read as PREPARING', async () => {
+    const ctx = build({ order: { status: 'PREPARING' } });
+    ctx.afterOrderRead(1, ({ order }) => {
+      order.status = 'CANCELLED';
+    });
+
+    expectConflict(await rejection(ctx.service.markReady(SHOP, 'order-1')), 'ORDER_STATE_CHANGED');
+
+    // A cancelled order was not brought back as READY.
+    expect(ctx.order.status).toBe('CANCELLED');
+    expect(ctx.order.readyAt).toBeUndefined();
+  });
+
+  it('collect in person: the order stops being READY after it was read', async () => {
+    const ctx = build({ order: { status: 'READY' }, task: { status: 'UNFULFILLED' } });
+    ctx.afterOrderRead(1, ({ order }) => {
+      order.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON')),
+      'ORDER_NOT_READY',
+    );
+
+    // Not completed, fee not zeroed, nothing captured or refunded.
+    expect(ctx.order).toMatchObject({
+      status: 'CANCELLED',
+      paymentStatus: 'HELD',
+      deliveryFeeMinor: 1000,
+      totalMinor: 3500,
+    });
+    expect(ctx.entries).toHaveLength(1);
+  });
+
+  it('collect in person: the task is cancelled after it was read as UNFULFILLED', async () => {
+    const ctx = build({ order: { status: 'READY' }, task: { status: 'UNFULFILLED' } });
+    ctx.afterOrderRead(1, ({ task }) => {
+      task.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON')),
+      'NOT_UNFULFILLED',
+    );
+
+    expect(ctx.task.status).toBe('CANCELLED');
+    expect(ctx.order.status).toBe('READY');
+    expect(ctx.entries).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// 6. The response says what happened to the money
+// ===========================================================================
+
+describe('what the caller is told about a refund', () => {
+  const CASH = { paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' };
+
+  it('unfulfilled cancel of a CASH order: nothing refunded, and it says so', async () => {
+    const ctx = build({
+      order: { ...CASH, status: 'PREPARING' },
+      task: { status: 'UNFULFILLED' },
+      entries: [],
+    });
+
+    const result = await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL');
+
+    // Was: refundedMinor 3500 and "refunded in full", with no money moved.
+    expect((result as { refundedMinor: number }).refundedMinor).toBe(0);
+    expect(result.message).not.toMatch(/refunded in full/);
+    expect(result.message).not.toContain('35');
+    expect(result.message).toMatch(/nothing to refund/);
+    expect(ctx.entries).toHaveLength(0);
+  });
+
+  it('unfulfilled cancel of a WALLET order: the full total, matching the ledger', async () => {
+    const ctx = build({ order: { status: 'PREPARING' }, task: { status: 'UNFULFILLED' } });
+
+    const result = await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL');
+
+    expect((result as { refundedMinor: number }).refundedMinor).toBe(3500);
+    expect(result.message).toMatch(/refunded in full/);
+    expect(ctx.entries[1]).toMatchObject({ type: 'ORDER_RELEASE', amountMinor: 3500 });
+  });
+
+  it('CASH order collected in person: no fee refunded; told what to pay at the shop', async () => {
+    const ctx = build({
+      order: { ...CASH, status: 'READY' },
+      task: { status: 'UNFULFILLED' },
+      entries: [],
+    });
+
+    const result = await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON');
+
+    // Was: refundedFeeMinor 1000 and "delivery fee has been refunded".
+    expect((result as { refundedFeeMinor: number }).refundedFeeMinor).toBe(0);
+    expect(result.message).not.toMatch(/refunded|returned/);
+    expect(result.message).toMatch(/No delivery fee is charged/);
+    // 3500 total less the 1000 fee.
+    expect(result.message).toContain('25');
+  });
+
+  it('WALLET order collected in person: the fee, matching the ledger', async () => {
+    const ctx = build({ order: { status: 'READY' }, task: { status: 'UNFULFILLED' } });
+
+    const result = await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON');
+
+    expect((result as { refundedFeeMinor: number }).refundedFeeMinor).toBe(1000);
+    expect(result.message).toMatch(/returned to your wallet/);
+  });
+
+  it('student cancel: 0 for cash, the held total for a wallet order', async () => {
+    const cash = build({ order: CASH, entries: [] });
+    const cashResult = await cash.service.cancelByStudent(STUDENT, 'order-1', {});
+    expect(cashResult.refundedMinor).toBe(0);
+    expect(cashResult.message).toBe('Order cancelled. You have not been charged.');
+
+    const wallet = build();
+    const walletResult = await wallet.service.cancelByStudent(STUDENT, 'order-1', {});
+    expect(walletResult.refundedMinor).toBe(3500);
+    expect(walletResult.message).toMatch(/returned to your wallet/);
+  });
+
+  it('shop reject: 0 for cash, the held total for a wallet order', async () => {
+    const cash = build({ order: CASH, entries: [] });
+    expect(
+      (await cash.service.rejectOrder(SHOP, 'order-1', { reason: 'Closed' })).refundedMinor,
+    ).toBe(0);
+
+    const wallet = build();
+    expect(
+      (await wallet.service.rejectOrder(SHOP, 'order-1', { reason: 'Closed' })).refundedMinor,
+    ).toBe(3500);
   });
 });

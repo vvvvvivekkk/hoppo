@@ -46,11 +46,12 @@ import type {
 } from './dto/orders.dto';
 
 /**
- * Page size for "my orders" when the client does not ask for one. The shared
- * helper defaults to 25; this list has always been specified at 30, so the
- * default is passed explicitly rather than inherited.
+ * Page size for "my orders" when the client does not ask for one: 20, as it
+ * was before the limit was validated. The shared helper defaults to 25, so
+ * the value is passed explicitly rather than inherited — clamping untrusted
+ * input was the fix; changing what an existing client gets by default was not.
  */
-export const MY_ORDERS_DEFAULT_LIMIT = 30;
+export const MY_ORDERS_DEFAULT_LIMIT = 20;
 
 @Injectable()
 export class OrdersService {
@@ -767,10 +768,19 @@ export class OrdersService {
       reference: order!.reference,
     });
 
+    // Say what actually happened to the money. A wallet order had its total
+    // held at placement and has just had it released; a cash order never
+    // moved any money at all.
+    const releasedMinor = order!.paymentMethod === PaymentMethod.WALLET ? order!.totalMinor : 0;
+
     return {
       orderId,
       status: 'CANCELLED',
-      message: 'Order cancelled. You have not been charged.',
+      refundedMinor: releasedMinor,
+      message:
+        releasedMinor > 0
+          ? `Order cancelled. ${formatMinor(releasedMinor)} has been returned to your wallet.`
+          : 'Order cancelled. You have not been charged.',
     };
   }
 
@@ -962,13 +972,27 @@ export class OrdersService {
         }
       });
 
+      // Only a wallet order has paid the fee already and can have it
+      // refunded. On a cash order nothing has been paid yet: the fee is simply
+      // dropped from what is owed, and saying "refunded" would send the
+      // student looking for money that never left their hands.
+      const refundedFeeMinor = refundsFeeToWallet ? order!.deliveryFeeMinor : 0;
+      const dueAtShopMinor = paidFromWallet ? 0 : order!.totalMinor - order!.deliveryFeeMinor;
+
       return {
         orderId,
         choice,
-        refundedFeeMinor: order!.deliveryFeeMinor,
-        message: `Collect your order from the shop. The ${formatMinor(
-          order!.deliveryFeeMinor,
-        )} delivery fee has been refunded.`,
+        refundedFeeMinor,
+        message:
+          refundedFeeMinor > 0
+            ? `Collect your order from the shop. The ${formatMinor(
+                refundedFeeMinor,
+              )} delivery fee has been returned to your wallet.`
+            : paidFromWallet
+              ? 'Collect your order from the shop. It is already paid for.'
+              : `Collect your order from the shop and pay ${formatMinor(
+                  dueAtShopMinor,
+                )} there. No delivery fee is charged.`,
       };
     }
 
@@ -1029,11 +1053,18 @@ export class OrdersService {
       }
     });
 
+    // A refund is only a refund if money was held. A cash order pays at the
+    // door, so cancelling it returns nothing — and must not claim to.
+    const refundedMinor = refundsToWallet ? order!.totalMinor : 0;
+
     return {
       orderId,
       choice,
-      refundedMinor: order!.totalMinor,
-      message: `Order cancelled and ${formatMinor(order!.totalMinor)} refunded in full.`,
+      refundedMinor,
+      message:
+        refundedMinor > 0
+          ? `Order cancelled and ${formatMinor(refundedMinor)} refunded in full to your wallet.`
+          : 'Order cancelled. You had not paid anything, so there is nothing to refund.',
     };
   }
 
@@ -1275,6 +1306,9 @@ export class OrdersService {
     return {
       orderId,
       status: 'CANCELLED',
+      // What went back to the student's wallet: the held total for a wallet
+      // order, nothing for cash. The shop sees a number, not a guess.
+      refundedMinor: order!.paymentMethod === PaymentMethod.WALLET ? order!.totalMinor : 0,
       message: 'Order rejected and the student notified.',
     };
   }

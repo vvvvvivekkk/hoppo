@@ -9,16 +9,16 @@ const limitFor = (raw: string | number | undefined) =>
   clampPageLimit(raw, MY_ORDERS_DEFAULT_LIMIT);
 
 describe('my-orders page limit', () => {
-  it('defaults to 30, not the shared helper default', () => {
-    expect(MY_ORDERS_DEFAULT_LIMIT).toBe(30);
-    expect(limitFor(undefined)).toBe(30);
-    expect(limitFor('')).toBe(30);
+  it('defaults to 20, as before the limit was validated, not the shared helper default', () => {
+    expect(MY_ORDERS_DEFAULT_LIMIT).toBe(20);
+    expect(limitFor(undefined)).toBe(20);
+    expect(limitFor('')).toBe(20);
   });
 
   it('defaults on anything that is not a number, rather than passing NaN to the query', () => {
-    expect(limitFor('abc')).toBe(30);
-    expect(limitFor('Infinity')).toBe(30);
-    expect(limitFor(Number.NaN)).toBe(30);
+    expect(limitFor('abc')).toBe(20);
+    expect(limitFor('Infinity')).toBe(20);
+    expect(limitFor(Number.NaN)).toBe(20);
   });
 
   it('caps a huge request at the maximum', () => {
@@ -40,6 +40,6 @@ describe('my-orders page limit', () => {
   // The shared helper treats a fraction as unusable input. The helper this
   // replaced truncated it (12.9 -> 12); either is safe, one rule is better.
   it('falls back to the default on a fraction', () => {
-    expect(limitFor('12.9')).toBe(30);
+    expect(limitFor('12.9')).toBe(20);
   });
 });
