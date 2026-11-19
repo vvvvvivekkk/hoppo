@@ -46,7 +46,14 @@ export class ApiError extends Error {
     return null;
   }
 
-  /** FR-SVER-01: the caller is registered but not yet verified. */
+  /**
+   * FR-SVER-01: the caller is registered but not yet verified.
+   *
+   * Exactly `VERIFICATION_REQUIRED`. The same guard answers a shop or admin
+   * account with `STUDENT_ACCOUNT_REQUIRED`, which is deliberately not
+   * included: sending those roles to the student verification screen would
+   * be wrong, since they have nothing to verify.
+   */
   get needsVerification(): boolean {
     return this.code === 'VERIFICATION_REQUIRED';
   }
@@ -82,9 +89,17 @@ export class ApiError extends Error {
     return this.code === 'ORDER_STATE_CHANGED' || this.code === 'ORDER_NOT_READY';
   }
 
-  /** FR-SVER-08: boolean form of `accountBlocked`. */
-  get isAccountBlocked(): boolean {
-    return this.accountBlocked !== null;
+  /**
+   * The caller is a shop account whose registration the campus administrator
+   * has not approved (403). A refusal, not a fault and not an expired
+   * session: nothing to retry, and the dashboard should show where the
+   * registration stands. `SHOP_NOT_APPROVED` comes from the shop-approval
+   * guard on every route but `/shops/mine`, `/auth/me` and `/auth/logout`;
+   * `LISTING_NOT_ACTIVE` is the catalog service's older wording of the same
+   * thing ("This shop is not yet approved").
+   */
+  get isAwaitingShopApproval(): boolean {
+    return this.code === 'SHOP_NOT_APPROVED' || this.code === 'LISTING_NOT_ACTIVE';
   }
 
   get isRateLimited(): boolean {

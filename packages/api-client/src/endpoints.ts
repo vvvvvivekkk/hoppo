@@ -7,6 +7,7 @@ import type {
   CatalogCategory,
   CatalogItem,
   College,
+  CollegeRadius,
   DeliveryPoint,
   FlaggedShop,
   ItemSearchResult,
@@ -272,6 +273,9 @@ export function endpoints(client: ApiClient) {
           message: string;
         }>(`/admin/shops/${listingId}/suspend`, { reason }),
 
+      /** A-09: the radius in force, with the bounds a change must stay within. */
+      radius: () => client.get<CollegeRadius>('/admin/college/radius'),
+
       /** A-09 */
       updateRadius: (serviceableRadiusM: number) =>
         client.patch<{
@@ -307,11 +311,10 @@ export function endpoints(client: ApiClient) {
           submissionsUsed: number;
           submissionsAllowed: number;
           /**
-           * When the rolling submission window next frees an attempt. The API
-           * does not send this on `/verification/me` yet (only inside the
-           * `SUBMISSION_LIMIT_REACHED` error), so treat it as usually absent.
+           * When the rolling submission window next frees an attempt (ISO
+           * timestamp). Always sent; null while attempts remain.
            */
-          retryAt?: string | null;
+          retryAt: string | null;
           unlocked: {
             browseShops: boolean;
             placeOrders: boolean;

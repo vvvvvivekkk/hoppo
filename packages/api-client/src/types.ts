@@ -552,3 +552,31 @@ export type TaskStatusEvent =
       reason: 'IDLE_TIMEOUT';
       afterMinutes: number;
     };
+
+/** `GET /admin/college/radius` (A-09), as ShopsService.currentRadius returns it. */
+export interface CollegeRadius {
+  collegeId: string;
+  /** Whole metres; 3000 when the college has no configuration row. */
+  serviceableRadiusM: number;
+  /** The same distance in words, e.g. "3.0 km". */
+  serviceableRadiusLabel: string;
+  /** RADIUS_MIN_M and RADIUS_MAX_M from @hoppo/shared. */
+  minRadiusM: number;
+  maxRadiusM: number;
+}
+
+/**
+ * The `/rt` socket's `exception` event, sent just before the server closes a
+ * connection it refuses for a stated reason.
+ *
+ * Today that is one case: a shop account with no approved shop gets
+ * `connect`, then `exception` with code `SHOP_NOT_APPROVED`, then
+ * `disconnect` (reason `io server disconnect`). It is not a `connect_error`,
+ * so a client must listen for this event to tell "awaiting approval" from a
+ * dropped connection it should retry. Missing or invalid tokens and
+ * suspended accounts are still disconnected with no event.
+ */
+export interface SocketException {
+  code: string;
+  message: string;
+}

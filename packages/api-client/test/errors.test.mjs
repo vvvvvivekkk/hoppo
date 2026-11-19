@@ -50,21 +50,46 @@ test('isStaleState covers the two order-moved-on codes only', () => {
   assert.equal(err('ERROR').isStaleState, false);
 });
 
-test('isAccountBlocked and accountBlocked agree', () => {
-  assert.equal(err('ACCOUNT_SUSPENDED', 401).isAccountBlocked, true);
+test('accountBlocked names the state, and an expired session is not one', () => {
   assert.equal(err('ACCOUNT_SUSPENDED', 401).accountBlocked, 'SUSPENDED');
-  assert.equal(err('ACCOUNT_DEACTIVATED', 401).isAccountBlocked, true);
   assert.equal(err('ACCOUNT_DEACTIVATED', 401).accountBlocked, 'DEACTIVATED');
-  // A plain expired session is an auth failure but not a blocked account.
   const expired = err('ERROR', 401);
   assert.equal(expired.isAuthFailure, true);
-  assert.equal(expired.isAccountBlocked, false);
   assert.equal(expired.accountBlocked, null);
+});
+
+test('isAwaitingShopApproval covers both codes the API emits for an unapproved shop', () => {
+  // shop-approval.guard.ts and catalog.service.ts respectively.
+  assert.equal(err('SHOP_NOT_APPROVED', 403).isAwaitingShopApproval, true);
+  assert.equal(err('LISTING_NOT_ACTIVE', 403).isAwaitingShopApproval, true);
+  // A rejected or suspended listing is a different answer, as is a plain 403.
+  assert.equal(err('LISTING_NOT_EDITABLE', 403).isAwaitingShopApproval, false);
+  assert.equal(err('FORBIDDEN', 403).isAwaitingShopApproval, false);
+});
+
+test('an unapproved shop is neither an auth failure nor a verification prompt', () => {
+  const e = err('SHOP_NOT_APPROVED', 403);
+  assert.equal(e.isAuthFailure, false);
+  assert.equal(e.needsVerification, false);
+  assert.equal(e.isRetryable, false);
+});
+
+test('STUDENT_ACCOUNT_REQUIRED does not send anyone to student verification', () => {
+  const e = err('STUDENT_ACCOUNT_REQUIRED', 403);
+  assert.equal(e.needsVerification, false);
+  assert.equal(e.isAwaitingShopApproval, false);
+  assert.equal(e.isAuthFailure, false);
+  assert.equal(err('VERIFICATION_REQUIRED', 403).needsVerification, true);
+});
+
+test('the getter removed in round two stays removed', () => {
+  assert.equal('isAccountBlocked' in err('ACCOUNT_SUSPENDED', 401), false);
 });
 
 test('a network error is none of these', () => {
   const e = new NetworkError('offline');
   assert.equal(e.isOfferGone, false);
   assert.equal(e.isStaleState, false);
-  assert.equal(e.isAccountBlocked, false);
+  assert.equal(e.isAwaitingShopApproval, false);
+  assert.equal(e.accountBlocked, null);
 });
