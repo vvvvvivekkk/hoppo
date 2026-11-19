@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
-import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 
 import { loadConfiguration } from './config/configuration';
 import { PrismaModule } from './prisma/prisma.module';
@@ -15,11 +15,15 @@ import { StorageModule } from './storage/storage.module';
 import { GeocodingModule } from './geocoding/geocoding.module';
 import { ShopsModule } from './shops/shops.module';
 import { CatalogModule } from './catalog/catalog.module';
+import { DispatchModule } from './dispatch/dispatch.module';
+import { OrdersModule } from './orders/orders.module';
+import { RiderModule } from './rider/rider.module';
 import { HealthModule } from './health/health.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 import { VerifiedGuard } from './common/guards/verified.guard';
+import { UserThrottlerGuard } from './common/guards/user-throttler.guard';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 @Module({
@@ -51,14 +55,23 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     VerificationModule,
     ShopsModule,
     CatalogModule,
+    DispatchModule,
+    OrdersModule,
+    RiderModule,
     HealthModule,
   ],
   providers: [
-    // Guard order matters, and it is the order listed here: authenticate
-    // first, then check the role, then check verification. Each later guard
-    // relies on request.user existing, which only the first one sets.
-    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    // Guard order matters, and it is the order listed here.
+    //
+    // Authentication comes FIRST so that the throttler can bucket by user id
+    // rather than by IP — every rider on campus Wi-Fi shares one NAT address,
+    // and an IP bucket would let one rider consume the whole college's
+    // allowance. See UserThrottlerGuard.
+    //
+    // Then role, then verification. Each later guard relies on request.user
+    // existing, which only the authentication guard sets.
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: UserThrottlerGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
     { provide: APP_GUARD, useClass: VerifiedGuard },
 

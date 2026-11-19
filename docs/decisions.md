@@ -368,3 +368,58 @@ owner, address, coordinates, FSSAI licence, Razorpay account.
   "open shops near me, sorted by distance" query cheap.
 - An administrator approving a shop approves it *for their college only*, which
   is the correct tenancy behaviour and falls out of the model for free.
+
+
+---
+
+## ADR-009 — The handover code is pushed and re-issued, never retrieved
+
+**Status:** accepted · Phase 1D
+
+### Context
+
+`FR-DLV-12` generates a six-digit handover code on pickup and displays it "to
+the requester only". `NFR-S-04` requires OTP values to be stored hashed.
+
+Those two pull against each other. If only a hash is stored, the code cannot
+be looked up later — so a requester who closes the app, switches phones, or
+simply misses the notification has no way to get it back, and the delivery
+cannot complete. The first implementation stored the hash, generated the code,
+and then did nothing with it at all: the rider was told to ask for a code that
+had never reached anybody. Found by walking the flow, not by a failing test.
+
+### Alternatives considered
+
+1. **Store the plaintext.** Simplest, and the exposure window is minutes. But
+   it puts a live credential in a database row and contradicts `NFR-S-04` for
+   no real gain.
+2. **Store it encrypted and decrypt on read.** Satisfies the letter of the
+   requirement while keeping retrieval. Rejected: the decryption key lives
+   next to the data, so it is plaintext with extra steps.
+3. **Push only.** Correct until the requester misses the push, and then the
+   delivery is stuck with no way out.
+4. **Push, plus re-issue on request.** Chosen.
+
+### Decision
+
+The code is generated at pickup, hashed with Argon2id, and pushed to the
+requester's socket — addressed to `user:<requesterId>`, never to the college
+room, because a code broadcast to the college would let any rider complete any
+delivery, which is the one thing the code exists to prevent.
+
+The plaintext is never persisted. Recovery is **re-issue**, not retrieval: the
+requester asks for a new code, which replaces the old one and resets the
+attempt counter. The attempt reset matters — the rider's failed attempts were
+against a code the requester no longer has, and carrying them over would
+escalate the task for no reason.
+
+The rider cannot re-issue. Only the requester can, which is checked explicitly.
+
+### Consequences
+
+- A lost code costs one extra tap, not a stranded delivery.
+- Re-issue is rate limited, because it is a credential-minting endpoint.
+- The GET endpoint deliberately has no `code` field and says so, so a client
+  author does not go looking for one.
+- Push delivery needs the socket connected. The app should fall back to
+  re-issue when it reconnects and finds a task in `PICKED_UP`.

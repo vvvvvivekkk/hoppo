@@ -19,8 +19,8 @@ that document so any line can be traced to the thing it implements.
 | 1A | Monorepo, data model, integrity constraints, shared business rules | **done** |
 | 1B | Auth, tenancy enforcement, student verification | **done** |
 | 1C | Shop registration with radius validation, catalog | **done** |
-| 1D | Ordering, dispatcher, first-accept assignment, OTP handover | next |
-| 1E | Shop dashboard, admin console | |
+| 1D | Ordering, dispatcher, first-accept assignment, OTP handover | **done** |
+| 1E | Shop dashboard, admin console | next |
 | 1F | Student mobile app | |
 
 Phase 1 as a whole is the "complete, demonstrable system" of SRS §12.2.
@@ -135,6 +135,10 @@ guarantees that one statement is indivisible.
 Nothing in this codebase may read-then-write a task assignment, and nothing
 may use a Redis lock as the source of truth. See `ADR-001`.
 
+Verified by stress test: five riders racing the same task, thirty rounds,
+exactly one winner every time with the HTTP responses and the database
+agreeing. `apps/api/test/race-stress.py`.
+
 ### 2. Distance has to be measured on a curved earth
 
 A shop may register only if it is inside the college's radius (3 km by
@@ -230,6 +234,15 @@ silently, each one is written down with the reasoning in
   the server ran in — a Hyderabad shop's 09:00 becomes 09:00 UTC on a default
   container image, closing it through its whole morning trade. Resolved with
   `college.timezone`.
+- A task collected in person under `FR-DLV-07` completes with no rider, which
+  the Phase 1A integrity constraint forbade. The constraint was narrowed rather
+  than loosened, so it still catches a delivered task that lost its rider.
+- Rate limiting by IP address would let one rider on campus Wi-Fi exhaust the
+  whole college's allowance, because they all share one NAT address. Now keyed
+  per user.
+- The five-character order reference collided near-certainly within a single
+  college-year. A flaky test caught it; the arithmetic confirmed the test was
+  right and the reference was wrong. Now seven characters, with a retry.
 
 ---
 

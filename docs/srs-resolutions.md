@@ -311,6 +311,119 @@ the old behaviour the shop reported closed; it now reports open.
 
 ---
 
+## 🔴 R-19 — A task collected in person completes with no rider
+
+**Not an SRS gap — a bug in this implementation**, recorded here because it was
+caused by the Phase 1A integrity constraints and is worth knowing about.
+
+The constraint `task_rider_presence_matches_status` required every `COMPLETED`
+task to have a `rider_id`. That encodes a reasonable-sounding assumption:
+completed means somebody delivered it.
+
+`FR-DLV-07` contradicts it. When no rider is found after every broadcast round,
+the requester may collect the order in person — and the task then completes
+having never been assigned to anybody. The constraint rejected that write, so
+the collect-in-person path returned a 500. Found by exercising `FR-DLV-07`,
+not by reading the code.
+
+**Resolution.** The constraint now keeps the invariant that actually matters
+rather than being loosened. The real rule is not "completed implies a rider"
+but "a task that was ever assigned keeps its rider":
+
+```sql
+OR (status = 'COMPLETED' AND (rider_id IS NOT NULL OR assigned_at IS NULL))
+```
+
+A collected-in-person task has `assigned_at` NULL, so it is still
+distinguishable from a delivered task that has somehow lost its `rider_id` —
+which is the bug the constraint exists to catch. Verified three ways: a
+`DELIVERED` task with no rider is still rejected, a `COMPLETED` task with no
+rider and no `assigned_at` is accepted, and a `COMPLETED` task that *was*
+assigned and lost its rider is still rejected.
+
+**Affects** `FR-DLV-07`, the Phase 1A integrity migration.
+
+---
+
+## 🟡 R-20 — Rate limiting by IP breaks on campus Wi-Fi
+
+**Also an implementation finding rather than an SRS gap.**
+
+`NFR-S-06` asks for rate limiting on authentication, OTP issue and task
+acceptance. The obvious implementation buckets by IP address, which is what
+the framework does by default.
+
+That is wrong for this product specifically. Every rider on campus Wi-Fi
+leaves through one NAT address, so an IP bucket means one rider tapping
+"accept" consumes the allowance for every other rider at that college. The
+endpoint would start refusing riders at exactly the moment several are
+competing for the same offer — and the symptom would be riders unable to accept
+work, with no error they could act on.
+
+This surfaced while stress-testing the assignment race: after nine rounds every
+request came back `429`. The race itself was fine; the limiter was the problem.
+
+**Resolution.** `UserThrottlerGuard` buckets authenticated requests by user id
+and falls back to the address only where there is no user yet — login, OTP
+issue, password reset — because there the address genuinely *is* the actor.
+This also required reordering the global guards so authentication runs before
+the throttler, since the throttler needs `request.user` to exist.
+
+**Proposed clarification to the SRS:**
+
+> **NFR-S-06 (amended).** Rate limits on authenticated endpoints shall be
+> applied per user account. Limits on unauthenticated endpoints shall be
+> applied per source address. A shared campus network means a per-address limit
+> on an authenticated endpoint would let one student exhaust the allowance of
+> every other student at that college.
+
+**Affects** `NFR-S-06`, `FR-DLV-04`.
+
+---
+
+## 🟡 R-21 — The order reference was too short, and a flaky test proved it
+
+**An implementation finding, found by its own test misbehaving.**
+
+The SRS does not specify an order reference; it is a usability addition — a
+short code read aloud across a counter, "order HP-7F3K2". The first version
+used five characters from a 32-character alphabet: about 33.5 million
+possibilities, which sounds ample.
+
+The test asserted that 5,000 generated references never collide. It failed
+about one run in three. The instinct is to call that a flaky test and loosen
+it; the arithmetic says otherwise. By the birthday bound, 5,000 draws from
+33.5 million collide with probability near 37% — the test was correct and the
+*reference* was too short.
+
+Worse, the approximation that makes this easy to misjudge (n²/2N) only holds
+while n² is far smaller than the space. At a realistic 73,000 orders per
+college-year it gives 79, which is not a probability at all. Computed
+properly, a collision within a single college-year was near-certain rather
+than unlikely — and `place()` had no retry, so a student would have seen
+"duplicate order reference, please retry" and had to re-confirm a cart they
+had already confirmed, for a problem entirely of our making.
+
+**Resolution.** Two changes, not one:
+
+1. Seven characters, giving about 34 billion possibilities. Still readable
+   aloud. At ten colleges over five years roughly one insert in ten thousand
+   collides, which keeps the retry cold.
+2. A bounded retry on the unique-constraint violation, because the space is
+   finite and reused indefinitely — over enough orders a collision is not
+   unlikely but inevitable, and the correct response is to generate another
+   reference rather than to tell the user.
+
+The test now asserts the properties that do not depend on the draw: the space
+size, the absence of modulo bias (256 divides by 32 exactly), and the
+*per-insert* collision probability, which is what decides whether the retry is
+hot. It also keeps the five-character arithmetic as a test, so a future reader
+tempted to shorten the reference for readability sees why it was lengthened.
+
+**Affects** order placement. No SRS requirement changes.
+
+---
+
 ## 🟢 R-17 — §9.1's `task.otp_hash` is right, but §9.1's naming is inconsistent
 
 **Observation, not a conflict.** The data model correctly names the column
@@ -333,6 +446,9 @@ issue timestamp.
 | R-03 missing dispatcher | 🔴 | Scheduled jobs, `ADR-005`, new `FR-DLV-00` |
 | R-04 cash settlement | 🔴 | `ADR-006` |
 | R-18 hours have no timezone | 🔴 | `college.timezone`, new `FR-TEN-06` |
+| R-19 completed without a rider | 🔴 | Constraint narrowed, not loosened |
+| R-20 rate limiting by IP | 🟡 | `UserThrottlerGuard`, amended `NFR-S-06` |
+| R-21 order reference too short | 🟡 | 7 characters plus a collision retry |
 | R-05 pickup ownership | 🟡 | `ADR-003` |
 | R-06 `UNFULFILLED` exits | 🟡 | `task-state.ts` |
 | R-07 fee increment | 🟡 | `ADR-004` |

@@ -42,8 +42,19 @@ export const RATING_MAX = 5;
 /** Version string recorded when a student accepts the rider terms (FR-WM-02). */
 export const RIDER_TERMS_VERSION = '2026-11-01';
 
-/** Prefix for the short human-readable order reference, e.g. HP-7F3K2. */
+/** Prefix for the short human-readable order reference, e.g. HP-7F3K2MP. */
 export const ORDER_REFERENCE_PREFIX = 'HP';
+
+/**
+ * Characters in the random part of an order reference.
+ *
+ * Seven, from a 32-character alphabet, so about 34 billion possibilities.
+ * Five characters — 33.5 million — looks ample and is not: at a few tens of
+ * thousands of orders a year the birthday bound makes a collision near
+ * certain rather than unlikely. The unique constraint on the column is still
+ * the guarantee; this decides how often it has to do anything.
+ */
+export const ORDER_REFERENCE_LENGTH = 7;
 
 /** Redis key layouts. Centralised so the dispatcher and the gateway agree. */
 export const redisKeys = {
@@ -85,6 +96,12 @@ export const wsEvents = {
   // server -> requester / shop
   ORDER_STATUS_CHANGED: 'order:status',
   TASK_STATUS_CHANGED: 'task:status',
+  /**
+   * FR-DLV-12: the six-digit handover code, sent to the requester's device
+   * only. Never stored in plaintext, so this push and a later re-issue are
+   * the only ways it reaches anyone.
+   */
+  HANDOVER_CODE_ISSUED: 'task:handover-code',
   // server -> shop
   ORDER_INCOMING: 'order:incoming',
   // chat, both directions

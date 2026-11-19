@@ -5,6 +5,8 @@ import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { RedisIoAdapter } from './dispatch/redis-io.adapter';
+import { RedisService } from './redis/redis.service';
 
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
@@ -39,6 +41,17 @@ async function bootstrap(): Promise<void> {
       disableErrorMessages: false,
     }),
   );
+
+  /**
+   * CI-2: dispatch and chat ride one persistent WebSocket connection. The
+   * Redis adapter makes a broadcast reach sockets on every API instance, so
+   * FR-DLV-03 ("delivered to all eligible riders simultaneously") still holds
+   * once there is more than one process.
+   */
+  const redis = app.get(RedisService);
+  const ioAdapter = new RedisIoAdapter(app, redis.duplicate(), redis.duplicate());
+  await ioAdapter.connect();
+  app.useWebSocketAdapter(ioAdapter);
 
   app.enableCors({
     origin: isProduction
