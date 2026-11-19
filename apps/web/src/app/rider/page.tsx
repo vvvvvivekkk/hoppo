@@ -1,6 +1,6 @@
 'use client';
 
-import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, type ActiveTask, type RiderStatus, type TaskOffer } from '@hoppo/api-client';
 import { RIDER_TERMS_VERSION, formatDistance, formatMinor } from '@hoppo/shared';
@@ -9,7 +9,27 @@ import { Banner, Button, Card, Field, Spinner } from '@/components/ui';
 import { CountdownBar, useCountdown } from '@/components/countdown';
 import { describeError, useApi } from '@/lib/api';
 import { useRiderPosition } from '@/lib/geo';
-import { sendPing, useSocket } from '@/lib/socket';
+import { usePolling } from '@/lib/poll';
+import { isWorkModeDisabled, sendPing, useSocket } from '@/lib/socket';
+import { useCanOrder } from '@/components/verify-prompt';
+
+/**
+ * The accept refusals that are not failures (FR-DLV-03/04): the window
+ * closed, or the offer was never (or is no longer) this rider's. Each means
+ * "this card is stale", so the card goes and the API's sentence is shown as
+ * information, the same way losing the race is.
+ */
+const STALE_OFFER_CODES = new Set([
+  'OFFER_EXPIRED',
+  'NOT_OFFERED_TO_YOU',
+  'NOT_YET_OFFERED',
+  // Already carrying one (accepted on another tab or device). The card goes,
+  // and the reload that follows puts the task they do hold on screen.
+  'ALREADY_HOLDING_TASK',
+]);
+
+/** How often to re-read rider status while it can change without an event. */
+const STATUS_POLL_MS = 10_000;
 
 /**
  * S-21 to S-27: the rider side.
@@ -34,10 +54,58 @@ import { sendPing, useSocket } from '@/lib/socket';
  *    Work mode cannot be turned on without a fix, because dispatch ranks by
  *    distance and a rider with no position would never be offered anything —
  *    which looks like the app not working.
+ *  - **Verification is checked before anything is fetched.** The API answers
+ *    an unverified student's `/rider/status` with a 403, so asking first and
+ *    reading `canEnable.verified` afterwards never got as far as the reading.
+ *    The outer component decides from the account already in context; the
+ *    inner one only mounts for somebody the API will actually talk to.
  */
 export default function Rider() {
-  const { api, client, user } = useApi();
-  const router = useRouter();
+  const { loading, canOrder, status } = useCanOrder();
+
+  if (loading) {
+    return (
+      <Shell title="Earn">
+        <Spinner label="Checking your rider status" />
+      </Shell>
+    );
+  }
+
+  // FR-WM-01: verification first, and nothing else on the screen until it is
+  // done — offering to accept terms for a ride they cannot take is noise.
+  if (!canOrder) {
+    return (
+      <Shell title="Earn">
+        <Card className="p-5">
+          <p className="text-lg font-bold">
+            {status === 'PENDING' ? 'Your ID is being checked' : 'Get verified first'}
+          </p>
+          <p className="mt-2 text-[var(--color-ink-soft)]">
+            Riders carry other students&apos; food and other students&apos; cash, so your student ID
+            has to be approved before you can go online.
+            {status === 'PENDING' &&
+              ' Yours is with an administrator now; this screen opens up as soon as it is approved.'}
+            {status === 'REJECTED' && ' Your last submission was not accepted.'}
+          </p>
+          <Link href="/verify" className="mt-4 block">
+            <Button className="w-full">
+              {status === 'PENDING'
+                ? 'Check the status'
+                : status === 'REJECTED'
+                  ? 'Try again'
+                  : 'Go to verification'}
+            </Button>
+          </Link>
+        </Card>
+      </Shell>
+    );
+  }
+
+  return <RiderHome />;
+}
+
+function RiderHome() {
+  const { api, client, user, refreshUser } = useApi();
 
   const [status, setStatus] = useState<RiderStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,23 +120,46 @@ export default function Rider() {
   const activeTask = status?.activeTask ?? null;
 
   const position = useRiderPosition(workModeOn);
+  /** The rider tapped "Go online" and we are waiting on a location fix. */
+  const [pendingOnline, setPendingOnline] = useState(false);
 
   const load = useCallback(async () => {
     try {
       setStatus(await api.rider.status());
       setError(null);
     } catch (e) {
+      if (e instanceof ApiError && e.needsVerification) {
+        // The account in context said verified and the server disagrees
+        // (verification was withdrawn since). Re-read it; the outer component
+        // then shows the verify card instead of this error.
+        void refreshUser();
+      }
       setError(describeError(e));
     } finally {
       setLoading(false);
     }
-  }, [api]);
+  }, [api, refreshUser]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  const { connected, socket } = useSocket(client, workModeOn || activeTask !== null, {
+  // The poll underneath the socket. Two things on this screen change with no
+  // event addressed to the rider: the shop marking an order ready (which is
+  // what enables "I have collected it") and the server's idle sweep. Without
+  // this a rider at the counter stared at "Waiting for the shop" until they
+  // reloaded. Quiet on failure — a missed poll must not put an error banner
+  // over a delivery, or wipe the message from an action the rider just took.
+  const pollStatus = useCallback(async () => {
+    try {
+      setStatus(await api.rider.status());
+    } catch {
+      /* the next tick, or the next action, will say so if it matters */
+    }
+  }, [api]);
+  usePolling(pollStatus, STATUS_POLL_MS, [], workModeOn || activeTask !== null);
+
+  const { connected, settled, socket } = useSocket(client, workModeOn || activeTask !== null, {
     onOffer: (incoming) => {
       // Ignore a new offer while already holding one: a rider can only take
       // one task, and swapping the card under their thumb mid-decision is how
@@ -79,72 +170,155 @@ export default function Rider() {
     onOfferWithdrawn: (payload) => {
       setOffer((current) => {
         if (current?.taskId !== payload.taskId) return current;
-        // Only call it a loss if this rider did not win it.
-        setLostOffer(payload.winnerUserId !== user?.id);
+        // Only call it a loss if this rider did not win it. The server says
+        // so directly; the id comparison is for an API build without `won`.
+        setLostOffer(!(payload.won ?? payload.winnerUserId === user?.id));
         return null;
       });
     },
-    onTaskStatus: () => void load(),
+    onTaskStatus: (payload) => {
+      // FR-WM-06: the server took this rider offline for going quiet. Say
+      // so — otherwise the screen flips to "offline" and it reads as a bug.
+      if (isWorkModeDisabled(payload)) {
+        setOffer(null);
+        setNotice(
+          `You were taken offline after ${payload.afterMinutes} minutes without a location update. ` +
+            'Browsers stop reporting when the tab is hidden or the phone is locked. Go online again when you are ready.',
+        );
+        void load();
+        return;
+      }
+      // This event goes to everyone in the college for every task. Only the
+      // one being carried is this screen's business; refetching on all of
+      // them meant every online rider hit the API each time anybody's
+      // delivery moved.
+      if (activeTask && payload.taskId === activeTask.id) void load();
+    },
   });
 
   // FR-WM-03: report position on the interval the server asks for, over the
   // open socket rather than as a request per ping.
-  const lastPing = useRef(0);
+  //
+  // A real timer reading the latest values through refs. This used to be an
+  // effect that pinged whenever its dependencies changed, which meant "when
+  // the position changed" — so a rider standing still at a shop counter sent
+  // nothing, and the idle sweep took them offline while they waited.
+  const positionRef = useRef(position.state);
+  positionRef.current = position.state;
+  const socketRef = useRef(socket);
+  socketRef.current = socket;
+
+  const pingIntervalSeconds = status?.pingIntervalSeconds ?? null;
+  const hasFix = position.state.kind === 'granted';
+
   useEffect(() => {
-    if (!workModeOn || position.state.kind !== 'granted' || !status) return;
+    if (!workModeOn || !hasFix || pingIntervalSeconds === null) return;
 
-    const intervalMs = Math.max(5, status.pingIntervalSeconds) * 1000;
-    const now = Date.now();
-    if (now - lastPing.current < intervalMs) return;
+    const ping = () => {
+      const fix = positionRef.current;
+      if (fix.kind !== 'granted') return;
 
-    lastPing.current = now;
-    const { latitude, longitude } = position.state;
+      // The socket is the normal path; the HTTP endpoint exists for when it
+      // is down, which on campus Wi-Fi is often enough to matter.
+      if (!sendPing(socketRef.current, fix.latitude, fix.longitude)) {
+        void api.rider.ping(fix.latitude, fix.longitude).catch(() => {
+          /* a dropped ping is not worth interrupting a delivery over */
+        });
+      }
+    };
 
-    // The socket is the normal path; the HTTP endpoint exists for when it is
-    // down, which on campus Wi-Fi is often enough to matter.
-    if (!sendPing(socket, latitude, longitude)) {
-      void api.rider.ping(latitude, longitude).catch(() => {
-        /* a dropped ping is not worth interrupting a delivery over */
-      });
+    // Once straight away: a page opened with work mode already on should
+    // report as soon as it has a fix, not one interval later.
+    ping();
+    const timer = setInterval(ping, Math.max(5, pingIntervalSeconds) * 1000);
+    return () => clearInterval(timer);
+  }, [workModeOn, hasFix, pingIntervalSeconds, api]);
+
+  const releasePosition = position.release;
+
+  const goOnline = useCallback(
+    async (latitude: number, longitude: number) => {
+      setBusy(true);
+      setError(null);
+
+      try {
+        const res = await api.rider.setWorkMode(true, latitude, longitude);
+        setNotice(res.message);
+        await load();
+      } catch (e) {
+        // Not going online after all, so stop holding the GPS open.
+        releasePosition();
+
+        if (e instanceof ApiError && e.code === 'RIDER_TERMS_REQUIRED') {
+          setNotice(null);
+          setStatus((current) =>
+            current
+              ? { ...current, canEnable: { ...current.canEnable, termsAccepted: false } }
+              : current,
+          );
+        } else {
+          setNotice(null);
+          setError(describeError(e));
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [api, load, releasePosition],
+  );
+
+  // Once work mode is on, it is what keeps the watch alive, and the earlier
+  // request has done its job. Dropping it here means that when work mode ends
+  // by any route — the button, the idle sweep, another device — the GPS is
+  // let go, instead of being held by a request nobody remembers making.
+  useEffect(() => {
+    if (workModeOn) releasePosition();
+  }, [workModeOn, releasePosition]);
+
+  // One tap, not two. "Go online" without a fix asks for one and remembers
+  // the intent; this finishes the job when the fix arrives, or gives up and
+  // lets the panel explain when it cannot.
+  useEffect(() => {
+    if (!pendingOnline) return;
+    const geo = position.state;
+
+    if (geo.kind === 'granted') {
+      setPendingOnline(false);
+      void goOnline(geo.latitude, geo.longitude);
+    } else if (geo.kind === 'denied' || geo.kind === 'unavailable') {
+      setPendingOnline(false);
+      setNotice(null);
     }
-  }, [workModeOn, position.state, status, socket, api]);
+  }, [pendingOnline, position.state, goOnline]);
 
   async function toggleWorkMode(enable: boolean) {
-    setBusy(true);
     setError(null);
     setNotice(null);
 
-    try {
-      if (enable) {
-        if (position.state.kind !== 'granted') {
-          position.request();
-          setNotice('Allow location access so shops and drop points can be ranked by distance.');
-          return;
-        }
-        const res = await api.rider.setWorkMode(
-          true,
-          position.state.latitude,
-          position.state.longitude,
-        );
-        setNotice(res.message);
-      } else {
-        const res = await api.rider.setWorkMode(false);
-        setNotice(res.message);
-        setOffer(null);
+    if (enable) {
+      if (position.state.kind === 'granted') {
+        await goOnline(position.state.latitude, position.state.longitude);
+        return;
       }
+      // No fix yet. Ask, and let the effect above go online when it lands.
+      position.request();
+      setPendingOnline(true);
+      setNotice(
+        'Getting your location — allow it if your browser asks. You will go online as soon as there is a fix.',
+      );
+      return;
+    }
+
+    setBusy(true);
+    setPendingOnline(false);
+    try {
+      const res = await api.rider.setWorkMode(false);
+      setNotice(res.message);
+      setOffer(null);
+      position.release();
       await load();
     } catch (e) {
-      if (e instanceof ApiError && e.code === 'RIDER_TERMS_REQUIRED') {
-        setError(null);
-        setNotice(null);
-        setStatus((current) =>
-          current
-            ? { ...current, canEnable: { ...current.canEnable, termsAccepted: false } }
-            : current,
-        );
-      } else {
-        setError(describeError(e));
-      }
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
@@ -178,6 +352,14 @@ export default function Rider() {
         // one rider. Not an error.
         setOffer(null);
         setLostOffer(true);
+      } else if (e instanceof ApiError && STALE_OFFER_CODES.has(e.code)) {
+        // The card was out of date — the window closed a moment before the
+        // tap, or the offer moved on. Nothing the rider did wrong, so the
+        // card goes and the API's own sentence is shown as information.
+        setOffer(null);
+        setLostOffer(false);
+        setNotice(e.message);
+        void load();
       } else {
         setError(describeError(e));
       }
@@ -205,27 +387,7 @@ export default function Rider() {
     );
   }
 
-  // FR-WM-01: verification first, and nothing else on the screen until it is
-  // done — offering to accept terms for a ride they cannot take is noise.
-  if (!status.canEnable.verified) {
-    return (
-      <Shell title="Earn">
-        <Card className="p-5">
-          <p className="text-lg font-bold">Get verified first</p>
-          <p className="mt-2 text-[var(--color-ink-soft)]">
-            Riders carry other students&apos; food and other students&apos; cash, so your student
-            ID has to be approved before you can go online.
-          </p>
-          <Button className="mt-4 w-full" onClick={() => router.push('/verify')}>
-            Go to verification
-          </Button>
-        </Card>
-      </Shell>
-    );
-  }
-
-  const barred =
-    status.barredUntil !== null && new Date(status.barredUntil).getTime() > Date.now();
+  const barred = status.barredUntil !== null && new Date(status.barredUntil).getTime() > Date.now();
 
   return (
     <Shell
@@ -239,7 +401,9 @@ export default function Rider() {
                 : 'bg-[var(--color-waiting-bg)] text-[var(--color-waiting)]'
             }`}
           >
-            {connected ? 'Online' : 'Reconnecting'}
+            {/* "Reconnecting" only once a first attempt has actually failed
+                or dropped; before that it is simply connecting. */}
+            {connected ? 'Online' : settled ? 'Reconnecting' : 'Connecting'}
           </span>
         ) : null
       }
@@ -264,20 +428,24 @@ export default function Rider() {
               dateStyle: 'medium',
               timeStyle: 'short',
             })}
-            , after abandoning a delivery.
+            , after abandoning several deliveries in a short time.
           </Banner>
         </div>
       )}
 
-      {/* FR-WM-02 */}
-      {!status.canEnable.termsAccepted || !status.canEnable.termsVersionCurrent ? (
+      {/* A live task comes before everything, the terms gate included. A new
+          terms version published while a rider is mid-delivery must not swap
+          the order in their bag for a wall of text — somebody is waiting for
+          it. The terms are asked for again once the delivery is done. */}
+      {activeTask ? (
+        <ActiveTaskPanel task={activeTask} onChanged={() => void load()} />
+      ) : !status.canEnable.termsAccepted || !status.canEnable.termsVersionCurrent ? (
+        // FR-WM-02
         <RiderTerms
           renewal={status.canEnable.termsAccepted && !status.canEnable.termsVersionCurrent}
           busy={busy}
           onAccept={() => void acceptTerms()}
         />
-      ) : activeTask ? (
-        <ActiveTaskPanel task={activeTask} onChanged={() => void load()} />
       ) : offer ? (
         <OfferCard
           offer={offer}
@@ -291,7 +459,7 @@ export default function Rider() {
           status={status}
           position={position}
           barred={barred}
-          busy={busy}
+          busy={busy || pendingOnline}
           lostOffer={lostOffer}
           onToggle={(enable) => void toggleWorkMode(enable)}
         />
@@ -330,7 +498,8 @@ export default function Rider() {
               {status.lifetime.acceptanceRate !== null && (
                 <span>
                   <span className="text-[var(--color-ink-faint)]">Accepted</span>{' '}
-                  <strong>{Math.round(status.lifetime.acceptanceRate * 100)}%</strong>
+                  {/* Already a percentage (0–100) from the API, not a fraction. */}
+                  <strong>{Math.round(status.lifetime.acceptanceRate)}%</strong>
                 </span>
               )}
               {status.lifetime.abandonedTasks > 0 && (
@@ -344,7 +513,9 @@ export default function Rider() {
         )}
 
         <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
-          Earnings land in your Hoppo wallet. Withdrawals arrive in a later phase.
+          Fees for wallet-paid orders land in your Hoppo wallet. On a cash order you keep your fee
+          out of the cash you collect at the door, so nothing is added to the wallet for it.
+          Withdrawals arrive in a later phase.
         </p>
       </section>
     </Shell>
@@ -379,14 +550,13 @@ function RiderTerms({
           before you accept.
         </li>
         <li>
-          Abandoning a delivery after accepting bars you from new tasks for a period, because
-          somebody&apos;s food goes cold.
+          Abandoning a delivery after accepting counts against you, because somebody&apos;s food
+          goes cold. Do it repeatedly in a short time and you are barred from new tasks for a
+          period.
         </li>
         <li>You follow traffic law. Hoppo does not ask anyone to rush.</li>
       </ul>
-      <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
-        Version {RIDER_TERMS_VERSION}
-      </p>
+      <p className="mt-3 text-sm text-[var(--color-ink-faint)]">Version {RIDER_TERMS_VERSION}</p>
       <Button large className="mt-4 w-full" loading={busy} onClick={onAccept}>
         I accept
       </Button>
@@ -456,9 +626,7 @@ function WorkModePanel({
         )}
 
         {geo.kind === 'asking' && (
-          <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
-            Waiting for a location fix…
-          </p>
+          <p className="mt-3 text-sm text-[var(--color-ink-faint)]">Waiting for a location fix…</p>
         )}
 
         <Button
@@ -549,6 +717,22 @@ function OfferCard({
             </dd>
           </div>
         )}
+        {/* ADR-006: a cash order means the rider fronts the shop's money and
+            gets it back at the door. That is the thing to know before
+            accepting, not after — a rider with ₹40 in their pocket cannot
+            take a ₹300 order. */}
+        {((offer.cashToPayShopMinor ?? 0) > 0 || (offer.cashToCollectMinor ?? 0) > 0) && (
+          <div>
+            <dt className="text-sm text-[var(--color-ink-faint)]">Cash order</dt>
+            <dd className="font-semibold">
+              {(offer.cashToPayShopMinor ?? 0) > 0 && (offer.cashToCollectMinor ?? 0) > 0
+                ? `You pay the shop ${formatMinor(offer.cashToPayShopMinor ?? 0)} in cash, collect ${formatMinor(offer.cashToCollectMinor ?? 0)} at the door`
+                : (offer.cashToPayShopMinor ?? 0) > 0
+                  ? `You pay the shop ${formatMinor(offer.cashToPayShopMinor ?? 0)} in cash`
+                  : `You collect ${formatMinor(offer.cashToCollectMinor ?? 0)} in cash at the door`}
+            </dd>
+          </div>
+        )}
         {offer.description && (
           <div>
             <dt className="text-sm text-[var(--color-ink-faint)]">Note</dt>
@@ -592,11 +776,14 @@ function ActiveTaskPanel({ task, onChanged }: { task: ActiveTask; onChanged: () 
     setError(null);
     try {
       await action();
-      onChanged();
     } catch (e) {
       setError(describeError(e));
     } finally {
       setBusy(false);
+      // On failure too. A wrong handover code changes the task (the attempt
+      // counter, and after enough of them the task itself is escalated), and
+      // refreshing only on success left the rider reading a stale count.
+      onChanged();
     }
   }
 
@@ -731,16 +918,17 @@ function ActiveTaskPanel({ task, onChanged }: { task: ActiveTask; onChanged: () 
           </div>
           {task.otpAttempts > 0 && (
             <p className="mt-2 text-sm font-semibold text-[var(--color-waiting)]">
-              {task.otpAttempts} wrong{' '}
-              {task.otpAttempts === 1 ? 'attempt' : 'attempts'} so far. The student can have a new
-              code sent to themselves if they have lost it.
+              {task.otpAttempts} wrong {task.otpAttempts === 1 ? 'attempt' : 'attempts'} so far. The
+              student can have a new code sent to themselves if they have lost it.
             </p>
           )}
           <Button
             large
             className="mt-3 w-full"
             loading={busy}
-            disabled={code.length < 4}
+            // The code is exactly six digits; anything shorter is refused by
+            // the API and still costs one of the limited attempts.
+            disabled={code.length !== 6}
             onClick={() => void run(() => api.rider.submitHandoverCode(task.id, code))}
           >
             Complete the delivery
@@ -752,12 +940,11 @@ function ActiveTaskPanel({ task, onChanged }: { task: ActiveTask; onChanged: () 
         <div className="mt-6 border-t border-[var(--color-line)] pt-4">
           {confirmAbandon ? (
             <>
-              <p className="font-semibold text-[var(--color-danger)]">
-                Give this delivery up?
-              </p>
+              <p className="font-semibold text-[var(--color-danger)]">Give this delivery up?</p>
               <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
-                Somebody is waiting for this food, so abandoning it bars you from new tasks for a
-                while. Only do it if you genuinely cannot finish.
+                Somebody is waiting for this food, so this is recorded against you, and abandoning
+                several deliveries in a short time bars you from new tasks for a while. Only do it
+                if you genuinely cannot finish.
               </p>
               <div className="mt-3 flex gap-2">
                 <Button

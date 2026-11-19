@@ -9,7 +9,10 @@ import { useApi } from '@/lib/api';
 export default function Account() {
   const { user, loading } = useApi();
 
-  if (loading) {
+  // The Shell holds the content back while the session loads and sends a
+  // signed-out visitor to /welcome, so by the time anything below is on
+  // screen there is a user. This only satisfies the hooks-before-returns rule.
+  if (loading || !user) {
     return (
       <Shell title="Account">
         <Spinner />
@@ -17,18 +20,13 @@ export default function Account() {
     );
   }
 
-  if (!user) {
-    return (
-      <Shell title="Account">
-        <Banner tone="info">You are signed out.</Banner>
-        <Link href="/login" className="mt-4 block text-center text-[var(--color-accent)] underline">
-          Sign in
-        </Link>
-      </Shell>
-    );
-  }
-
   const profile = user.studentProfile;
+  // The roll number, department and year are only real once a submission has
+  // been made. Before that the profile row holds placeholders — an empty roll
+  // number and "year 1" — and showing those as "from your verification"
+  // presents made-up details as the student's own.
+  const hasDetails =
+    profile !== null && profile.verificationStatus !== 'UNSUBMITTED' && profile.rollNumber !== '';
 
   return (
     <Shell title="Account">
@@ -57,9 +55,13 @@ export default function Account() {
         <Card className="mt-3 p-5">
           <p className="font-bold">Student details</p>
           <dl className="mt-2 space-y-1 text-sm">
-            <Row label="Roll number" value={profile.rollNumber} />
-            <Row label="Department" value={profile.department} />
-            <Row label="Year" value={`Year ${profile.yearOfStudy}`} />
+            {hasDetails && (
+              <>
+                <Row label="Roll number" value={profile.rollNumber} />
+                <Row label="Department" value={profile.department} />
+                <Row label="Year" value={`Year ${profile.yearOfStudy}`} />
+              </>
+            )}
             <Row
               label="Verification"
               value={
@@ -71,7 +73,11 @@ export default function Account() {
                           })}`
                         : ''
                     }`
-                  : profile.verificationStatus.toLowerCase()
+                  : profile.verificationStatus === 'UNSUBMITTED'
+                    ? 'Not started'
+                    : profile.verificationStatus === 'PENDING'
+                      ? 'Being checked'
+                      : 'Not accepted'
               }
             />
             <Row
@@ -85,10 +91,20 @@ export default function Account() {
               }
             />
           </dl>
-          <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
-            These came from your verification. Changing them means resubmitting, which an
-            administrator has to approve.
-          </p>
+          {hasDetails ? (
+            <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
+              These came from your verification
+              {profile.verificationStatus === 'VERIFIED' ? '' : ' submission'}. Changing them means
+              resubmitting, which an administrator has to approve.
+            </p>
+          ) : (
+            <Link
+              href="/verify"
+              className="mt-3 block text-sm font-semibold text-[var(--color-accent)] underline"
+            >
+              Verify your student ID to fill these in
+            </Link>
+          )}
         </Card>
       )}
 

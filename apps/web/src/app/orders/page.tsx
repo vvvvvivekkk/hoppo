@@ -6,6 +6,7 @@ import { Shell } from '@/components/shell';
 import { Banner, Button, Card, EmptyState, Spinner, Status } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 import { usePolling } from '@/lib/poll';
+import { VerifyPrompt, useCanOrder } from '@/components/verify-prompt';
 
 const LIVE_STATUSES = new Set(['PLACED', 'SHOP_ACCEPTED', 'PREPARING', 'READY', 'PICKED_UP']);
 
@@ -16,10 +17,36 @@ const LIVE_STATUSES = new Set(['PLACED', 'SHOP_ACCEPTED', 'PREPARING', 'READY', 
  * screen, where it matters; a list that is a few seconds stale is fine, and
  * one poll beats holding a subscription open for every order a student has
  * ever placed.
+ *
+ * An unverified student is not asked. The API refuses their `GET /orders`
+ * with a 403, and they cannot have placed an order anyway, so the request
+ * would only produce an error banner over a "No orders yet" that is true for
+ * the wrong reason. They get the verify prompt, which says what is actually
+ * in the way.
  */
 export default function Orders() {
   const { api } = useApi();
-  const { data, error, loading } = usePolling(() => api.orders.mine(30), 15_000);
+  const { canOrder, loading: accountLoading } = useCanOrder();
+  const { data, error, loading } = usePolling(() => api.orders.mine(30), 15_000, [], canOrder);
+
+  if (accountLoading) {
+    return (
+      <Shell title="Your orders">
+        <Spinner />
+      </Shell>
+    );
+  }
+
+  if (!canOrder) {
+    return (
+      <Shell title="Your orders">
+        <VerifyPrompt />
+        <p className="text-sm text-[var(--color-ink-soft)]">
+          Orders you place will show up here once your ID is approved.
+        </p>
+      </Shell>
+    );
+  }
 
   const orders = data?.items ?? [];
   const live = orders.filter((o) => LIVE_STATUSES.has(o.status));
@@ -32,12 +59,15 @@ export default function Orders() {
       {error && (
         <div className="mb-3">
           <Banner tone="warn">
-            {describeError(error)} Showing whatever loaded last.
+            {describeError(error)}
+            {data ? ' Showing whatever loaded last.' : ''}
           </Banner>
         </div>
       )}
 
-      {!loading && orders.length === 0 && (
+      {/* Only once a list has actually loaded. A failed first request is not
+          "no orders", and saying so sends people off to order twice. */}
+      {data && orders.length === 0 && (
         <EmptyState
           title="No orders yet"
           body="Pick a shop near your college and your first order will show up here."

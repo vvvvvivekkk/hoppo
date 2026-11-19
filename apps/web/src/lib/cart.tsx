@@ -9,6 +9,8 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { MAX_CART_ITEM_QUANTITY } from '@hoppo/shared';
+import { useApi } from './api';
 
 export interface CartLine {
   catalogItemId: string;
@@ -28,6 +30,12 @@ export interface CartLine {
 }
 
 export interface Cart {
+  /**
+   * Whose cart this is. A phone gets passed around and accounts get swapped
+   * on it; a cart with no owner showed the last person's samosas to the next
+   * person to sign in.
+   */
+  ownerId: string;
   listingId: string;
   shopName: string;
   lines: CartLine[];
@@ -35,6 +43,12 @@ export interface Cart {
 
 interface CartContextValue {
   cart: Cart | null;
+  /**
+   * False until the saved cart has been read. Until then "no cart" means
+   * "not looked yet", and a screen that treats it as empty flashes "Your
+   * cart is empty" at someone who has a full one.
+   */
+  hydrated: boolean;
   /** Lines for the shop being viewed, or an empty array for any other shop. */
   linesFor(listingId: string): CartLine[];
   quantityOf(listingId: string, catalogItemId: string): number;
@@ -62,12 +76,20 @@ const STORAGE_KEY = 'hoppo.student.cart';
  *    minutes building is worse than an extra tap.
  *  - **Prices are not trusted from here.** See `unitPriceMinor` above.
  *
+ * Scoped to the signed-in student. The saved cart records its owner and is
+ * dropped when somebody else signs in; an explicit sign-out empties it too
+ * (see `SignOutButton`). A session that merely expires does not, so signing
+ * back in as the same person finds the cart where it was left.
+ *
  * Persisted to `localStorage` so switching to Maps to find a drop point, or
  * taking a call, does not lose the cart. Everything is in integer paise; a
  * float total drifts by a rupee over enough additions and then disagrees with
  * the server for reasons nobody can reproduce.
  */
 export function CartProvider({ children }: { children: ReactNode }) {
+  const { user, loading: authLoading } = useApi();
+  const userId = user?.id ?? null;
+
   const [cart, setCart] = useState<Cart | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
@@ -97,13 +119,24 @@ export function CartProvider({ children }: { children: ReactNode }) {
     }
   }, [cart, hydrated]);
 
+  // Somebody else's cart is not this student's cart. Checked once the saved
+  // cart and the signed-in user are both known — either can arrive first.
+  useEffect(() => {
+    if (!hydrated || authLoading || !userId) return;
+    setCart((current) => (current && current.ownerId !== userId ? null : current));
+  }, [hydrated, authLoading, userId]);
+
   const add = useCallback(
     (listingId: string, shopName: string, line: Omit<CartLine, 'quantity'>) => {
+      // Every screen that can add is behind sign-in, so there is always an
+      // owner. Refusing quietly beats saving a cart that belongs to nobody.
+      if (!userId) return;
+
       setCart((current) => {
         // A different shop replaces the cart. The caller is responsible for
         // confirming that with the student first.
         if (!current || current.listingId !== listingId) {
-          return { listingId, shopName, lines: [{ ...line, quantity: 1 }] };
+          return { ownerId: userId, listingId, shopName, lines: [{ ...line, quantity: 1 }] };
         }
 
         const existing = current.lines.find((l) => l.catalogItemId === line.catalogItemId);
@@ -111,7 +144,9 @@ export function CartProvider({ children }: { children: ReactNode }) {
           return {
             ...current,
             lines: current.lines.map((l) =>
-              l.catalogItemId === line.catalogItemId ? { ...l, quantity: l.quantity + 1 } : l,
+              l.catalogItemId === line.catalogItemId
+                ? { ...l, quantity: Math.min(l.quantity + 1, MAX_CART_ITEM_QUANTITY) }
+                : l,
             ),
           };
         }
@@ -119,7 +154,7 @@ export function CartProvider({ children }: { children: ReactNode }) {
         return { ...current, lines: [...current.lines, { ...line, quantity: 1 }] };
       });
     },
-    [],
+    [userId],
   );
 
   const setQuantity = useCallback((catalogItemId: string, quantity: number) => {
@@ -157,6 +192,7 @@ export function CartProvider({ children }: { children: ReactNode }) {
 
     return {
       cart,
+      hydrated,
       linesFor: (listingId: string) => (cart?.listingId === listingId ? cart.lines : []),
       quantityOf: (listingId: string, catalogItemId: string) =>
         cart?.listingId === listingId
@@ -169,7 +205,7 @@ export function CartProvider({ children }: { children: ReactNode }) {
       setNote,
       clear,
     };
-  }, [cart, add, setQuantity, setNote, clear]);
+  }, [cart, hydrated, add, setQuantity, setNote, clear]);
 
   return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
 }

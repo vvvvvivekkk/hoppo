@@ -55,8 +55,11 @@ export default function Signup() {
 
   const emailHint = useMemo(() => {
     const college = colleges.find((c) => c.id === collegeId);
+    // Required, not preferred: when a college has a domain on file the API
+    // refuses any other address (EMAIL_DOMAIN_MISMATCH). Saying "if you have
+    // one" invited people to type a Gmail address and be turned away.
     return college?.emailDomain
-      ? `Your ${college.emailDomain} address, if you have one.`
+      ? `Must be your ${college.emailDomain} address — ${college.name} accounts need one.`
       : 'A college address helps verification go faster.';
   }, [colleges, collegeId]);
 
@@ -132,7 +135,7 @@ export default function Signup() {
         <>
           <h1 className="mt-2 text-2xl font-bold">What is your mobile number?</h1>
           <p className="mt-1 text-[var(--color-ink-soft)]">
-            We send a code to confirm it. This is also how a rider reaches you about a delivery.
+            We send a code to confirm it. Your number is not shown to riders or to other students.
           </p>
 
           <form onSubmit={requestCode} className="mt-6 space-y-4">
@@ -176,7 +179,15 @@ export default function Signup() {
               className="text-center font-mono text-2xl tracking-[0.4em]"
               required
             />
-            <Button type="submit" large loading={busy} disabled={code.length < 4} className="w-full">
+            {/* Exactly six: the API rejects anything shorter, and a rejected
+                guess still uses up one of the challenge's attempts. */}
+            <Button
+              type="submit"
+              large
+              loading={busy}
+              disabled={code.length !== 6}
+              className="w-full"
+            >
               Confirm
             </Button>
             <Button

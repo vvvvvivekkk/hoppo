@@ -22,7 +22,7 @@ export default function Shop() {
   const params = useParams<{ listingId: string }>();
   const listingId = params.listingId;
 
-  const { api } = useApi();
+  const { api, signedIn } = useApi();
   const router = useRouter();
   const cart = useCart();
 
@@ -45,8 +45,9 @@ export default function Shop() {
   }, [api, listingId]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    // Signed out, the Shell is redirecting; the request would only 401.
+    if (signedIn) void load();
+  }, [load, signedIn]);
 
   const lines = cart.linesFor(listingId);
   const lineTotal = lines.reduce((sum, l) => sum + l.unitPriceMinor * l.quantity, 0);
@@ -81,7 +82,11 @@ export default function Shop() {
     );
   }
 
-  const allItems = shop.categories.flatMap((c) => c.items);
+  // Items the shop filed under no category. Optional-chained because an API
+  // build from before the field existed does not send it.
+  const uncategorised = shop.uncategorised ?? [];
+  const categorised = shop.categories.filter((category) => category.items.length > 0);
+  const allItems = [...shop.categories.flatMap((c) => c.items), ...uncategorised];
 
   return (
     <Shell back="/shops" title={shop.shop.name}>
@@ -127,9 +132,7 @@ export default function Shop() {
       {switchPrompt && (
         <div className="mt-3">
           <Card tone="waiting" className="p-4">
-            <p className="font-semibold">
-              Your cart has items from {switchPrompt.fromShop}.
-            </p>
+            <p className="font-semibold">Your cart has items from {switchPrompt.fromShop}.</p>
             <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
               An order goes to one shop, so adding this will empty that cart.
             </p>
@@ -170,26 +173,49 @@ export default function Shop() {
         </div>
       )}
 
-      {shop.categories
-        .filter((category) => category.items.length > 0)
-        .map((category) => (
-          <section key={category.id} className="mt-6">
-            <h2 className="mb-2 font-bold text-[var(--color-ink-soft)]">{category.name}</h2>
-            <ul className="space-y-3">
-              {category.items.map((item) => (
-                <li key={item.id}>
-                  <ItemCard
-                    item={item}
-                    shopOpen={shop.isOpen}
-                    quantity={cart.quantityOf(listingId, item.id)}
-                    onAdd={() => addItem(item)}
-                    onChange={(next) => cart.setQuantity(item.id, next)}
-                  />
-                </li>
-              ))}
-            </ul>
-          </section>
-        ))}
+      {categorised.map((category) => (
+        <section key={category.id} className="mt-6">
+          <h2 className="mb-2 font-bold text-[var(--color-ink-soft)]">{category.name}</h2>
+          <ul className="space-y-3">
+            {category.items.map((item) => (
+              <li key={item.id}>
+                <ItemCard
+                  item={item}
+                  shopOpen={shop.isOpen}
+                  quantity={cart.quantityOf(listingId, item.id)}
+                  onAdd={() => addItem(item)}
+                  onChange={(next) => cart.setQuantity(item.id, next)}
+                />
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+
+      {/* A shop that never set categories up has its whole menu here. It
+          used to be dropped, and the shop looked empty. "More" only when
+          there are categories above it to be more than; on its own the
+          items need no heading at all. */}
+      {uncategorised.length > 0 && (
+        <section className="mt-6">
+          {categorised.length > 0 && (
+            <h2 className="mb-2 font-bold text-[var(--color-ink-soft)]">More</h2>
+          )}
+          <ul className="space-y-3">
+            {uncategorised.map((item) => (
+              <li key={item.id}>
+                <ItemCard
+                  item={item}
+                  shopOpen={shop.isOpen}
+                  quantity={cart.quantityOf(listingId, item.id)}
+                  onAdd={() => addItem(item)}
+                  onChange={(next) => cart.setQuantity(item.id, next)}
+                />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {lines.length > 0 && (
         <div className="fixed inset-x-0 bottom-16 z-10 mx-auto max-w-2xl px-3">
@@ -204,9 +230,7 @@ export default function Shop() {
             </span>
             <span className="text-white/70">·</span>
             <span>{formatMinor(lineTotal)}</span>
-            <span className="ml-auto">
-              {shop.isOpen ? 'Checkout →' : 'Shop is closed'}
-            </span>
+            <span className="ml-auto">{shop.isOpen ? 'Checkout →' : 'Shop is closed'}</span>
           </button>
           <p className="mt-1 text-center text-xs text-[var(--color-ink-faint)]">
             Delivery and platform fees are added at checkout.

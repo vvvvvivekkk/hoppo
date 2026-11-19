@@ -27,12 +27,32 @@ interface ApiContextValue {
   user: AuthUser | null;
   loading: boolean;
   signedIn: boolean;
+  /**
+   * Set when the server has said this account is suspended or closed.
+   *
+   * It has to live here rather than on `user`, because there is no user: the
+   * API's JWT guard refuses a suspended account with a 401 before `/auth/me`
+   * ever runs, so the client is signed out and `user.status` is never seen.
+   * Without this flag a suspended student was dropped on the welcome screen
+   * with no explanation.
+   */
+  accountBlocked: AccountBlocked | null;
   login(identifier: string, password: string): Promise<void>;
   /** Registration returns tokens, so it signs the student straight in. */
   adoptSession(tokens: TokenPair): Promise<void>;
   logout(): Promise<void>;
   refreshUser(): Promise<void>;
 }
+
+export type AccountBlocked = 'SUSPENDED' | 'DEACTIVATED';
+
+/** Which kind of block an error describes, or null if it is something else. */
+export function blockedReason(error: unknown): AccountBlocked | null {
+  return error instanceof ApiError ? error.accountBlocked : null;
+}
+
+/** How often, at most, coming back to the tab re-reads the signed-in user. */
+const FOCUS_REFRESH_MIN_GAP_MS = 15_000;
 
 const ApiContext = createContext<ApiContextValue | null>(null);
 
@@ -42,6 +62,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [authVersion, setAuthVersion] = useState(0);
+  const [accountBlocked, setAccountBlocked] = useState<AccountBlocked | null>(null);
 
   // One client for the lifetime of the app. Rebuilding it per render would
   // throw away the in-flight refresh promise, and that promise is what stops
@@ -55,22 +76,45 @@ export function ApiProvider({ children }: { children: ReactNode }) {
     clientRef.current = new ApiClient({
       baseUrl: API_URL,
       tokens,
-      onAuthFailure: () => setUser(null),
+      onAuthFailure: (error) => {
+        // Any request can be the one that discovers a suspension, not only
+        // `/auth/me` — a rider mid-poll finds out from `/rider/status`.
+        const blocked = blockedReason(error);
+        if (blocked) setAccountBlocked(blocked);
+        setUser(null);
+      },
     });
   }
 
   const api = useMemo(() => endpoints(clientRef.current!), []);
 
   const refreshUser = useCallback(async () => {
+    // No tokens means no session, and there is nothing to ask the server.
+    // Belt and braces with the token store's guard against the same loop.
+    if (!clientRef.current!.hasSession()) {
+      setUser(null);
+      setLoading(false);
+      return;
+    }
+
     try {
       const { user: me } = await api.auth.me();
       setUser(me);
+      setAccountBlocked(null);
     } catch (error) {
-      // A 401 is the normal state before sign-in, not something to log.
-      if (!(error instanceof ApiError && error.isAuthFailure)) {
-        console.error('Could not load the signed-in user', error);
+      const blocked = blockedReason(error);
+      if (blocked) setAccountBlocked(blocked);
+
+      if (error instanceof ApiError && error.isAuthFailure) {
+        // A 401 is the normal state before sign-in, not something to log.
+        setUser(null);
+      } else {
+        // The server could not be reached, which says nothing about whether
+        // the session is still good. Keep whoever was signed in: this runs
+        // every time the tab regains focus, and a phone coming out of a lift
+        // must not be thrown back to the welcome screen.
+        console.warn('Could not load the signed-in user', error);
       }
-      setUser(null);
     } finally {
       setLoading(false);
     }
@@ -80,9 +124,46 @@ export function ApiProvider({ children }: { children: ReactNode }) {
     void refreshUser();
   }, [refreshUser, authVersion]);
 
+  // Verification is decided by an administrator, somewhere else, at a time
+  // the student cannot see. Re-reading the user when the tab comes back is
+  // what lets "approved" show up without a reload — the usual pattern is
+  // submit, switch to another app, come back later. Throttled, because focus
+  // and visibility both fire on one return and some browsers fire them often.
+  const lastFocusRefresh = useRef(0);
+  useEffect(() => {
+    const onReturn = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!clientRef.current!.hasSession()) return;
+
+      const now = Date.now();
+      if (now - lastFocusRefresh.current < FOCUS_REFRESH_MIN_GAP_MS) return;
+      lastFocusRefresh.current = now;
+
+      void refreshUser();
+    };
+
+    window.addEventListener('focus', onReturn);
+    document.addEventListener('visibilitychange', onReturn);
+    return () => {
+      window.removeEventListener('focus', onReturn);
+      document.removeEventListener('visibilitychange', onReturn);
+    };
+  }, [refreshUser]);
+
   const login = useCallback(
     async (identifier: string, password: string) => {
-      const tokens = await api.auth.login(identifier, password);
+      let tokens: TokenPair;
+      try {
+        tokens = await api.auth.login(identifier, password);
+      } catch (error) {
+        // Sign-in is where a suspended student usually finds out. Record it
+        // so the sign-in screen can hand over to /suspended, then let the
+        // error through for everything else that reads it.
+        const blocked = blockedReason(error);
+        if (blocked) setAccountBlocked(blocked);
+        throw error;
+      }
+      setAccountBlocked(null);
       await clientRef.current!.setTokens(tokens);
       await refreshUser();
     },
@@ -105,6 +186,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
     }
     await clientRef.current!.clearTokens();
     setUser(null);
+    setAccountBlocked(null);
   }, [api]);
 
   const value = useMemo<ApiContextValue>(
@@ -114,12 +196,13 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       user,
       loading,
       signedIn: user !== null,
+      accountBlocked,
       login,
       adoptSession,
       logout,
       refreshUser,
     }),
-    [api, user, loading, login, adoptSession, logout, refreshUser],
+    [api, user, loading, accountBlocked, login, adoptSession, logout, refreshUser],
   );
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>;

@@ -1,7 +1,8 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { AuthShell, SignOutButton } from '@/components/shell';
 import { Banner, Button, Card, Field, Select, Spinner } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
@@ -13,6 +14,8 @@ interface VerificationState {
   status: Status;
   submissionsUsed: number;
   submissionsAllowed: number;
+  /** When the rolling window next frees an attempt, if the API said. */
+  retryAt: string | null;
   latestSubmission: {
     submittedAt: string;
     rejectionReason: string | null;
@@ -28,9 +31,12 @@ interface VerificationState {
  * Splitting it would mean redirect logic in three places and a race every
  * time an administrator decides.
  *
- * FR-SVER-05 caps resubmissions. The count is shown before the form, not
- * after a failure, because "you have one attempt left" changes how carefully
- * someone photographs their ID card.
+ * FR-SVER-05/06 cap resubmissions — as a rolling window, not for life: so
+ * many in any so-many-day period, counted from the submissions themselves.
+ * The count is shown before the form, not after a failure, because "you have
+ * one attempt left" changes how carefully someone photographs their ID card.
+ * And running out is worded as "not for now", because that is what it is:
+ * the oldest submission ages out of the window and an attempt comes back.
  */
 export default function Verify() {
   const { api, user, refreshUser } = useApi();
@@ -40,6 +46,11 @@ export default function Verify() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // What the rest of the app currently believes, read through a ref so that
+  // correcting it below does not re-create `load` and fetch twice.
+  const knownStatus = useRef(user?.studentProfile?.verificationStatus);
+  knownStatus.current = user?.studentProfile?.verificationStatus;
+
   const load = useCallback(async () => {
     try {
       const res = await api.verification.me();
@@ -47,6 +58,7 @@ export default function Verify() {
         status: res.status,
         submissionsUsed: res.submissionsUsed,
         submissionsAllowed: res.submissionsAllowed,
+        retryAt: res.retryAt ?? null,
         latestSubmission: res.latestSubmission
           ? {
               submittedAt: res.latestSubmission.submittedAt,
@@ -58,6 +70,11 @@ export default function Verify() {
       if (res.status === 'VERIFIED') {
         await refreshUser();
         router.replace('/shops');
+      } else if (res.status !== knownStatus.current) {
+        // This screen has just learned something the account in context does
+        // not know yet — submitted, or rejected while it was open. Every
+        // other screen words its verify prompt from that copy.
+        void refreshUser();
       }
     } catch (e) {
       setError(describeError(e));
@@ -121,7 +138,14 @@ export default function Verify() {
         <p className="mt-6 text-center text-sm text-[var(--color-ink-faint)]">
           This page updates itself — you can leave it open or come back later.
         </p>
-        <div className="mt-8">
+        {/* Browsing is unlocked while this is pending (FR-SVER-01), so the
+            waiting screen is not a dead end. */}
+        <div className="mt-8 space-y-3">
+          <Link href="/shops" className="block">
+            <Button large className="w-full">
+              Look at the shops meanwhile
+            </Button>
+          </Link>
           <SignOutButton />
         </div>
       </AuthShell>
@@ -147,11 +171,25 @@ export default function Verify() {
             <p className="mt-1">{state.latestSubmission.rejectionNote}</p>
           </Card>
         )}
+        {/* Not "all attempts used, contact an administrator": the limit is a
+            rolling window, so that was telling people a door was shut for
+            good when it reopens by itself. */}
         <p className="mt-4 text-[var(--color-ink-soft)]">
-          You have used all {state.submissionsAllowed} attempts, so the next step is to contact
-          your college&apos;s Hoppo administrator directly.
+          You have used all {state.submissionsAllowed} attempts allowed for now. The limit covers a
+          set number of days, so{' '}
+          {state.retryAt
+            ? `you can submit again after ${new Date(state.retryAt).toLocaleDateString('en-IN', {
+                dateStyle: 'medium',
+              })}.`
+            : 'more attempts open up as your earlier submissions age out of it.'}{' '}
+          If it is urgent, contact your college&apos;s Hoppo administrator directly.
         </p>
-        <div className="mt-8">
+        <div className="mt-8 space-y-3">
+          <Link href="/shops" className="block">
+            <Button tone="secondary" large className="w-full">
+              Look at the shops meanwhile
+            </Button>
+          </Link>
           <SignOutButton />
         </div>
       </AuthShell>
@@ -162,7 +200,13 @@ export default function Verify() {
     <SubmitForm
       state={state}
       attemptsLeft={attemptsLeft}
-      onSubmitted={() => void load()}
+      onSubmitted={() => {
+        // The account in context still says "unsubmitted" at this point, and
+        // every other screen reads it from there — the shops list would go on
+        // saying "Verify to start ordering" to someone who just did.
+        void refreshUser();
+        void load();
+      }}
     />
   );
 }
@@ -225,8 +269,7 @@ function SubmitForm({
       {state.status === 'REJECTED' && state.latestSubmission?.rejectionReason && (
         <div className="mt-4">
           <Banner tone="warn">
-            Last time:{' '}
-            {state.latestSubmission.rejectionReason.replace(/_/g, ' ').toLowerCase()}
+            Last time: {state.latestSubmission.rejectionReason.replace(/_/g, ' ').toLowerCase()}
             {state.latestSubmission.rejectionNote
               ? ` — ${state.latestSubmission.rejectionNote}`
               : ''}
@@ -237,8 +280,8 @@ function SubmitForm({
       {/* FR-SVER-05: say how many attempts are left before the form, not after. */}
       <p className="mt-4 text-sm font-semibold text-[var(--color-ink-faint)]">
         {attemptsLeft === 1
-          ? 'This is your last attempt — check the photo is readable before you send it.'
-          : `${attemptsLeft} of ${state.submissionsAllowed} attempts left.`}
+          ? 'This is your last attempt for now — check the photo is readable before you send it.'
+          : `${attemptsLeft} of ${state.submissionsAllowed} attempts left for now.`}
       </p>
 
       {storageDown && (
@@ -315,7 +358,12 @@ function SubmitForm({
         </Button>
       </form>
 
-      <div className="mt-8">
+      <div className="mt-8 space-y-3">
+        <Link href="/shops" className="block">
+          <Button tone="secondary" large className="w-full">
+            Look around first
+          </Button>
+        </Link>
         <SignOutButton />
       </div>
     </AuthShell>

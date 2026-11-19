@@ -2,7 +2,7 @@
 
 import { useParams, useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
-import type { OrderDetail } from '@hoppo/api-client';
+import { ApiError, type OrderDetail } from '@hoppo/api-client';
 import { formatMinor } from '@hoppo/shared';
 import { Shell } from '@/components/shell';
 import { Banner, Button, Card, Spinner, Status } from '@/components/ui';
@@ -20,6 +20,22 @@ const STAGES = [
   { key: 'COMPLETED', label: 'Delivered' },
 ];
 
+/**
+ * The stages when the student fetched the order themselves (FR-DLV-07).
+ *
+ * No rider found, food ready, student walked over. The order ends COMPLETED
+ * like any other, and the ordinary list would tick "On the way to you" and
+ * "Delivered" for a delivery that never happened — on a screen whose whole
+ * job is to say what happened.
+ */
+const COLLECTED_STAGES = [
+  { key: 'PLACED', label: 'Order placed' },
+  { key: 'SHOP_ACCEPTED', label: 'Shop accepted it' },
+  { key: 'PREPARING', label: 'Being prepared' },
+  { key: 'READY', label: 'Ready at the shop' },
+  { key: 'COMPLETED', label: 'Collected by you' },
+];
+
 const STAGE_INDEX: Record<string, number> = {
   PLACED: 0,
   SHOP_ACCEPTED: 1,
@@ -29,6 +45,19 @@ const STAGE_INDEX: Record<string, number> = {
   DELIVERED: 5,
   COMPLETED: 5,
 };
+
+/**
+ * The refusals that mean "the order moved while you were looking at it": the
+ * shop started preparing as the student tapped cancel, a rider took it as they
+ * chose to collect it themselves. The API's message says what happened; the
+ * screen then has to catch up, or the same dead button is still there to tap.
+ */
+function isStaleOrder(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.code === 'ORDER_STATE_CHANGED' || error.code === 'ORDER_NOT_READY')
+  );
+}
 
 /**
  * S-18 and S-19: tracking one order.
@@ -53,13 +82,17 @@ export default function Order() {
   const params = useParams<{ orderId: string }>();
   const orderId = params.orderId;
 
-  const { api, client } = useApi();
+  const { api, client, signedIn } = useApi();
   const router = useRouter();
 
+  // Nothing is asked for, and no socket is opened, until there is a session
+  // to ask with. Signed out, the Shell is already on its way to /welcome, and
+  // a socket handshake with no token is just a rejection in the server log.
   const { data, error, loading, refresh } = usePolling<OrderDetail>(
     () => api.orders.detail(orderId),
     12_000,
     [orderId],
+    signedIn,
   );
 
   const [handoverCode, setHandoverCode] = useState<string | null>(null);
@@ -69,11 +102,18 @@ export default function Order() {
   // Live updates. `refresh` rather than patching state from the payload: the
   // socket says something changed, the API says what it changed to, and one
   // source of truth for the shape beats two.
-  const { connected } = useSocket(client, true, {
+  const { connected, settled } = useSocket(client, signedIn, {
     onOrderStatus: (payload) => {
       if (payload.orderId === orderId) void refresh();
     },
-    onTaskStatus: () => void refresh(),
+    // Task events are broadcast to the whole college. Only this order's task
+    // matters here; refetching on all of them meant every open tracking
+    // screen hit the API whenever any delivery on campus moved. (The other
+    // shape on this event, a rider being taken offline, has no taskId and so
+    // falls through the same test.)
+    onTaskStatus: (payload) => {
+      if (data?.task && 'taskId' in payload && payload.taskId === data.task.id) void refresh();
+    },
     onHandoverCode: (payload) => {
       if (data?.task && payload.taskId === data.task.id) {
         setHandoverCode(payload.code);
@@ -105,6 +145,7 @@ export default function Order() {
       await refresh();
     } catch (e) {
       setActionError(describeError(e));
+      if (isStaleOrder(e)) await refresh();
     } finally {
       setBusy(false);
     }
@@ -119,12 +160,13 @@ export default function Order() {
       await refresh();
     } catch (e) {
       setActionError(describeError(e));
+      if (isStaleOrder(e)) await refresh();
     } finally {
       setBusy(false);
     }
   }
 
-  if (loading && !data) {
+  if (!signedIn || (loading && !data)) {
     return (
       <Shell back="/orders" title="Order">
         <Spinner />
@@ -140,16 +182,25 @@ export default function Order() {
     );
   }
 
-  const stage = STAGE_INDEX[data.status] ?? 0;
   const cancelled = data.status === 'CANCELLED';
   const unfulfilled = data.task?.status === 'UNFULFILLED';
+  const escalated = data.task?.status === 'ESCALATED';
+  const completed = data.status === 'COMPLETED';
+  // Completed without ever being picked up by anyone: the student collected
+  // it. `pickedUpAt` is only ever set by a rider's pickup.
+  const collectedInPerson = completed && !data.rider && !data.pickedUpAt;
+
+  const stages = collectedInPerson ? COLLECTED_STAGES : STAGES;
+  const stage = collectedInPerson ? stages.length - 1 : (STAGE_INDEX[data.status] ?? 0);
 
   return (
     <Shell back="/orders" title={data.shopListing.shop.name}>
       <div className="flex items-center gap-2">
         <Status status={data.status} />
         <span className="text-sm text-[var(--color-ink-faint)]">{data.reference}</span>
-        {!connected && (
+        {/* Not before the first attempt has finished: until then it is
+            connecting, not reconnecting. */}
+        {settled && !connected && (
           <span className="ml-auto text-xs font-semibold text-[var(--color-waiting)]">
             Reconnecting…
           </span>
@@ -179,9 +230,8 @@ export default function Order() {
           <Card tone="waiting" className="p-4">
             <p className="font-bold">No rider picked this up</p>
             <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
-              Your food is{' '}
-              {data.status === 'READY' ? 'ready at the shop' : 'still being prepared'}, but nobody
-              is free to bring it. What would you like to do?
+              Your food is {data.status === 'READY' ? 'ready at the shop' : 'still being prepared'},
+              but nobody is free to bring it. What would you like to do?
             </p>
             <div className="mt-3 space-y-2">
               <Button
@@ -212,8 +262,21 @@ export default function Order() {
         </div>
       )}
 
+      {/* FR-DLV-14: too many wrong codes. The code flow is over for this
+          delivery — no new code will be issued and none will be accepted — so
+          promising that "a code will appear here" would be untrue. */}
+      {escalated && !cancelled && !completed && (
+        <div className="mt-3">
+          <Banner tone="warn">
+            The handover code was entered wrongly too many times; an administrator has to resolve
+            this delivery. You do not need to do anything with a code now — your college&apos;s
+            Hoppo administrator will sort it out with you and the rider.
+          </Banner>
+        </div>
+      )}
+
       {/* FR-DLV-12: the code the rider needs at the door. */}
-      {data.status === 'PICKED_UP' && (
+      {data.status === 'PICKED_UP' && !escalated && (
         <div className="mt-3">
           <Card tone="ready" className="p-4">
             <p className="font-bold">Your handover code</p>
@@ -255,9 +318,10 @@ export default function Order() {
 
       <section className="mt-5">
         <ol className="relative space-y-0">
-          {STAGES.map((s, index) => {
-            const done = index < stage;
-            const current = index === stage && !cancelled;
+          {stages.map((s, index) => {
+            // The last stage of a finished order is done, not "in progress".
+            const done = index < stage || (index === stage && completed);
+            const current = index === stage && !cancelled && !completed;
             return (
               <li key={s.key} className="flex gap-3 pb-5 last:pb-0">
                 <div className="flex flex-col items-center">
@@ -271,7 +335,7 @@ export default function Order() {
                   >
                     {done ? '✓' : ''}
                   </span>
-                  {index < STAGES.length - 1 && (
+                  {index < stages.length - 1 && (
                     <span
                       aria-hidden
                       className={`mt-1 w-0.5 flex-1 ${

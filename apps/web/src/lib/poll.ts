@@ -26,6 +26,13 @@ export function usePolling<T>(
   fetcher: () => Promise<T>,
   intervalMs: number,
   deps: unknown[] = [],
+  /**
+   * False means "do not fetch at all": no timer and no first request. For a
+   * screen that has to wait for something — sign-in, verification — before
+   * the endpoint will answer with anything but a refusal. `loading` is only
+   * meaningful while this is true.
+   */
+  enabled = true,
 ) {
   const [data, setData] = useState<T | null>(null);
   /**
@@ -62,6 +69,8 @@ export function usePolling<T>(
   }, []);
 
   useEffect(() => {
+    if (!enabled) return;
+
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const start = () => {
@@ -89,7 +98,7 @@ export function usePolling<T>(
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run, intervalMs, ...deps]);
+  }, [run, intervalMs, enabled, ...deps]);
 
   return { data, error, loading, refresh: run };
 }

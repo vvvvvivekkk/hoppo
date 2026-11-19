@@ -7,6 +7,7 @@ import type {
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from 'react';
+import { MAX_CART_ITEM_QUANTITY } from '@hoppo/shared';
 
 /**
  * The student app's primitives.
@@ -311,7 +312,9 @@ export function Spinner({ label = 'Loading' }: { label?: string }) {
 export function Stepper({
   quantity,
   onChange,
-  max = 50,
+  // The API refuses a line above this (MAX_CART_ITEM_QUANTITY), so the plus
+  // button stops there rather than letting someone build a cart that fails.
+  max = MAX_CART_ITEM_QUANTITY,
   label,
 }: {
   quantity: number;

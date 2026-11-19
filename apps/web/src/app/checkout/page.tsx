@@ -1,13 +1,14 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, type DeliveryPoint, type OrderQuote } from '@hoppo/api-client';
 import { formatMinor } from '@hoppo/shared';
 import { Shell } from '@/components/shell';
 import { Banner, Button, Card, Spinner, Stepper, TextArea } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 import { useCart } from '@/lib/cart';
+import { VerifyPrompt, useCanOrder } from '@/components/verify-prompt';
 
 type Payment = 'CASH' | 'WALLET';
 
@@ -26,9 +27,10 @@ type Payment = 'CASH' | 'WALLET';
  * fee that updates only at the end is a fee nobody reads.
  */
 export default function Checkout() {
-  const { api } = useApi();
+  const { api, signedIn } = useApi();
   const router = useRouter();
   const cart = useCart();
+  const { canOrder, loading: accountLoading } = useCanOrder();
 
   const [points, setPoints] = useState<DeliveryPoint[] | null>(null);
   const [pointId, setPointId] = useState<string>('');
@@ -40,9 +42,12 @@ export default function Checkout() {
   const [error, setError] = useState<string | null>(null);
   const [placing, setPlacing] = useState(false);
   /** Set when the server refused because the total moved under us. */
-  const [priceMoved, setPriceMoved] = useState<{ from: number; to: number } | null>(null);
+  const [priceMoved, setPriceMoved] = useState<{ from: number; to: number | null } | null>(null);
 
   useEffect(() => {
+    // Signed out, the Shell is already redirecting; asking anyway only
+    // produces a 401 to show for it.
+    if (!signedIn) return;
     void api.browse
       .deliveryPoints()
       .then(({ points: rows }) => {
@@ -52,42 +57,56 @@ export default function Checkout() {
         if (rows.length > 0) setPointId((current) => current || rows[0].id);
       })
       .catch((e) => setError(describeError(e)));
-  }, [api]);
+  }, [api, signedIn]);
 
   const lines = cart.cart?.lines ?? [];
   const listingId = cart.cart?.listingId;
 
-  const requote = useCallback(async () => {
-    if (!listingId || lines.length === 0 || !pointId) return;
+  // Each quote request takes a number, and only the newest one may write to
+  // the screen. Tapping the stepper three times sends three quotes, and they
+  // do not have to come back in the order they left: without this an older,
+  // slower answer could land last and leave a total on screen for a cart the
+  // student no longer has — which is the total `place()` would then send.
+  const quoteSeq = useRef(0);
 
+  const requote = useCallback(async () => {
+    if (!listingId || lines.length === 0 || !pointId || !canOrder) return;
+
+    const seq = ++quoteSeq.current;
     setQuoting(true);
     setError(null);
-    setPriceMoved(null);
 
     try {
-      setQuote(
-        await api.orders.quote({
-          listingId,
-          lines: lines.map((l) => ({
-            catalogItemId: l.catalogItemId,
-            quantity: l.quantity,
-            note: l.note,
-          })),
-          deliveryPointId: pointId,
-        }),
-      );
+      const next = await api.orders.quote({
+        listingId,
+        lines: lines.map((l) => ({
+          catalogItemId: l.catalogItemId,
+          quantity: l.quantity,
+          note: l.note,
+        })),
+        deliveryPointId: pointId,
+      });
+      if (seq !== quoteSeq.current) return;
+      setQuote(next);
     } catch (e) {
+      if (seq !== quoteSeq.current) return;
       setError(describeError(e));
       setQuote(null);
     } finally {
-      setQuoting(false);
+      if (seq === quoteSeq.current) setQuoting(false);
     }
     // The cart lines are compared by value rather than by reference, so a
     // quantity change re-quotes but a re-render does not.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, listingId, pointId, JSON.stringify(lines)]);
+  }, [api, listingId, pointId, canOrder, JSON.stringify(lines)]);
 
+  // The student changed the cart or the drop point, so whatever the last
+  // refusal said about the total no longer describes this order. Cleared
+  // here, on their action — not inside `requote`, which `place()` also calls
+  // straight after setting the banner. That wiped it before it ever painted,
+  // so a price change looked like a button that did nothing.
   useEffect(() => {
+    setPriceMoved(null);
     void requote();
   }, [requote]);
 
@@ -96,7 +115,6 @@ export default function Checkout() {
 
     setPlacing(true);
     setError(null);
-    setPriceMoved(null);
 
     try {
       const res = await api.orders.place({
@@ -113,16 +131,19 @@ export default function Checkout() {
         expectedTotalMinor: quote.totals.totalMinor,
       });
 
+      setPriceMoved(null);
       cart.clear();
       router.replace(`/orders/${res.orderId}`);
     } catch (e) {
       if (e instanceof ApiError && e.code === 'PRICE_CHANGED') {
         const details = e.details as
-          | { shownTotalMinor?: number; currentTotalMinor?: number }
-          | undefined;
-        if (details?.shownTotalMinor !== undefined && details.currentTotalMinor !== undefined) {
-          setPriceMoved({ from: details.shownTotalMinor, to: details.currentTotalMinor });
-        }
+          { shownTotalMinor?: number; currentTotalMinor?: number } | undefined;
+        // The server's two numbers when it sends them; otherwise the total
+        // that was on screen, with the new one read off the fresh quote.
+        setPriceMoved({
+          from: details?.shownTotalMinor ?? quote.totals.totalMinor,
+          to: details?.currentTotalMinor ?? null,
+        });
         // Pull the new numbers in so the student is agreeing to what is
         // actually true now, rather than retrying the stale total.
         await requote();
@@ -132,6 +153,16 @@ export default function Checkout() {
     } finally {
       setPlacing(false);
     }
+  }
+
+  // Not "empty" until the saved cart has actually been read — and not the
+  // verify prompt until the account has. Both used to flash on every load.
+  if (!cart.hydrated || accountLoading) {
+    return (
+      <Shell back="/shops" title="Checkout">
+        <Spinner />
+      </Shell>
+    );
   }
 
   if (!cart.cart || lines.length === 0) {
@@ -145,6 +176,23 @@ export default function Checkout() {
     );
   }
 
+  // The hard stop. Browsing and building a cart are open; this is the line.
+  // Placed before the quote so an unverified student is not shown a total they
+  // cannot act on, and the cart is deliberately left intact — it is waiting
+  // for them when verification comes back.
+  if (!canOrder) {
+    return (
+      <Shell back={`/shops/${listingId}`} title="Checkout">
+        <VerifyPrompt />
+        <p className="text-sm text-[var(--color-ink-soft)]">
+          Your cart is saved. Come back to it once your ID is approved.
+        </p>
+      </Shell>
+    );
+  }
+
+  const movedTo = priceMoved ? (priceMoved.to ?? quote?.totals.totalMinor ?? null) : null;
+
   return (
     <Shell back={`/shops/${listingId}`} title="Checkout">
       <p className="text-sm text-[var(--color-ink-faint)]">From</p>
@@ -153,21 +201,36 @@ export default function Checkout() {
       <section className="mt-5">
         <h2 className="mb-2 font-bold">Your order</h2>
         <Card className="divide-y divide-[var(--color-line)]">
-          {lines.map((line) => (
-            <div key={line.catalogItemId} className="flex items-center gap-3 p-3">
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-semibold">{line.name}</p>
-                <p className="text-sm text-[var(--color-ink-faint)]">
-                  {formatMinor(line.unitPriceMinor)} each
-                </p>
+          {lines.map((line) => {
+            // The quote is the authority on price; the cart's copy is only
+            // what the item cost when it was added. Show the quoted price
+            // once there is one, and say so when the two differ — otherwise
+            // the lines add up to one number and the total says another.
+            const quoted = quote?.lines.find((l) => l.catalogItemId === line.catalogItemId);
+            const unitPriceMinor = quoted?.unitPriceMinor ?? line.unitPriceMinor;
+            const changed = quoted !== undefined && quoted.unitPriceMinor !== line.unitPriceMinor;
+
+            return (
+              <div key={line.catalogItemId} className="flex items-center gap-3 p-3">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-semibold">{line.name}</p>
+                  <p className="text-sm text-[var(--color-ink-faint)]">
+                    {formatMinor(unitPriceMinor)} each
+                  </p>
+                  {changed && (
+                    <p className="text-sm font-semibold text-[var(--color-waiting)]">
+                      Price changed — it was {formatMinor(line.unitPriceMinor)} when you added it.
+                    </p>
+                  )}
+                </div>
+                <Stepper
+                  quantity={line.quantity}
+                  onChange={(next) => cart.setQuantity(line.catalogItemId, next)}
+                  label={line.name}
+                />
               </div>
-              <Stepper
-                quantity={line.quantity}
-                onChange={(next) => cart.setQuantity(line.catalogItemId, next)}
-                label={line.name}
-              />
-            </div>
-          ))}
+            );
+          })}
         </Card>
       </section>
 
@@ -254,9 +317,10 @@ export default function Checkout() {
         {priceMoved && (
           <div className="mb-3">
             <Banner tone="warn">
-              The total changed from {formatMinor(priceMoved.from)} to{' '}
-              {formatMinor(priceMoved.to)} while you were ordering, so nothing was placed. The
-              figures below are current — confirm again if you are happy with them.
+              The total changed from {formatMinor(priceMoved.from)}
+              {movedTo !== null && ` to ${formatMinor(movedTo)}`} while you were ordering, so
+              nothing was placed. The figures below are current — confirm again if you are happy
+              with them.
             </Banner>
           </div>
         )}

@@ -2,12 +2,13 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { BrowseShop, ItemSearchResult } from '@hoppo/api-client';
 import { formatMinor } from '@hoppo/shared';
 import { Shell } from '@/components/shell';
 import { Banner, Button, Card, EmptyState, Spinner } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { VerifyPrompt } from '@/components/verify-prompt';
 import { useCart } from '@/lib/cart';
 
 type Sort = 'distance' | 'rating' | 'prepTime';
@@ -25,7 +26,7 @@ type Sort = 'distance' | 'rating' | 'prepTime';
  * their favourite shop has left the platform.
  */
 export default function Shops() {
-  const { api, user } = useApi();
+  const { api, user, signedIn } = useApi();
   const { cart, itemCount, subtotalMinor } = useCart();
 
   const [query, setQuery] = useState('');
@@ -48,6 +49,11 @@ export default function Shops() {
   const [items, setItems] = useState<ItemSearchResult[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** Where the next page of shops starts, or null when there are no more. */
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  /** Bumped whenever the list is replaced, so a late page can tell. */
+  const listGeneration = useRef(0);
 
   // Debounce the search box. Each keystroke otherwise fires a trigram query
   // across every catalog item in the college.
@@ -59,9 +65,14 @@ export default function Shops() {
   const searching = debounced.length >= 2;
 
   useEffect(() => {
+    // Signed out, the Shell is redirecting; the request would only 401.
+    if (!signedIn) return;
+
     let cancelled = false;
+    listGeneration.current += 1;
     setLoading(true);
     setError(null);
+    setNextCursor(null);
 
     const request = searching
       ? api.browse.items(debounced).then((res) => {
@@ -80,6 +91,7 @@ export default function Shops() {
             if (cancelled) return;
             setShops(res.items);
             setItems(null);
+            setNextCursor(res.nextCursor);
 
             // Only an unfiltered list is a complete picture of the
             // categories; a filtered one only ever contains its own.
@@ -102,10 +114,48 @@ export default function Shops() {
     return () => {
       cancelled = true;
     };
-  }, [api, searching, debounced, category, sort, openOnly]);
+  }, [api, signedIn, searching, debounced, category, sort, openOnly]);
+
+  // The list is paged by the API. Without this a college with more shops than
+  // one page simply did not show the rest, with nothing to say they existed.
+  async function showMore() {
+    if (!nextCursor) return;
+    setLoadingMore(true);
+    setError(null);
+
+    // Which list this page belongs to. If the filters change while it is in
+    // the air, the effect above has already replaced the list, and appending
+    // to it would mix two different queries on one screen.
+    const generation = listGeneration.current;
+
+    try {
+      const res = await api.browse.shops({
+        category: category || undefined,
+        sort,
+        openNow: openOnly || undefined,
+        cursor: nextCursor,
+      });
+      if (generation !== listGeneration.current) return;
+
+      setNextCursor(res.nextCursor);
+      setShops((current) => {
+        if (!current) return current;
+        const seen = new Set(current.map((s) => s.listingId));
+        return [...current, ...res.items.filter((s) => !seen.has(s.listingId))];
+      });
+    } catch (e) {
+      setError(describeError(e));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   return (
     <Shell title={user?.college?.shortName ?? user?.college?.name ?? 'Shops'}>
+      {/* Compact here: it sits on the screen a student returns to most, so it
+          nudges without taking the first screenful every single visit. */}
+      <VerifyPrompt compact />
+
       <div className="space-y-3">
         <input
           type="search"
@@ -201,6 +251,17 @@ export default function Shops() {
         </ul>
       )}
 
+      {!loading && shops && nextCursor && (
+        <Button
+          tone="secondary"
+          className="mt-4 w-full"
+          loading={loadingMore}
+          onClick={() => void showMore()}
+        >
+          Show more shops
+        </Button>
+      )}
+
       {!loading && items && items.length === 0 && (
         <div className="mt-4">
           <EmptyState
@@ -278,7 +339,7 @@ function ShopRow({ shop }: { shop: BrowseShop }) {
             {shop.closureNote ??
               (shop.opensInMinutes !== null
                 ? `Opens in about ${formatMinutes(shop.opensInMinutes)}.`
-                : (shop.closedReason ?? 'Closed right now.'))}
+                : closedSentence(shop.closedReason))}
           </p>
         )}
       </Card>
@@ -317,6 +378,24 @@ function ItemRow({ item }: { item: ItemSearchResult }) {
       </div>
     </Card>
   );
+}
+
+/**
+ * `closedReason` is the shared hours module's enum (see
+ * packages/shared/src/hours.ts), not prose. It used to be printed as it
+ * came, so a student read "NO_HOURS_SET" under a shop's name.
+ */
+function closedSentence(reason: string | null): string {
+  switch (reason) {
+    case 'TEMPORARILY_CLOSED':
+      return 'Closed for now — the shop has paused orders.';
+    case 'NO_HOURS_SET':
+      return 'This shop has not set its opening hours yet, so it cannot take orders.';
+    case 'OUTSIDE_HOURS':
+      return 'Closed right now — outside its opening hours.';
+    default:
+      return 'Closed right now.';
+  }
 }
 
 function formatMinutes(minutes: number): string {

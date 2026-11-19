@@ -2,7 +2,8 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import type { ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
+import { Spinner } from '@/components/ui';
 import { useApi } from '@/lib/api';
 import { useCart } from '@/lib/cart';
 
@@ -16,6 +17,14 @@ import { useCart } from '@/lib/cart';
  * The content area carries bottom padding equal to the bar's height plus the
  * iPhone home-indicator inset, so the last item in a list is reachable rather
  * than sitting under the bar.
+ *
+ * It is also the route guard. Every screen wrapped in a `Shell` is a
+ * signed-in screen, so this is the one place that can say "not signed in,
+ * go to the welcome screen" for all of them. Before it did, each screen
+ * improvised: the shops list showed an API error under a verify banner, the
+ * orders list said "No orders yet" to somebody with no account. The page's
+ * own content is held back until the session is known, so nothing renders
+ * against a user who turns out not to exist.
  */
 const TABS = [
   { href: '/shops', label: 'Shops', icon: '🏪' },
@@ -39,6 +48,16 @@ export function Shell({
   const pathname = usePathname();
   const router = useRouter();
   const { itemCount } = useCart();
+  const { user, loading, accountBlocked } = useApi();
+
+  const signedOut = !loading && !user;
+
+  useEffect(() => {
+    if (!signedOut) return;
+    // A suspended account has no user either, and "your account is on hold"
+    // is a different message from "please sign in".
+    router.replace(accountBlocked ? '/suspended' : '/welcome');
+  }, [signedOut, accountBlocked, router]);
 
   return (
     <div className="mx-auto min-h-dvh max-w-2xl bg-[var(--color-surface-sunken)]">
@@ -59,7 +78,15 @@ export function Shell({
         </div>
       </header>
 
-      <main className="px-3 pb-28 pt-3">{children}</main>
+      <main className="px-3 pb-28 pt-3">
+        {loading ? (
+          <Spinner label="Loading" />
+        ) : signedOut ? (
+          <Spinner label="Taking you to sign in" />
+        ) : (
+          children
+        )}
+      </main>
 
       <nav
         aria-label="Main"
@@ -113,12 +140,16 @@ export function AuthShell({ children }: { children: ReactNode }) {
  */
 export function SignOutButton() {
   const { logout } = useApi();
+  const { clear } = useCart();
   const router = useRouter();
 
   return (
     <button
       type="button"
       onClick={async () => {
+        // Signing out is the one moment the cart is certainly finished with.
+        // Left behind, it greets whoever signs in next on this phone.
+        clear();
         await logout();
         router.replace('/');
       }}
