@@ -5,7 +5,6 @@ import {
   Injectable,
   Logger,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomInt } from 'node:crypto';
 import {
@@ -27,6 +26,8 @@ import { TenantService } from '../common/tenant/tenant.service';
 import { DispatchService } from '../dispatch/dispatch.service';
 import { DispatchGateway } from '../dispatch/dispatch.gateway';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
+import { readWalletHead } from '../wallet/wallet-ledger';
+import { acceptanceRateBps, acceptanceRatePercent } from './acceptance-rate';
 import type {
   AbandonTaskDto,
   ConfirmPickupDto,
@@ -142,12 +143,12 @@ export class RiderService {
         completedTasks: reliability?.tasksCompleted ?? 0,
         earningsMinor: lifetimeEarnings._sum.amountMinor ?? 0,
         earningsLabel: formatMinor(lifetimeEarnings._sum.amountMinor ?? 0),
-        acceptanceRate:
-          (reliability?.tasksOffered ?? 0) > 0
-            ? Number(
-                (((reliability!.tasksAccepted ?? 0) / reliability!.tasksOffered) * 100).toFixed(1),
-              )
-            : null,
+        // Clamped to 0..100 and null when nothing was ever offered — see
+        // acceptanceRatePercent for why the plain ratio is wrong on old rows.
+        acceptanceRate: acceptanceRatePercent(
+          reliability?.tasksOffered ?? 0,
+          reliability?.tasksAccepted ?? 0,
+        ),
         abandonedTasks: reliability?.tasksAbandoned ?? 0,
         averageRating:
           (reliability?.ratingCount ?? 0) > 0
@@ -351,8 +352,9 @@ export class RiderService {
       });
     }
 
-    // FR-WM-07. The UNIQUE constraint on active_task_id is the real guard;
-    // this gives a readable error instead of a constraint violation.
+    // FR-WM-07. The real guard is the conditional UPDATE on rider_state
+    // inside DispatchService.accept; this is the early, cheap answer with the
+    // id of the task being held.
     if (state.activeTaskId) {
       throw new ConflictException({
         code: 'ALREADY_HOLDING_TASK',
@@ -441,8 +443,16 @@ export class RiderService {
       // round 3 of 3 would retire it on the next tick having never genuinely
       // re-offered it, and punishing the task for the rider's choice is the
       // wrong party.
-      await tx.task.update({
-        where: { id: taskId },
+      //
+      // M4, ADR-001: the WHERE is the decision. The checks above read the
+      // task a moment ago, and "abandon" and "confirm pickup" are two buttons
+      // on one screen — tapped together (or retried by a flaky connection)
+      // an unconditional update here would un-assign a task whose pickup had
+      // just committed, leaving an order PICKED_UP, a live handover code, and
+      // no rider. Exactly one of the two UPDATEs can match `status =
+      // 'ASSIGNED'`; the other changes nothing and says so.
+      const released = await tx.task.updateMany({
+        where: { id: taskId, riderId: user.userId, status: 'ASSIGNED' },
         data: {
           riderId: null,
           status: 'CREATED',
@@ -454,18 +464,33 @@ export class RiderService {
           dispatchDueAt: new Date(),
         },
       });
+      if (released.count !== 1) {
+        throw new ConflictException({
+          code: 'CANNOT_ABANDON',
+          message: 'This task can no longer be abandoned. Refresh to see where it stands.',
+        });
+      }
 
-      await tx.riderState.update({
-        where: { userId: user.userId },
+      // Only ever clears *this* task: a blind `activeTaskId: null` would also
+      // release a task the rider had legitimately moved on to.
+      await tx.riderState.updateMany({
+        where: { userId: user.userId, activeTaskId: taskId },
         data: { activeTaskId: null },
       });
 
       // FR-CHAT-08-adjacent: the task room's membership was for this rider.
       // Archiving it rather than deleting keeps the history for a dispute.
+      // The next rider's accept re-opens the same room (task_id is unique),
+      // so this rider is marked as having left it — otherwise they would sit
+      // in on the conversation about a delivery they walked away from.
       if (task!.chatRoom) {
         await tx.chatRoom.update({
           where: { id: task!.chatRoom.id },
           data: { isArchived: true, archivedAt: new Date() },
+        });
+        await tx.chatMember.updateMany({
+          where: { roomId: task!.chatRoom.id, userId: user.userId, leftAt: null },
+          data: { leftAt: new Date() },
         });
       }
 
@@ -525,8 +550,31 @@ export class RiderService {
       await this.redis.removeRider(collegeId, user.userId);
     }
 
+    // The requester and the shop learn their rider is gone — addressed to
+    // them individually (M7). The status is the task's real one; the reason
+    // says why it went backwards. The task row no longer names this rider,
+    // so they are added by hand for their other devices.
+    await this.dispatch.notifyTaskParties(
+      taskId,
+      'CREATED',
+      { reason: 'RIDER_ABANDONED' },
+      [user.userId],
+    );
+
     // Straight back into the pool at round 0.
-    await this.dispatch.rebroadcastFromScratch(taskId);
+    //
+    // The abandonment has committed, so a failure here must not be reported
+    // as a failed abandon — the rider would retry and be told the task is
+    // not theirs. The task is CREATED with dispatchDueAt set, so the
+    // dispatch-due tick offers it within five seconds regardless.
+    try {
+      await this.dispatch.rebroadcastFromScratch(taskId);
+    } catch (error) {
+      this.logger.error(
+        `Immediate re-broadcast of abandoned task ${taskId} failed; the dispatch tick will pick it up`,
+        error instanceof Error ? error.stack : String(error),
+      );
+    }
 
     this.logger.warn(
       `Rider ${user.userId} abandoned task ${taskId}${result.shouldBar ? ' and was barred' : ''}`,
@@ -554,7 +602,8 @@ export class RiderService {
    * disagree about when the handover happened.
    */
   async confirmPickup(user: AuthenticatedUser, taskId: string, dto: ConfirmPickupDto) {
-    const collegeId = this.tenant.requireCollegeId(user);
+    // Called for the throw, not the value (C-1) — see acceptTask.
+    this.tenant.requireCollegeId(user);
 
     const task = await this.prisma.task.findUnique({
       where: { id: taskId },
@@ -618,8 +667,13 @@ export class RiderService {
     await this.prisma.$transaction(async (tx) => {
       assertTaskTransition(TaskStatus.ASSIGNED, TaskEvent.PICKUP_CONFIRMED);
 
-      await tx.task.update({
-        where: { id: taskId },
+      // M4, ADR-001: the other half of the abandon/pickup race — see
+      // abandonTask. Conditional on the rider and the status, so a pickup
+      // cannot land on a task that was abandoned (or re-assigned to somebody
+      // else) after the checks above read it, and a double-tap cannot issue
+      // two handover codes with the second silently replacing the first.
+      const pickedUp = await tx.task.updateMany({
+        where: { id: taskId, riderId: user.userId, status: 'ASSIGNED' },
         data: {
           status: 'PICKED_UP',
           pickedUpAt: now,
@@ -629,20 +683,36 @@ export class RiderService {
           pickupProofUrl: dto.proofImageKey ?? null,
         },
       });
+      if (pickedUp.count !== 1) {
+        throw new ConflictException({
+          code: 'NOT_AWAITING_PICKUP',
+          message: 'This task is no longer awaiting pickup. Refresh to see where it stands.',
+        });
+      }
 
-      // ADR-003: both rows, one transaction, one writer.
+      // ADR-003: both rows, one transaction, one writer. The order moves
+      // only from READY — if the student or shop cancelled it in the last
+      // instant, zero rows change and throwing rolls the task back too, so
+      // the two rows still cannot disagree.
       if (task!.order) {
         assertOrderTransition(OrderStatus.READY, OrderEvent.RIDER_PICKED_UP);
-        await tx.order.update({
-          where: { id: task!.order.id },
+        const orderMoved = await tx.order.updateMany({
+          where: { id: task!.order.id, status: 'READY' },
           data: { status: 'PICKED_UP', pickedUpAt: now },
         });
+        if (orderMoved.count !== 1) {
+          throw new ConflictException({
+            code: 'SHOP_NOT_READY',
+            message: 'This order is no longer ready for pickup. Refresh to see where it stands.',
+          });
+        }
       }
     });
 
-    this.gateway.notifyTaskStatus(collegeId, taskId, 'PICKED_UP');
+    // M7: to the requester, the rider and the shop — not the college.
+    await this.dispatch.notifyTaskParties(taskId, 'PICKED_UP');
     if (task!.order) {
-      this.gateway.notifyOrderStatus(collegeId, task!.order.id, 'PICKED_UP');
+      await this.dispatch.notifyOrderParties(taskId, task!.order.id, 'PICKED_UP');
     }
 
     /**
@@ -719,10 +789,19 @@ export class RiderService {
     );
     const otpHash = await argon2.hash(code, { type: argon2.argon2id });
 
-    await this.prisma.task.update({
-      where: { id: taskId },
+    // Conditional for the same reason as every other write here: the status
+    // was read above, and a re-issue landing just after the delivery
+    // completed would otherwise plant a live code on a finished task.
+    const reissued = await this.prisma.task.updateMany({
+      where: { id: taskId, requesterId: user.userId, status: 'PICKED_UP' },
       data: { otpHash, otpAttempts: 0, otpIssuedAt: new Date() },
     });
+    if (reissued.count !== 1) {
+      throw new ConflictException({
+        code: 'CODE_NOT_APPLICABLE',
+        message: 'A handover code only exists while the rider is carrying your order.',
+      });
+    }
 
     this.gateway.sendHandoverCode(task!.requesterId, {
       taskId,
@@ -855,19 +934,77 @@ export class RiderService {
     });
     const maxAttempts = config?.maxOtpAttempts ?? 5;
 
-    const matches = await argon2.verify(task!.otpHash, dto.code);
+    /**
+     * M1, FR-DLV-14: count the attempt first, atomically, then check the code.
+     *
+     * This used to verify, and on a miss write back `otpAttempts + 1` using
+     * the value read at the top of the method. Fifty wrong guesses sent in
+     * parallel all read 0 and all wrote 1 — so the five-attempt cap on a
+     * six-digit code was really "five batches of as many as you like".
+     *
+     * One UPDATE now does the counting and the cap together: it increments
+     * only while the count is below the maximum, and reports the new value.
+     * However many requests race, exactly `maxAttempts` of them can ever get
+     * a row back; the rest are refused without the code being looked at.
+     *
+     * The hash is returned by the same statement, so the code is checked
+     * against whichever hash this attempt was counted against — a re-issue
+     * landing mid-request cannot be guessed at with the old code's attempts.
+     *
+     * A correct code spends an attempt too. That costs nothing: success
+     * clears the hash and ends the task.
+     */
+    const [counted] = await this.prisma.$queryRaw<{ otpAttempts: number; otpHash: string }[]>`
+      UPDATE "task"
+      SET otp_attempts = otp_attempts + 1,
+          updated_at = now()
+      WHERE id = ${taskId}
+        AND rider_id = ${user.userId}
+        AND status = 'PICKED_UP'
+        AND otp_hash IS NOT NULL
+        AND otp_attempts < ${maxAttempts}
+      RETURNING otp_attempts AS "otpAttempts", otp_hash AS "otpHash"
+    `;
+
+    if (!counted) {
+      // Zero rows: the cap was already reached, or the task moved on. Read
+      // back only to word the refusal — the UPDATE has already refused.
+      const current = await this.prisma.task.findUnique({
+        where: { id: taskId },
+        select: { status: true, riderId: true, otpAttempts: true },
+      });
+
+      if (
+        current?.status === 'PICKED_UP' &&
+        current.riderId === user.userId &&
+        current.otpAttempts >= maxAttempts
+      ) {
+        // Deliberately does not escalate from here. The request that spent
+        // the final attempt escalates if its code was wrong; escalating from
+        // this branch as well would let a stray extra request escalate a
+        // task whose final attempt is, right now, verifying the correct code.
+        throw new ConflictException({
+          code: 'OTP_ATTEMPTS_EXHAUSTED',
+          message:
+            'Too many incorrect codes. Ask the customer to request a new code, or ' +
+            'contact your campus administrator.',
+        });
+      }
+
+      throw new ConflictException({
+        code: 'NOT_AWAITING_HANDOVER',
+        message: 'This task is no longer awaiting handover.',
+      });
+    }
+
+    const matches = await argon2.verify(counted.otpHash, dto.code);
 
     if (!matches) {
-      const attempts = task!.otpAttempts + 1;
-
-      await this.prisma.task.update({
-        where: { id: taskId },
-        data: { otpAttempts: attempts },
-      });
+      const attempts = counted.otpAttempts;
 
       // FR-DLV-14
       if (attempts >= maxAttempts) {
-        await this.escalate(taskId, collegeId, 'OTP attempts exhausted');
+        await this.escalate(taskId, collegeId, user.userId, 'OTP attempts exhausted');
 
         throw new ConflictException({
           code: 'OTP_ATTEMPTS_EXHAUSTED',
@@ -887,7 +1024,12 @@ export class RiderService {
     }
 
     // --- correct code: deliver and settle --------------------------------
-    return this.completeDelivery(user.userId, taskId, collegeId);
+    return this.completeDelivery(user.userId, taskId, collegeId, {
+      // Immutable facts about the order, read above; used only to know whose
+      // wallet to lock before the transaction touches a row.
+      walletStudentId:
+        task!.order?.paymentMethod === 'WALLET' ? task!.order.studentId : null,
+    });
   }
 
   /**
@@ -898,15 +1040,83 @@ export class RiderService {
    * causes them." A rider marked as having completed a delivery with no
    * corresponding ledger entry would be owed money the books do not show.
    */
-  private async completeDelivery(riderId: string, taskId: string, collegeId: string) {
+  private async completeDelivery(
+    riderId: string,
+    taskId: string,
+    collegeId: string,
+    opts: { walletStudentId: string | null },
+  ) {
     const now = new Date();
 
     const result = await this.prisma.$transaction(async (tx) => {
-      const task = await tx.task.findUnique({
+      /**
+       * The per-user wallet lock, taken before anything else.
+       *
+       * A wallet balance here is a running total: each entry stores
+       * `balanceAfterMinor`, computed from the entry before it. Two
+       * transactions writing to one wallet at once both read the same
+       * "latest" entry and both write the same balance — one credit vanishes
+       * from the total while both rows sit in an append-only ledger. The lock
+       * makes writers to one wallet take turns; it is transaction-scoped, so
+       * it releases itself on commit or rollback.
+       *
+       * The call is byte-for-byte the one the orders module uses, because two
+       * different lock keys for one wallet would be no lock at all. It comes
+       * first, before the task row is touched, and the ids are sorted: every
+       * transaction then acquires in the same order and none can deadlock
+       * against another.
+       */
+      const walletUserIds = [
+        ...new Set([riderId, ...(opts.walletStudentId ? [opts.walletStudentId] : [])]),
+      ].sort();
+      for (const walletUserId of walletUserIds) {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${walletUserId}))`;
+      }
+
+      // DELIVERED then COMPLETED, both legal moves in the state machine.
+      assertTaskTransition(TaskStatus.PICKED_UP, TaskEvent.OTP_VALID);
+      assertTaskTransition(TaskStatus.DELIVERED, TaskEvent.SETTLEMENT_WRITTEN);
+
+      /**
+       * H4, ADR-001: the settlement gate.
+       *
+       * This was `findUnique`, check the status, then an unconditional
+       * `update`. Two requests carrying the correct code — a double tap, a
+       * retry after a timeout — both read PICKED_UP before either wrote, and
+       * both went on to credit the delivery fee and bump tasksCompleted. The
+       * rider was paid twice for one delivery, in a ledger that cannot be
+       * edited afterwards.
+       *
+       * One conditional UPDATE decides instead. Exactly one request can move
+       * the row out of PICKED_UP; every other changes zero rows and stops
+       * here, before a single ledger entry is written.
+       */
+      const settled = await tx.task.updateMany({
+        where: { id: taskId, status: 'PICKED_UP', riderId },
+        data: {
+          status: 'COMPLETED',
+          deliveredAt: now,
+          completedAt: now,
+          // The hash is cleared on success: the code has done its job and
+          // keeping it serves no purpose.
+          otpHash: null,
+        },
+      });
+
+      if (settled.count !== 1) {
+        throw new ConflictException({
+          code: 'NOT_AWAITING_HANDOVER',
+          message: 'This task is no longer awaiting handover.',
+        });
+      }
+
+      // Read after the UPDATE, inside the transaction that now holds the row:
+      // these are the values being settled, and nobody else can change them
+      // until this commits.
+      const task = await tx.task.findUniqueOrThrow({
         where: { id: taskId },
         select: {
           id: true,
-          status: true,
           feeMinor: true,
           reimbursementMinor: true,
           assignedAt: true,
@@ -926,35 +1136,15 @@ export class RiderService {
         },
       });
 
-      if (!task || task.status !== 'PICKED_UP') {
-        throw new ConflictException({
-          code: 'NOT_AWAITING_HANDOVER',
-          message: 'This task is no longer awaiting handover.',
-        });
-      }
-
-      // DELIVERED then COMPLETED, both legal moves in the state machine.
-      assertTaskTransition(TaskStatus.PICKED_UP, TaskEvent.OTP_VALID);
-      assertTaskTransition(TaskStatus.DELIVERED, TaskEvent.SETTLEMENT_WRITTEN);
-
-      await tx.task.update({
-        where: { id: taskId },
-        data: {
-          status: 'COMPLETED',
-          deliveredAt: now,
-          completedAt: now,
-          // The hash is cleared on success: the code has done its job and
-          // keeping it serves no purpose.
-          otpHash: null,
-        },
-      });
-
       if (task.order) {
         assertOrderTransition(OrderStatus.PICKED_UP, OrderEvent.HANDOVER_CONFIRMED);
         assertOrderTransition(OrderStatus.DELIVERED, OrderEvent.SETTLEMENT_WRITTEN);
 
-        await tx.order.update({
-          where: { id: task.order.id },
+        // Conditional as well: an order that is not PICKED_UP while its task
+        // was is a disagreement between the two rows, and settling money on
+        // top of it would bury it. Throwing rolls the task back.
+        const orderSettled = await tx.order.updateMany({
+          where: { id: task.order.id, status: 'PICKED_UP' },
           data: {
             status: 'COMPLETED',
             deliveredAt: now,
@@ -967,12 +1157,19 @@ export class RiderService {
                   : 'CAPTURED',
           },
         });
+        if (orderSettled.count !== 1) {
+          throw new ConflictException({
+            code: 'ORDER_NOT_AWAITING_HANDOVER',
+            message:
+              'This order can no longer be completed. Contact your campus administrator.',
+          });
+        }
 
         // FR-PAY-06: a wallet hold is captured on completion. The hold was
         // already debited at placement, so capture is a status change rather
         // than a second debit.
         if (task.order.paymentMethod === 'WALLET') {
-          const balance = await this.balanceTx(tx, task.order.studentId);
+          const studentHead = await readWalletHead(tx, task.order.studentId);
           await tx.walletEntry.create({
             data: {
               userId: task.order.studentId,
@@ -980,7 +1177,8 @@ export class RiderService {
               amountMinor: 0,
               type: 'ORDER_CAPTURE',
               orderId: task.order.id,
-              balanceAfterMinor: balance,
+              balanceAfterMinor: studentHead.balanceMinor,
+              createdAt: studentHead.nextCreatedAt,
               note: `Captured for completed order ${task.order.reference}`,
             },
           });
@@ -997,7 +1195,14 @@ export class RiderService {
        * online-settled credits.
        */
       const isCash = !task.order || task.order.paymentMethod === 'CASH';
-      const riderBalance = await this.balanceTx(tx, riderId);
+
+      // The head of the rider's ledger, through the shared helper: it reads
+      // "the latest entry" with a tie-break, and hands back the timestamp the
+      // next entry must carry so that it sorts strictly after that one. The
+      // wallet lock taken at the top of this transaction is what makes the
+      // read safe to build on.
+      const feeHead = await readWalletHead(tx, riderId);
+      const balanceAfterFee = isCash ? feeHead.balanceMinor : feeHead.balanceMinor + task.feeMinor;
 
       await tx.walletEntry.create({
         data: {
@@ -1008,7 +1213,8 @@ export class RiderService {
           taskId,
           orderId: task.order?.id ?? null,
           counterpartyUserId: task.requesterId,
-          balanceAfterMinor: isCash ? riderBalance : riderBalance + task.feeMinor,
+          balanceAfterMinor: balanceAfterFee,
+          createdAt: feeHead.nextCreatedAt,
           note: isCash
             ? `Delivery fee for ${task.order?.reference ?? taskId} — collected in cash at the door (ADR-006)`
             : `Delivery fee for ${task.order?.reference ?? taskId}`,
@@ -1017,7 +1223,11 @@ export class RiderService {
 
       // FR-ORD-08: a peer errand reimburses the rider for what they spent.
       if (task.reimbursementMinor && task.reimbursementMinor > 0) {
-        const afterFee = isCash ? riderBalance : riderBalance + task.feeMinor;
+        // Read again rather than reusing `feeHead`: this is the second entry
+        // for the same wallet in the same millisecond, and it must sort after
+        // the fee entry just written. The fresh read sees that entry, so its
+        // balance is the one to carry and its timestamp lands one tick later.
+        const reimbursementHead = await readWalletHead(tx, riderId);
         await tx.walletEntry.create({
           data: {
             userId: riderId,
@@ -1026,15 +1236,16 @@ export class RiderService {
             type: 'ERRAND_REIMBURSEMENT',
             taskId,
             counterpartyUserId: task.requesterId,
-            balanceAfterMinor: afterFee,
+            balanceAfterMinor: reimbursementHead.balanceMinor,
+            createdAt: reimbursementHead.nextCreatedAt,
             note: 'Errand reimbursement — settled directly with the requester',
           },
         });
       }
 
-      // FR-WM-07: free the rider for the next task.
-      await tx.riderState.update({
-        where: { userId: riderId },
+      // FR-WM-07: free the rider for the next task — this task, specifically.
+      await tx.riderState.updateMany({
+        where: { userId: riderId, activeTaskId: taskId },
         data: { activeTaskId: null },
       });
 
@@ -1064,12 +1275,15 @@ export class RiderService {
       await tx.riderReliability.upsert({
         where: { userId: riderId },
         update: {
-          tasksCompleted: completed,
+          // An atomic increment rather than the value computed above: the
+          // settlement gate already makes this run once per task, and the
+          // counter should not depend on that staying true.
+          tasksCompleted: { increment: 1 },
           avgDeliverySeconds: newAvg,
+          // The column is NOT NULL, so "no rate yet" is stored as 0 here;
+          // the API reports null for it from the counters themselves.
           acceptanceRateBps:
-            (current?.tasksOffered ?? 0) > 0
-              ? Math.round(((current!.tasksAccepted ?? 0) / current!.tasksOffered) * 10_000)
-              : 0,
+            acceptanceRateBps(current?.tasksOffered ?? 0, current?.tasksAccepted ?? 0) ?? 0,
         },
         create: { userId: riderId, tasksCompleted: 1, avgDeliverySeconds: newAvg },
       });
@@ -1090,9 +1304,10 @@ export class RiderService {
       };
     });
 
-    await this.redis.markRiderFree(collegeId, riderId);
+    await this.freeRiderInRedis(collegeId, riderId);
 
-    this.gateway.notifyTaskStatus(collegeId, taskId, 'COMPLETED');
+    // M7: to the requester, the rider and the shop — not the college.
+    await this.dispatch.notifyTaskParties(taskId, 'COMPLETED');
 
     this.logger.log(
       `Task ${taskId} completed by ${riderId}, fee ${result.feeMinor} (${
@@ -1115,20 +1330,44 @@ export class RiderService {
     };
   }
 
-  /** FR-DLV-14, FR-ADM-04 */
-  private async escalate(taskId: string, collegeId: string, reason: string): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      const task = await tx.task.findUnique({
-        where: { id: taskId },
-        select: { status: true },
-      });
-      if (!task || task.status !== 'PICKED_UP') return;
-
+  /**
+   * FR-DLV-14, FR-ADM-04.
+   *
+   * M2: escalation releases the rider. It used to mark the task ESCALATED and
+   * stop — leaving `rider_state.active_task_id` pointing at it and the rider
+   * in the Redis busy set. Nothing else ever cleared either, so a rider whose
+   * customer misread a code five times answered ALREADY_HOLDING_TASK to every
+   * offer from then on, with no way out short of someone editing the
+   * database.
+   *
+   * The administrator resolution endpoint (FR-ADM-04: resolve as delivered or
+   * cancelled, settling or refunding accordingly) is STILL UNBUILT. Until it
+   * exists an ESCALATED task has no route to a terminal state through the
+   * API. Releasing the rider here is the minimum that keeps a person able to
+   * work; the task keeps its `rider_id` — the CHECK constraint requires one
+   * while ESCALATED, and whoever resolves it needs to know who was carrying
+   * the goods.
+   */
+  private async escalate(
+    taskId: string,
+    collegeId: string,
+    riderId: string,
+    reason: string,
+  ): Promise<void> {
+    const escalated = await this.prisma.$transaction(async (tx) => {
       assertTaskTransition(TaskStatus.PICKED_UP, TaskEvent.OTP_ATTEMPTS_EXHAUSTED);
 
-      await tx.task.update({
-        where: { id: taskId },
+      // ADR-001: conditional, so an escalation cannot land on a task that a
+      // correct code completed in the same instant.
+      const moved = await tx.task.updateMany({
+        where: { id: taskId, status: 'PICKED_UP', riderId },
         data: { status: 'ESCALATED', escalatedAt: new Date(), resolutionNote: reason },
+      });
+      if (moved.count !== 1) return false;
+
+      await tx.riderState.updateMany({
+        where: { userId: riderId, activeTaskId: taskId },
+        data: { activeTaskId: null },
       });
 
       await tx.auditLog.create({
@@ -1138,13 +1377,39 @@ export class RiderService {
           action: AuditAction.TASK_ESCALATED,
           targetType: 'task',
           targetId: taskId,
-          detail: { reason },
+          detail: { reason, riderId, riderReleased: true },
         },
       });
+
+      return true;
     });
 
-    this.gateway.notifyTaskStatus(collegeId, taskId, 'ESCALATED', { reason });
-    this.logger.warn(`Task ${taskId} escalated: ${reason}`);
+    if (!escalated) return;
+
+    await this.freeRiderInRedis(collegeId, riderId);
+
+    await this.dispatch.notifyTaskParties(taskId, 'ESCALATED', { reason });
+    this.logger.warn(`Task ${taskId} escalated: ${reason}; rider ${riderId} released`);
+  }
+
+  /**
+   * Clear the Redis busy flag after a task has been released in the database.
+   *
+   * Never throws. The database is the truth about who holds a task — the
+   * broadcast re-confirms `active_task_id IS NULL` there — and by the time
+   * this runs the transaction has committed, so a Redis hiccup must not turn
+   * a completed delivery into an error response.
+   */
+  private async freeRiderInRedis(collegeId: string, riderId: string): Promise<void> {
+    try {
+      await this.redis.markRiderFree(collegeId, riderId);
+    } catch (error) {
+      this.logger.warn(
+        `Could not clear the busy flag for rider ${riderId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   // =======================================================================
@@ -1198,7 +1463,16 @@ export class RiderService {
     if (!task) return null;
     this.tenant.assertSameTenant(user, task, 'Task');
 
-    if (task.riderId !== user.userId && user.role === 'STUDENT') {
+    // H6: the assigned rider, or an administrator of the same college (the
+    // tenant check above has already pinned an ADMIN to their own).
+    //
+    // The old test was "not the rider AND a student", which let every other
+    // role through — a shop owner or shop staff account could read any task
+    // in the college by id: the customer's name, their drop point, the
+    // shop's phone number, what they ordered.
+    const isAdministrator = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+
+    if (task.riderId !== user.userId && !isAdministrator) {
       throw new ForbiddenException({
         code: 'NOT_YOUR_TASK',
         message: 'That task is not assigned to you.',
@@ -1222,14 +1496,5 @@ export class RiderService {
         task.order?.paymentMethod === 'CASH' ? task.order.itemsSubtotalMinor : 0,
       cashToCollectMinor: task.order?.paymentMethod === 'CASH' ? task.order.totalMinor : 0,
     };
-  }
-
-  private async balanceTx(tx: Prisma.TransactionClient, userId: string): Promise<number> {
-    const last = await tx.walletEntry.findFirst({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      select: { balanceAfterMinor: true },
-    });
-    return last?.balanceAfterMinor ?? 0;
   }
 }

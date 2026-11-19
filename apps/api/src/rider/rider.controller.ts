@@ -4,6 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { RiderService } from './rider.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequireVerified } from '../common/decorators/require-verified.decorator';
+import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import {
   AbandonTaskDto,
@@ -18,9 +19,18 @@ import {
  *
  * FR-SVER-01 bars an unverified student from work mode, so the whole
  * controller is gated.
+ *
+ * H6: `@RequireVerified()` alone is not that gate. VerifiedGuard waves through
+ * every role that is not STUDENT — staff are "not subject to student
+ * verification" — so on its own it let a shop owner, shop staff or admin
+ * account go online, accept tasks and be paid for deliveries, having never
+ * been verified as anything. Riders are verified students (FR-WM-01), and
+ * `@Roles('STUDENT')` is what says so. The two decorators are a pair: one
+ * picks the role, the other checks that role's verification.
  */
 @ApiTags('rider')
 @Controller('rider')
+@Roles('STUDENT')
 @RequireVerified()
 export class RiderController {
   constructor(private readonly rider: RiderService) {}
@@ -112,9 +122,15 @@ export class RiderController {
   }
 }
 
-/** The requester's side of the handover (S-19). */
+/**
+ * The requester's side of the handover (S-19).
+ *
+ * H6: students only, for the reason given on RiderController. Only a student
+ * places an order or posts an errand, so only a student is ever a requester.
+ */
 @ApiTags('tasks')
 @Controller('tasks')
+@Roles('STUDENT')
 @RequireVerified()
 export class TasksController {
   constructor(private readonly rider: RiderService) {}

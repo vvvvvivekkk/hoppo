@@ -15,6 +15,15 @@ import { wsEvents } from '@hoppo/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import type { AccessTokenPayload } from '../common/types/authenticated-user';
+import {
+  SHOP_NOT_APPROVED_CODE,
+  SHOP_NOT_APPROVED_MESSAGE,
+  ShopAccessService,
+  isShopRole,
+} from '../common/access/shop-access.service';
+
+/** L9: pings arriving faster than this, per socket, are ignored. */
+const MIN_PING_GAP_MS = 2_000;
 
 interface SocketUser {
   userId: string;
@@ -65,6 +74,7 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
+    private readonly shopAccess: ShopAccessService,
   ) {}
 
   async handleConnection(client: Socket): Promise<void> {
@@ -99,6 +109,30 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
 
     if (!user || user.status !== 'ACTIVE') {
       this.logger.debug(`Socket rejected: account ${payload.sub} is not active`);
+      client.disconnect(true);
+      return;
+    }
+
+    // A shop account is ACTIVE from the moment the public registration form
+    // is submitted, long before an administrator approves the shop. HTTP
+    // refuses such an account everything but its own registration status
+    // (ShopApprovalGuard); without the same rule here it could open this
+    // channel and sit in `user:<id>` and the college room of whichever
+    // college it named on the form. Answered by the same ShopAccessService
+    // the HTTP side uses, so the two cannot drift apart.
+    //
+    // Checked at connect only. Nothing un-approves a shop account today
+    // (a SUSPENDED listing still counts as approved), so there is no path
+    // that needs an open socket re-checked.
+    if (isShopRole(user.role) && !(await this.shopAccess.hasApprovedShop(user.id))) {
+      this.logger.debug(`Socket rejected: shop account ${user.id} has no approved shop`);
+      // Said before the door closes, so the dashboard can show "awaiting
+      // approval" rather than a bare disconnect it would retry forever.
+      // `exception` is the event Nest's own WebSocket error filter uses.
+      client.emit('exception', {
+        code: SHOP_NOT_APPROVED_CODE,
+        message: SHOP_NOT_APPROVED_MESSAGE,
+      });
       client.disconnect(true);
       return;
     }
@@ -146,14 +180,35 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
     const user = client.data.user as SocketUser | undefined;
     if (!user?.collegeId) return { ok: false, reason: 'NOT_AUTHENTICATED' };
 
+    // L9: this handler is reachable by any authenticated socket, and what it
+    // writes feeds the proximity query. `Number.isFinite` alone let through
+    // latitude 9000, which GEOADD rejects with an error that surfaced as an
+    // unhandled exception — and a string or NaN would have poisoned the audit
+    // columns. The bounds are the same ones the database CHECKs elsewhere.
     if (
       typeof body?.latitude !== 'number' ||
       typeof body?.longitude !== 'number' ||
       !Number.isFinite(body.latitude) ||
-      !Number.isFinite(body.longitude)
+      !Number.isFinite(body.longitude) ||
+      body.latitude < -90 ||
+      body.latitude > 90 ||
+      body.longitude < -180 ||
+      body.longitude > 180
     ) {
       return { ok: false, reason: 'INVALID_POSITION' };
     }
+
+    // Each accepted ping costs two database reads, a database write and a
+    // Redis transaction. The configured interval is fifteen seconds, so
+    // anything faster than one per two seconds is a bug or abuse; it is
+    // dropped before it touches either store. Kept on the socket rather than
+    // in Redis because the point is to make a flood free to ignore.
+    const nowMs = Date.now();
+    const lastAcceptedMs = client.data.lastPingAcceptedMs as number | undefined;
+    if (lastAcceptedMs !== undefined && nowMs - lastAcceptedMs < MIN_PING_GAP_MS) {
+      return { ok: false, reason: 'TOO_FREQUENT' };
+    }
+    client.data.lastPingAcceptedMs = nowMs;
 
     const state = await this.prisma.riderState.findUnique({
       where: { userId: user.userId },
@@ -197,8 +252,13 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
   // Outbound
   // =======================================================================
 
-  /** FR-DLV-03: to every eligible rider at once. */
-  sendOffer(collegeId: string, riderIds: string[], offer: Record<string, unknown>): void {
+  /**
+   * FR-DLV-03: to every eligible rider at once.
+   *
+   * The payload is passed through untouched — every field the dispatcher
+   * builds reaches the rider, including the cash amounts they must front.
+   */
+  sendOffer(riderIds: string[], offer: Record<string, unknown>): void {
     if (riderIds.length === 0) return;
 
     for (const riderId of riderIds) {
@@ -206,39 +266,109 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
-  /** FR-DLV-05: withdraw from everyone except the winner. */
-  withdrawOffer(collegeId: string, taskId: string, winnerUserId: string): void {
-    this.server?.to(`college:${collegeId}`).emit(wsEvents.TASK_OFFER_WITHDRAWN, {
-      taskId,
-      // The winner's client uses this to tell "you got it" from "too slow".
-      winnerUserId,
-    });
+  /**
+   * FR-DLV-05: withdraw the offer from the riders who were shown it.
+   *
+   * M7: this used to go to the whole `college:<id>` room with the winner's
+   * user id in it, so every connected account in the college — students
+   * browsing shops, shop staff — learned which rider took which task. Now it
+   * goes only to the riders who were offered the task, and nobody is told
+   * who won: the winner's copy carries their own id and everyone else's
+   * carries null. `winnerUserId !== myId` therefore still means "too slow"
+   * on a client written against the old payload.
+   *
+   * `offeredRiderIds` is null when the offered set could not be read (Redis
+   * down). The withdrawal still has to reach the losers' screens, so that one
+   * case falls back to the college room — carrying a task id and nothing
+   * about any person.
+   */
+  withdrawOffer(
+    collegeId: string,
+    taskId: string,
+    winnerUserId: string,
+    offeredRiderIds: string[] | null,
+  ): void {
+    this.server
+      ?.to(`user:${winnerUserId}`)
+      .emit(wsEvents.TASK_OFFER_WITHDRAWN, { taskId, winnerUserId, won: true });
+
+    const lost = { taskId, winnerUserId: null, won: false };
+
+    if (offeredRiderIds === null) {
+      this.server
+        ?.to(`college:${collegeId}`)
+        .except(`user:${winnerUserId}`)
+        .emit(wsEvents.TASK_OFFER_WITHDRAWN, lost);
+      return;
+    }
+
+    for (const riderId of offeredRiderIds) {
+      if (riderId === winnerUserId) continue;
+      this.server?.to(`user:${riderId}`).emit(wsEvents.TASK_OFFER_WITHDRAWN, lost);
+    }
   }
 
+  /**
+   * A task changed state — told to the people the task belongs to.
+   *
+   * M7: addressed to `user:<id>` rooms, never the college room. The payload
+   * names the rider and can carry an escalation reason; neither is the
+   * business of every account in the college. The caller supplies the
+   * audience (requester, rider, shop staff) because the gateway decides
+   * nothing and looks nothing up.
+   */
   notifyTaskStatus(
-    collegeId: string,
+    recipientUserIds: readonly string[],
     taskId: string,
     status: string,
     extra: Record<string, unknown> = {},
   ): void {
-    this.server?.to(`college:${collegeId}`).emit(wsEvents.TASK_STATUS_CHANGED, {
+    this.emitToUsers(recipientUserIds, wsEvents.TASK_STATUS_CHANGED, {
       taskId,
       status,
       ...extra,
     });
   }
 
+  /** As notifyTaskStatus: the student, the shop's staff, and the rider if any. */
   notifyOrderStatus(
-    collegeId: string,
+    recipientUserIds: readonly string[],
     orderId: string,
     status: string,
     extra: Record<string, unknown> = {},
   ): void {
-    this.server?.to(`college:${collegeId}`).emit(wsEvents.ORDER_STATUS_CHANGED, {
+    this.emitToUsers(recipientUserIds, wsEvents.ORDER_STATUS_CHANGED, {
       orderId,
       status,
       ...extra,
     });
+  }
+
+  /**
+   * One emit to several user rooms. Socket.IO takes the union of the rooms,
+   * so a user who is both requester and shop staff gets the event once per
+   * socket rather than once per role.
+   */
+  private emitToUsers(
+    userIds: readonly string[],
+    event: string,
+    payload: Record<string, unknown>,
+  ): void {
+    const rooms = [...new Set(userIds)].filter(Boolean).map((id) => `user:${id}`);
+    if (rooms.length === 0) return;
+    this.server?.to(rooms).emit(event, payload);
+  }
+
+  /**
+   * FR-SVER-08: suspension terminates active sessions immediately.
+   *
+   * Authentication happens once, at connect, so a socket opened before the
+   * suspension would otherwise keep receiving offers and chat until the
+   * phone happened to reconnect. Addressed by room, so the Redis adapter
+   * closes the sockets on whichever instance holds them.
+   */
+  disconnectUser(userId: string): void {
+    this.server?.in(`user:${userId}`).disconnectSockets(true);
   }
 
   /** FR-SHP-01: the shop dashboard's audible alert. */
