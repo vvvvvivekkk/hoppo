@@ -22,7 +22,8 @@
     "db:generate": "pnpm --filter @hoppo/api prisma:generate",
     "db:seed": "pnpm --filter @hoppo/api prisma:seed",
     "db:studio": "pnpm --filter @hoppo/api prisma:studio",
-    "db:reset": "pnpm --filter @hoppo/api prisma:reset"
+    "db:reset": "pnpm --filter @hoppo/api prisma:reset",
+    "check:routes": "python3 packages/api-client/test/check-routes.py"
   },
   "devDependencies": {
     "prettier": "^3.4.2",

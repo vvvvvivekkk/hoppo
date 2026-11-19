@@ -1,0 +1,94 @@
+@import 'tailwindcss';
+
+/*
+ * The shop dashboard runs on a counter tablet, usually propped up next to a
+ * till, operated by someone who is mid-order and not looking closely. Three
+ * consequences shape everything here:
+ *
+ *  - Touch targets are large. NFR-U-04 asks for 44x44 px minimum; the primary
+ *    order actions are considerably bigger than that, because a mis-tap on
+ *    "reject" costs a sale.
+ *  - Contrast is high. A tablet on a counter catches window light and kitchen
+ *    steam. NFR-U-04 asks for 4.5:1; these pairs are above it.
+ *  - Nothing important is conveyed by colour alone. The queue cards carry a
+ *    text status as well as a colour, so a colour-blind operator and a
+ *    washed-out screen both still work.
+ */
+
+@theme {
+  --color-ink: #11181c;
+  --color-ink-soft: #3d4a52;
+  --color-ink-faint: #68787f;
+
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f2f5f6;
+  --color-line: #d6dee1;
+
+  /* Status colours. Each is paired with text in the markup, never used alone. */
+  --color-waiting: #b4530a;
+  --color-waiting-bg: #fdf1e3;
+  --color-preparing: #0b5f8a;
+  --color-preparing-bg: #e7f2f9;
+  --color-ready: #1a6b3c;
+  --color-ready-bg: #e6f4ec;
+  --color-danger: #a11a1a;
+  --color-danger-bg: #fcebeb;
+
+  --color-accent: #0f766e;
+  --color-accent-strong: #0b5a54;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--color-surface-sunken);
+    color: var(--color-ink);
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    /* A counter tablet is read at arm's length, not 40 cm. */
+    font-size: 17px;
+    line-height: 1.5;
+  }
+
+  /* Visible focus, because the dashboard is also used with a keyboard on a
+     desktop browser and an invisible focus ring makes that unusable. */
+  :focus-visible {
+    outline: 3px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* The minimum comfortable target on a tablet, above the NFR-U-04 floor. */
+  .tap {
+    min-height: 56px;
+    min-width: 56px;
+  }
+
+  .tap-lg {
+    min-height: 72px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse-soft {
+      animation: none;
+    }
+  }
+
+  .animate-pulse-soft {
+    animation: pulse-soft 1.8s ease-in-out infinite;
+  }
+
+  @keyframes pulse-soft {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.55;
+    }
+  }
+}

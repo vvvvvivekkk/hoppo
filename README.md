@@ -20,8 +20,8 @@ that document so any line can be traced to the thing it implements.
 | 1B | Auth, tenancy enforcement, student verification | **done** |
 | 1C | Shop registration with radius validation, catalog | **done** |
 | 1D | Ordering, dispatcher, first-accept assignment, OTP handover | **done** |
-| 1E | Shop dashboard, admin console | next |
-| 1F | Student mobile app | |
+| 1E | Shop dashboard, admin console | **done** |
+| 1F | Student mobile app | next |
 
 Phase 1 as a whole is the "complete, demonstrable system" of SRS §12.2.
 Phases 2 and 3 (chat, community board, ratings, analytics) come after.
@@ -33,12 +33,13 @@ Phases 2 and 3 (chat, community board, ratings, analytics) come after.
 ```
 hoppo/
 ├── apps/
-│   ├── api/          NestJS monolith — REST + WebSocket, Prisma, the dispatcher
+│   ├── api/           NestJS monolith — REST + WebSocket, Prisma, the dispatcher
 │   ├── dashboard/     Next.js shop dashboard (counter tablet)
 │   ├── admin/         Next.js admin console
 │   └── mobile/        Expo React Native student app
 ├── packages/
-│   └── shared/        Types and business rules used by the API and every client
+│   ├── shared/        Business rules used by the API and every client
+│   └── api-client/    Typed HTTP client shared by the consoles and the app
 ├── infra/             docker-compose for local Postgres, Redis, object storage
 └── docs/              Architecture, decisions, and the SRS itself
 ```
@@ -73,6 +74,17 @@ pnpm db:seed
 
 # 6. run the API
 pnpm dev:api
+
+# 7. in other terminals, the two web consoles
+pnpm dev:dashboard    # shop dashboard on :3001
+pnpm dev:admin        # admin console on :3002
+```
+
+Each console needs its own `.env.local`:
+
+```bash
+cp apps/dashboard/.env.example apps/dashboard/.env.local
+cp apps/admin/.env.example apps/admin/.env.local
 ```
 
 `pnpm db:studio` opens a browser UI over the database if you want to look
@@ -106,6 +118,34 @@ PostGIS is actually present; without it, shop registration cannot validate a
 radius).
 
 ---
+
+## The two consoles
+
+**Shop dashboard** (`:3001`) runs on a counter tablet, operated by someone
+mid-order. Large targets, high contrast, and no state conveyed by colour
+alone — a tablet in window light and a colour-blind operator both still read
+the word. Accepting an order is one tap from the alert, per `NFR-U-02`.
+
+The order queue has one piece of real difficulty worth knowing about:
+**browsers refuse to play audio until the page has been interacted with.** A
+tablet left on a counter overnight and reloaded by a browser restart will
+silently fail to chime, and nobody finds out until orders go unanswered. So
+the alert reports whether it is actually permitted to make sound, and the UI
+shows a "turn on sound" prompt rather than pretending it is armed. It also
+repeats every eight seconds while anything is unanswered, because one chime
+at the moment nobody was looking is the same as no chime — and `FR-SHP-02`
+cancels the order when the window runs out.
+
+**Admin console** (`:3002`) is for a trained operator at a desk. Dense rather
+than comfortable, because `FR-ADM-02` wants a whole decision visible without
+navigating away. The shop queue leads with the measured distance *against the
+limit*, and flags the two things that change a reviewer's judgement: whether
+the owner adjusted the map pin (an unadjusted pin came from a geocoder, which
+for a road name lands mid-road), and whether a food shop has an FSSAI licence.
+
+Both consoles say plainly what is not built rather than showing plausible
+zeros — the admin overview lists the missing screens, and the login page notes
+that admin two-factor is not enabled yet.
 
 ## The parts that matter
 
@@ -286,6 +326,11 @@ regardless. This is not legal advice; it is the conservative design.
   deployment (`NFR-M-01`).
 - **snake_case in the database, camelCase in TypeScript.** Each side gets the
   convention it expects; Prisma's `@map` bridges them.
+- **The API client's paths are checked against the API's routes.**
+  `packages/api-client/test/check-routes.py` compares every path the client can
+  request against the OpenAPI document the API serves. A renamed route is
+  otherwise invisible until it 404s in one screen, which is the worst way to
+  find out.
 - **Every query is tenant-scoped, and the rule is short enough to check.**
   Every Prisma query in a feature module either spreads `tenant.scope(user)`
   into its `where`, or passes its result through `tenant.assertSameTenant`.
