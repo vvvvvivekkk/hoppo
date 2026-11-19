@@ -12,6 +12,7 @@ import { RedisService } from '../redis/redis.service';
 import { AuditAction, AuditService } from '../audit/audit.service';
 import { AuthService } from '../auth/auth.service';
 import { TenantService } from '../common/tenant/tenant.service';
+import { DispatchGateway } from '../dispatch/dispatch.gateway';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import type {
   ApproveVerificationDto,
@@ -30,6 +31,9 @@ export class VerificationService {
     private readonly audit: AuditService,
     private readonly auth: AuthService,
     private readonly tenant: TenantService,
+    // Injected directly: VerificationModule imports DispatchModule, which
+    // exports the gateway and depends on nothing in this module.
+    private readonly gateway: DispatchGateway,
   ) {}
 
   // =======================================================================
@@ -230,6 +234,22 @@ export class VerificationService {
       where: { userId: user.userId, submittedAt: { gte: windowStart } },
     });
 
+    const allowed = config?.maxVerificationSubmissions ?? 3;
+
+    // When the rolling window next frees an attempt: the oldest submission
+    // still inside it, plus the window. Null while attempts remain. The same
+    // computation submit() puts in SUBMISSION_LIMIT_REACHED's details, so the
+    // date on the screen and the date in the refusal cannot disagree.
+    let retryAt: Date | null = null;
+    if (used >= allowed) {
+      const oldest = await this.prisma.verificationSubmission.findFirst({
+        where: { userId: user.userId, submittedAt: { gte: windowStart } },
+        orderBy: { submittedAt: 'asc' },
+        select: { submittedAt: true },
+      });
+      retryAt = oldest ? new Date(oldest.submittedAt.getTime() + windowDays * 86_400_000) : null;
+    }
+
     return {
       status: profile.verificationStatus,
       verifiedAt: profile.verifiedAt,
@@ -240,7 +260,8 @@ export class VerificationService {
       },
       latestSubmission: latest,
       submissionsUsed: used,
-      submissionsAllowed: config?.maxVerificationSubmissions ?? 3,
+      submissionsAllowed: allowed,
+      retryAt,
       // FR-SVER-01: what is and is not available while unverified.
       unlocked: {
         browseShops: true,
@@ -503,9 +524,7 @@ export class VerificationService {
       });
     }
 
-    const activeTaskId = student!.riderState?.activeTaskId ?? null;
-
-    await this.prisma.$transaction(async (tx) => {
+    const released = await this.prisma.$transaction(async (tx) => {
       await tx.user.update({
         where: { id: studentId },
         data: {
@@ -515,46 +534,85 @@ export class VerificationService {
         },
       });
 
-      // Disable work mode and release the active task.
+      /**
+       * Cancel the in-flight assignment by returning the task to the pool.
+       * The task keeps its history; the rider is simply detached.
+       *
+       * M9: this used to set the task BROADCASTING with `offerExpiresAt`
+       * null and no `dispatchDueAt`. Neither dispatcher tick matches that:
+       * the first looks for CREATED with a due time, the second for
+       * BROADCASTING with an expiry. The task sat in a state that says "on
+       * offer" while being offered to nobody, forever, and the student's
+       * food went cold with the app showing "finding a rider".
+       *
+       * It now does exactly what abandonment does — CREATED, due now, round
+       * 0, base fee (R-08: a task returning to the pool is a fresh search) —
+       * which the dispatch-due tick picks up within five seconds. CREATED
+       * with `rider_id` NULL also satisfies task_rider_presence_matches_status.
+       *
+       * ADR-001: found by `rider_id` and status in the UPDATE's own WHERE,
+       * not by an `activeTaskId` read before the transaction began. A rider
+       * who accepted a task between that read and this write would otherwise
+       * keep it, suspended.
+       */
+      const returnedToPool = await tx.$queryRaw<{ id: string }[]>`
+        UPDATE "task"
+        SET rider_id = NULL,
+            status = 'CREATED',
+            assigned_at = NULL,
+            broadcast_round = 0,
+            fee_minor = base_fee_minor,
+            current_proximity_m = NULL,
+            offer_expires_at = NULL,
+            dispatch_due_at = now(),
+            updated_at = now()
+        WHERE rider_id = ${studentId}
+          AND status = 'ASSIGNED'
+        RETURNING id
+      `;
+
+      // Only a task not yet picked up can safely return to the pool. One
+      // already carrying goods needs a human, so it escalates instead. It
+      // keeps its rider_id (the CHECK requires one while ESCALATED, and the
+      // administrator needs to know who has the goods).
+      const escalated = await tx.$queryRaw<{ id: string }[]>`
+        UPDATE "task"
+        SET status = 'ESCALATED',
+            escalated_at = now(),
+            resolution_note = ${`Rider suspended mid-delivery: ${dto.reason}`},
+            updated_at = now()
+        WHERE rider_id = ${studentId}
+          AND status IN ('PICKED_UP', 'DELIVERED')
+        RETURNING id
+      `;
+
+      // As abandonment does: the task room was for this rider. Archived, and
+      // the rider marked as having left; the next accept re-opens it.
+      const returnedIds = returnedToPool.map((t) => t.id);
+      if (returnedIds.length > 0) {
+        const rooms = await tx.chatRoom.findMany({
+          where: { taskId: { in: returnedIds } },
+          select: { id: true },
+        });
+        const roomIds = rooms.map((r) => r.id);
+        await tx.chatRoom.updateMany({
+          where: { id: { in: roomIds } },
+          data: { isArchived: true, archivedAt: new Date() },
+        });
+        await tx.chatMember.updateMany({
+          where: { roomId: { in: roomIds }, userId: studentId, leftAt: null },
+          data: { leftAt: new Date() },
+        });
+      }
+
+      // Disable work mode and release whatever the rider held. After the
+      // task updates, so the two rows change together or not at all.
       await tx.riderState.updateMany({
         where: { userId: studentId },
         data: { workModeOn: false, activeTaskId: null },
       });
 
-      // Cancel the in-flight assignment by returning the task to broadcast.
-      // The task keeps its history; the rider is simply detached.
-      if (activeTaskId) {
-        const task = await tx.task.findUnique({
-          where: { id: activeTaskId },
-          select: { id: true, status: true, baseFeeMinor: true },
-        });
-
-        // Only a task not yet picked up can safely return to the pool. One
-        // already carrying goods needs a human, so it escalates instead.
-        if (task && task.status === 'ASSIGNED') {
-          await tx.task.update({
-            where: { id: activeTaskId },
-            data: {
-              riderId: null,
-              status: 'BROADCASTING',
-              assignedAt: null,
-              // R-08: a task returning to the pool is a fresh search.
-              broadcastRound: 0,
-              feeMinor: task.baseFeeMinor,
-              offerExpiresAt: null,
-            },
-          });
-        } else if (task && ['PICKED_UP', 'DELIVERED'].includes(task.status)) {
-          await tx.task.update({
-            where: { id: activeTaskId },
-            data: {
-              status: 'ESCALATED',
-              escalatedAt: new Date(),
-              resolutionNote: `Rider suspended mid-delivery: ${dto.reason}`,
-            },
-          });
-        }
-      }
+      const releasedTaskId = returnedIds[0] ?? escalated[0]?.id ?? null;
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
@@ -562,9 +620,18 @@ export class VerificationService {
         action: AuditAction.STUDENT_SUSPENDED,
         targetType: 'user',
         targetId: studentId,
-        detail: { reason: dto.reason, releasedTaskId: activeTaskId },
+        detail: {
+          reason: dto.reason,
+          releasedTaskId,
+          returnedToPoolTaskIds: returnedIds,
+          escalatedTaskIds: escalated.map((t) => t.id),
+        },
       });
+
+      return { releasedTaskId, returnedIds, escalatedIds: escalated.map((t) => t.id) };
     });
+
+    const activeTaskId = released.releasedTaskId;
 
     // Terminate sessions. The JWT strategy also rejects a suspended account on
     // every request, so this is belt and braces — but revoking the refresh
@@ -574,6 +641,29 @@ export class VerificationService {
     // Remove from the dispatch pool so no further offers reach them.
     if (student!.collegeId) {
       await this.redis.removeRider(student!.collegeId, studentId);
+    }
+
+    // FR-SVER-08, "immediately terminating active sessions": a socket is
+    // authenticated once, at connect, so one opened before the suspension
+    // would keep receiving task offers and chat until it happened to
+    // reconnect. Revoking tokens does not reach it; closing it does.
+    this.gateway.disconnectUser(studentId);
+
+    // M7-consistent: the people each affected task belongs to are told,
+    // individually. The suspended rider is not among them — their sockets
+    // have just been closed.
+    for (const taskId of released.returnedIds) {
+      this.gateway.notifyTaskStatus(await this.taskAudience(taskId), taskId, 'CREATED', {
+        reason: 'RIDER_REMOVED',
+      });
+    }
+    for (const taskId of released.escalatedIds) {
+      this.gateway.notifyTaskStatus(
+        (await this.taskAudience(taskId)).filter((id) => id !== studentId),
+        taskId,
+        'ESCALATED',
+        { reason: 'RIDER_SUSPENDED' },
+      );
     }
 
     this.logger.warn(`Student ${studentId} suspended by ${user.userId}: ${dto.reason}`);
@@ -587,13 +677,49 @@ export class VerificationService {
     };
   }
 
+  /**
+   * Who a task's status is the business of: the requester, and the shop's
+   * staff for a shop order. Mirrors DispatchService.taskAudience.
+   */
+  private async taskAudience(taskId: string): Promise<string[]> {
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      select: {
+        requesterId: true,
+        riderId: true,
+        order: {
+          select: {
+            shopListing: { select: { shop: { select: { staff: { select: { userId: true } } } } } },
+          },
+        },
+      },
+    });
+    if (!task) return [];
+
+    return [
+      ...new Set([
+        task.requesterId,
+        ...(task.riderId ? [task.riderId] : []),
+        ...(task.order?.shopListing.shop.staff.map((s) => s.userId) ?? []),
+      ]),
+    ];
+  }
+
   async reinstate(user: AuthenticatedUser, studentId: string) {
     const student = await this.prisma.user.findUnique({
       where: { id: studentId },
-      select: { id: true, collegeId: true, status: true },
+      select: { id: true, collegeId: true, role: true, status: true },
     });
 
     this.tenant.assertSameTenant(user, student, 'Student');
+
+    // The mirror of suspend(): this route acts on student accounts only.
+    if (student!.role !== 'STUDENT') {
+      throw new BadRequestException({
+        code: 'NOT_A_STUDENT',
+        message: 'Only student accounts are reinstated this way.',
+      });
+    }
 
     if (student!.status !== 'SUSPENDED') {
       throw new ConflictException({
