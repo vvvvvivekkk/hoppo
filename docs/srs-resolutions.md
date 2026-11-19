@@ -270,6 +270,47 @@ on parcel tasks is noted as Phase 3 work when parcel pickup actually ships.
 
 ---
 
+## 🔴 R-18 — Opening hours have no timezone, so they follow the server's
+
+**The gap.** `FR-CAT-04` has a shop set opening hours per day of the week, and
+`FR-CAT-05` shows a shop outside those hours as closed. Neither says in which
+timezone the hours are expressed, and §9.1's `shop_hours` table carries no zone.
+
+That is not a theoretical omission. Hours stored as minutes from midnight and
+compared against the API process's local time mean a Hyderabad shop opening at
+09:00 IST appears to open at 09:00 *server* time. Deploy the API in UTC — which
+is the default for most container images — and the shop shows closed from 09:00
+to 14:30 IST, through the whole morning trade, and open until 02:30 the next
+morning.
+
+This was found by observation rather than by reading: a seeded shop with
+08:00–21:00 hours reported closed during what should have been its open window,
+because the development host was running in `Asia/Taipei`.
+
+**Resolution.** `college.timezone` (IANA, defaulting to `Asia/Kolkata`), and
+`resolveOpenState` now takes that zone and reads the day and minute in it via
+`Intl.DateTimeFormat` — which carries the full IANA database, so daylight
+saving and historical offset changes are handled without a date library and
+without hard-coding `+05:30`. Nothing in the hours path reads the host's local
+time any more, and an unparseable zone falls back to the Indian default rather
+than to the host's.
+
+Verified with a discriminating test: hours set to Thursday 23:00–23:59 IST,
+evaluated on a host where it was already Friday 01:37 with no Friday row. Under
+the old behaviour the shop reported closed; it now reports open.
+
+**Proposed requirement to add to the SRS:**
+
+> **FR-TEN-06.** Each college tenant shall carry an IANA timezone. All
+> wall-clock business rules for that tenant — shop opening hours, temporary
+> closures expressed as local times, and operational reporting by hour — shall
+> be evaluated in the college's timezone and not in the timezone of the host
+> running the application.
+
+**Affects** `FR-CAT-04`, `FR-CAT-05`, `FR-ADM-05` (active riders by hour), §9.1.
+
+---
+
 ## 🟢 R-17 — §9.1's `task.otp_hash` is right, but §9.1's naming is inconsistent
 
 **Observation, not a conflict.** The data model correctly names the column
@@ -291,6 +332,7 @@ issue timestamp.
 | R-02 geospatial index | 🔴 | Redis GEO + PostGIS function, `ADR-002` |
 | R-03 missing dispatcher | 🔴 | Scheduled jobs, `ADR-005`, new `FR-DLV-00` |
 | R-04 cash settlement | 🔴 | `ADR-006` |
+| R-18 hours have no timezone | 🔴 | `college.timezone`, new `FR-TEN-06` |
 | R-05 pickup ownership | 🟡 | `ADR-003` |
 | R-06 `UNFULFILLED` exits | 🟡 | `task-state.ts` |
 | R-07 fee increment | 🟡 | `ADR-004` |

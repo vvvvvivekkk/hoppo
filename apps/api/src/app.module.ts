@@ -11,6 +11,10 @@ import { AuditModule } from './audit/audit.module';
 import { TenantModule } from './common/tenant/tenant.module';
 import { AuthModule } from './auth/auth.module';
 import { VerificationModule } from './verification/verification.module';
+import { StorageModule } from './storage/storage.module';
+import { GeocodingModule } from './geocoding/geocoding.module';
+import { ShopsModule } from './shops/shops.module';
+import { CatalogModule } from './catalog/catalog.module';
 import { HealthModule } from './health/health.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
@@ -40,9 +44,13 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     RedisModule,
     AuditModule,
     TenantModule,
+    StorageModule,
+    GeocodingModule,
 
     AuthModule,
     VerificationModule,
+    ShopsModule,
+    CatalogModule,
     HealthModule,
   ],
   providers: [

@@ -3,13 +3,22 @@
  *
  * Hours are stored as minutes from midnight (540 = 09:00) so that "is this
  * shop open right now" is an integer comparison rather than date parsing.
- * A row whose closeMinute is less than its openMinute crosses midnight.
+ * A row whose closeMinute is less than or equal to its openMinute crosses
+ * midnight.
  *
- * FR-CAT-04, FR-CAT-05.
+ * **Hours are in the college's timezone, not the server's.** This matters
+ * more than it looks. A shop in Hyderabad opens at 09:00 IST. If the API
+ * resolves "is it open" using the server process's local time, then the same
+ * shop appears to open at 09:00 UTC on a server in London — 14:30 in
+ * Hyderabad — and shows as closed through most of its actual trading day.
+ * Every function here therefore takes an IANA timezone and uses it; none of
+ * them reads the host's local time.
+ *
+ * FR-CAT-04, FR-CAT-05. See docs/srs-resolutions.md R-18.
  */
 
 export interface HoursRow {
-  /** 0 = Sunday .. 6 = Saturday */
+  /** 0 = Sunday .. 6 = Saturday, in the college's timezone. */
   dayOfWeek: number;
   openMinute: number;
   closeMinute: number;
@@ -22,8 +31,66 @@ export interface OpenState {
   opensInMinutes?: number;
 }
 
-export function minuteOfDay(date: Date): number {
-  return date.getHours() * 60 + date.getMinutes();
+/** India, the default for every college until one says otherwise. */
+export const DEFAULT_TIMEZONE = 'Asia/Kolkata';
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+/**
+ * The day of week and minute of day at an instant, as observed in a
+ * particular timezone.
+ *
+ * Uses Intl, which is built into Node and every browser and carries the full
+ * IANA database — so daylight saving and historical offset changes are
+ * handled without a date library and without hard-coding "+05:30".
+ */
+export function zonedDayAndMinute(
+  at: Date,
+  timeZone: string = DEFAULT_TIMEZONE,
+): { dayOfWeek: number; minuteOfDay: number } {
+  let parts: Intl.DateTimeFormatPart[];
+
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(at);
+  } catch {
+    // An invalid timezone string must not take the endpoint down. Fall back
+    // to the default rather than to the host's zone, which would be the
+    // original bug wearing a disguise.
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: DEFAULT_TIMEZONE,
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(at);
+  }
+
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((p) => p.type === type)?.value ?? '';
+
+  // With hour12: false some ICU builds render midnight as "24" rather than
+  // "00", which would put the minute of day at 1440 and break comparisons.
+  const hour = Number(get('hour')) % 24;
+  const minute = Number(get('minute'));
+
+  return {
+    dayOfWeek: WEEKDAY_INDEX[get('weekday')] ?? 0,
+    minuteOfDay: hour * 60 + minute,
+  };
 }
 
 export function formatMinuteOfDay(minute: number): string {
@@ -39,10 +106,13 @@ export function formatMinuteOfDay(minute: number): string {
 export function resolveOpenState(params: {
   rows: readonly HoursRow[];
   now: Date;
+  /** The college's IANA timezone, e.g. "Asia/Kolkata". */
+  timeZone?: string;
   temporarilyClosedUntil?: Date | null;
 }): OpenState {
-  const { rows, now, temporarilyClosedUntil } = params;
+  const { rows, now, timeZone = DEFAULT_TIMEZONE, temporarilyClosedUntil } = params;
 
+  // A temporary closure is an absolute instant, so it needs no zone maths.
   if (temporarilyClosedUntil && temporarilyClosedUntil.getTime() > now.getTime()) {
     return { isOpen: false, reason: 'TEMPORARILY_CLOSED' };
   }
@@ -51,9 +121,8 @@ export function resolveOpenState(params: {
     return { isOpen: false, reason: 'NO_HOURS_SET' };
   }
 
-  const today = now.getDay();
+  const { dayOfWeek: today, minuteOfDay: nowMinute } = zonedDayAndMinute(now, timeZone);
   const yesterday = (today + 6) % 7;
-  const nowMinute = minuteOfDay(now);
 
   for (const row of rows) {
     const crossesMidnight = row.closeMinute <= row.openMinute;
@@ -65,7 +134,7 @@ export function resolveOpenState(params: {
     }
 
     if (crossesMidnight) {
-      // Open late yesterday and still open now, or open late today.
+      // Opened late yesterday and still open, or opened late today.
       if (row.dayOfWeek === yesterday && nowMinute < row.closeMinute) {
         return { isOpen: true, reason: 'OPEN' };
       }
@@ -75,12 +144,18 @@ export function resolveOpenState(params: {
     }
   }
 
-  return { isOpen: false, reason: 'OUTSIDE_HOURS', opensInMinutes: minutesUntilNextOpen(rows, now) };
+  return {
+    isOpen: false,
+    reason: 'OUTSIDE_HOURS',
+    opensInMinutes: minutesUntilNextOpen(rows, today, nowMinute),
+  };
 }
 
-function minutesUntilNextOpen(rows: readonly HoursRow[], now: Date): number | undefined {
-  const nowMinute = minuteOfDay(now);
-  const today = now.getDay();
+function minutesUntilNextOpen(
+  rows: readonly HoursRow[],
+  today: number,
+  nowMinute: number,
+): number | undefined {
   let best: number | undefined;
 
   for (let dayOffset = 0; dayOffset < 7; dayOffset += 1) {

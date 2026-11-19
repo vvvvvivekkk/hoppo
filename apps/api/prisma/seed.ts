@@ -34,6 +34,8 @@ const COLLEGE = {
   latitude: 17.3045,
   longitude: 78.6188,
   emailDomain: 'anurag.edu.in',
+  // Shop opening hours are interpreted in this zone, not the server's (R-18).
+  timezone: 'Asia/Kolkata',
 };
 
 const DEV_PASSWORD = 'Hoppo@dev123';
@@ -51,7 +53,7 @@ async function main() {
   // -----------------------------------------------------------------------
   const college = await prisma.college.upsert({
     where: { id: COLLEGE.id },
-    update: {},
+    update: { timezone: COLLEGE.timezone },
     create: { ...COLLEGE, status: 'ACTIVE' },
   });
 

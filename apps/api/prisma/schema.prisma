@@ -250,6 +250,12 @@ model College {
   /// Decimal degrees, WGS 84. Used as the centre point for radius validation.
   latitude  Float
   longitude Float
+  /// IANA timezone, e.g. "Asia/Kolkata". Shop opening hours are stored as
+  /// minutes from midnight and must be interpreted in *this* zone, not the
+  /// server's — otherwise a Hyderabad shop's 09:00 becomes 09:00 UTC on a
+  /// server deployed elsewhere, and it shows closed through its own trading
+  /// day. See docs/srs-resolutions.md R-18.
+  timezone  String  @default("Asia/Kolkata")
   /// FR-AUTH-03: when set, only email addresses on this domain may register.
   emailDomain String?     @map("email_domain")
   contactName  String?    @map("contact_name")

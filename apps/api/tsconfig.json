@@ -8,6 +8,12 @@
       "@/*": ["src/*"]
     },
     "incremental": true,
+    // Keep the incremental cache inside the output directory. Left at its
+    // default (next to tsconfig.json) it survives `rm -rf dist`, and the next
+    // build then believes the deleted files are still up to date and emits a
+    // partial dist — which fails at runtime with a confusing
+    // "Cannot find module './config/configuration'".
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
     "sourceMap": true,
     "strictPropertyInitialization": false
   },

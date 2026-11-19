@@ -18,8 +18,8 @@ that document so any line can be traced to the thing it implements.
 |---|---|---|
 | 1A | Monorepo, data model, integrity constraints, shared business rules | **done** |
 | 1B | Auth, tenancy enforcement, student verification | **done** |
-| 1C | Shop registration with radius validation, catalog | next |
-| 1D | Ordering, dispatcher, first-accept assignment, OTP handover | |
+| 1C | Shop registration with radius validation, catalog | **done** |
+| 1D | Ordering, dispatcher, first-accept assignment, OTP handover | next |
 | 1E | Shop dashboard, admin console | |
 | 1F | Student mobile app | |
 
@@ -170,7 +170,31 @@ run as scheduled jobs in the API. The SRS implies this in its indexing notes
 but never states it as a requirement; `docs/srs-resolutions.md` records the
 gap. See `ADR-005`.
 
-### 4. Money is never a decimal
+### 4. Opening hours belong to a place, not to a server
+
+A shop opens at 09:00. That is 09:00 *in Hyderabad* — and the API process may
+be running anywhere. Store the hours as minutes from midnight, compare them
+against the server's clock, and a shop deployed on a UTC container shows closed
+from 09:00 to 14:30 IST and open until half past two in the morning.
+
+So each college carries an IANA timezone (`Asia/Kolkata` by default), and
+`resolveOpenState` reads the day and minute *in that zone*:
+
+```ts
+resolveOpenState({ rows, now, timeZone: college.timezone, temporarilyClosedUntil })
+```
+
+`Intl.DateTimeFormat` does the conversion. It is built into Node and carries
+the full IANA database, so daylight saving and historical offset changes come
+free and nothing hard-codes `+05:30`.
+
+This one was found by accident: a seeded shop with 08:00–21:00 hours reported
+closed when it should have been open, because the development machine was in
+`Asia/Taipei`. Worth knowing that a passing test suite would not have caught
+it — the old tests built dates with `new Date(2026, 10, 18, 13)`, which is
+*also* host-relative, so they agreed with the bug.
+
+### 5. Money is never a decimal
 
 Every amount is an integer number of paise. `₹120.50` is stored, passed and
 compared as `12050`.
@@ -202,6 +226,10 @@ silently, each one is written down with the reasoning in
   wallet in Phase 2. The minimal ledger ships in Phase 1.
 - Cash-on-delivery had no settlement path to the shop at all. Resolved and
   documented in `ADR-006`.
+- Opening hours carried no timezone, so they silently followed whatever zone
+  the server ran in — a Hyderabad shop's 09:00 becomes 09:00 UTC on a default
+  container image, closing it through its whole morning trade. Resolved with
+  `college.timezone`.
 
 ---
 
