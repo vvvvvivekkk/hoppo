@@ -1,7 +1,8 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { OrdersService } from './orders.service';
+import { MY_ORDERS_DEFAULT_LIMIT, OrdersService } from './orders.service';
+import { clampPageLimit } from '../common/pagination';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RequireVerified } from '../common/decorators/require-verified.decorator';
@@ -21,9 +22,15 @@ import {
  * @RequireVerified on the controller: FR-SVER-01 bars an unverified student
  * from placing orders, and putting it here means a new endpoint added to this
  * controller is gated by default rather than by remembering.
+ *
+ * @Roles('STUDENT') on the controller for the same reason. Without it the
+ * RolesGuard treats these endpoints as open to any signed-in account, so a
+ * shop or administrator login could quote and place orders. A rider is a
+ * student, so riders are unaffected.
  */
 @ApiTags('orders')
 @Controller('orders')
+@Roles('STUDENT')
 @RequireVerified()
 export class OrdersController {
   constructor(private readonly orders: OrdersService) {}
@@ -51,9 +58,18 @@ export class OrdersController {
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
   ) {
-    return this.orders.myOrders(user, limit ? Number(limit) : 20, cursor);
+    // The raw query string is untrusted: "abc" becomes NaN and a very large
+    // number becomes an unbounded read. clampPageLimit turns anything that
+    // is not a whole number into the default and caps the rest at 1..100.
+    return this.orders.myOrders(user, clampPageLimit(limit, MY_ORDERS_DEFAULT_LIMIT), cursor);
   }
 
+  // Overrides the class-level role list (RolesGuard reads the handler before
+  // the class). OrdersService.orderDetail deliberately serves the shop's
+  // staff and the college's administrators as well as the student, and does
+  // its own ownership and tenancy checks; restricting this one route to
+  // STUDENT would lock them out of an order they are entitled to see.
+  @Roles('STUDENT', 'SHOP_OWNER', 'SHOP_STAFF', 'ADMIN')
   @Get(':orderId')
   @ApiOperation({ summary: 'One order, with live task and rider state' })
   detail(@CurrentUser() user: AuthenticatedUser, @Param('orderId') orderId: string) {

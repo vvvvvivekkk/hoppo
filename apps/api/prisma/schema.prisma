@@ -1297,6 +1297,23 @@ model Comment {
 /// a correction is a new, opposite entry. balanceAfterMinor is carried on each
 /// row so a statement needs no running total computed at read time, and so a
 /// mismatch is immediately visible.
+///
+/// Three rules on this table live in raw SQL, in migration
+/// 20261120090000_wallet_integrity, because Prisma cannot declare a partial
+/// index or a CHECK constraint:
+///   - at most one ORDER_HOLD and one ORDER_RELEASE per order
+///     (wallet_entry_one_hold_release_per_order)
+///   - at most one DELIVERY_FEE_EARNED per task
+///     (wallet_entry_one_delivery_fee_per_task)
+///   - balance_after_minor >= 0 (wallet_entry_balance_non_negative)
+/// The same migration adds the `seq` column declared below.
+/// Do not add a plain @@unique([orderId, type]) here to "match" them: that
+/// would be unique across every entry type, which is a different and wrong
+/// rule.
+///
+/// Every transaction that inserts here must first take the per-user lock,
+/// pg_advisory_xact_lock(hashtext('wallet:' || user_id)), and only then read
+/// the balance it builds on.
 model WalletEntry {
   id     String @id @default(uuid())
   userId String @map("user_id")
@@ -1309,6 +1326,12 @@ model WalletEntry {
   note      String?
   balanceAfterMinor Int @map("balance_after_minor")
   createdAt DateTime @default(now()) @map("created_at")
+
+  /// A counter the database increments on every insert. createdAt stores
+  /// milliseconds and two entries can share one, so it cannot by itself say
+  /// which entry is the latest; seq can. Read the head of a wallet with
+  /// ORDER BY created_at DESC, seq DESC. Never set it from application code.
+  seq BigInt @unique @default(autoincrement())
 
   user User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   task Task? @relation(fields: [taskId], references: [id])

@@ -30,6 +30,13 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TenantService } from '../common/tenant/tenant.service';
 import { AuditService } from '../audit/audit.service';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
+import { clampPageLimit } from '../common/pagination';
+import {
+  orderStateChanged,
+  resolveOrderTransition,
+  resolveTaskTransition,
+} from './order-transition';
+import { WALLET_HEAD_ORDER, readWalletHead } from '../wallet/wallet-ledger';
 import type {
   AcceptOrderDto,
   CancelOrderDto,
@@ -37,6 +44,13 @@ import type {
   QuoteOrderDto,
   RejectOrderDto,
 } from './dto/orders.dto';
+
+/**
+ * Page size for "my orders" when the client does not ask for one. The shared
+ * helper defaults to 25; this list has always been specified at 30, so the
+ * default is passed explicitly rather than inherited.
+ */
+export const MY_ORDERS_DEFAULT_LIMIT = 30;
 
 @Injectable()
 export class OrdersService {
@@ -294,6 +308,18 @@ export class OrdersService {
 
   async place(user: AuthenticatedUser, dto: PlaceOrderDto) {
     const collegeId = this.tenant.requireCollegeId(user);
+
+    // No payment gateway exists yet. An ONLINE order would be created
+    // PENDING, never collected, and still credit the rider's wallet on
+    // completion — money paid out that nobody paid in. Refuse it here, before
+    // any pricing work, until a gateway can actually take the payment.
+    if (dto.paymentMethod === PaymentMethod.ONLINE) {
+      throw new BadRequestException({
+        code: 'ONLINE_PAYMENT_UNAVAILABLE',
+        message:
+          'Online payment is not available yet. Choose cash on delivery or your wallet instead.',
+      });
+    }
     const context = await this.loadOrderContext(collegeId, dto);
 
     if (!context.isOpen) {
@@ -327,14 +353,14 @@ export class OrdersService {
       // FR-PAY-06: the amount is held on placement. The wallet is not funded
       // in Phase 1 beyond rider earnings, so refuse clearly rather than
       // creating an order that can never be paid for.
+      //
+      // This read is a courtesy only: it fails fast without opening a
+      // transaction. It decides nothing — two placements can both pass it —
+      // so the same check runs again under the wallet lock below, and that
+      // one is the guarantee.
       const balance = await this.walletBalance(user.userId);
       if (balance < context.totals.totalMinor) {
-        throw new BadRequestException({
-          code: 'INSUFFICIENT_WALLET_BALANCE',
-          message: `Your wallet has ${formatMinor(balance)}, and this order is ${formatMinor(
-            context.totals.totalMinor,
-          )}. Choose cash on delivery instead.`,
-        });
+        throw this.insufficientWalletBalance(balance, context.totals.totalMinor);
       }
     }
 
@@ -342,6 +368,12 @@ export class OrdersService {
 
     const result = await this.withReferenceRetry((reference) =>
       this.prisma.$transaction(async (tx) => {
+      // Taken before anything is written, so every wallet-writing transaction
+      // acquires its locks in the same order (wallet first, rows after).
+      if (dto.paymentMethod === PaymentMethod.WALLET) {
+        await this.lockWallet(tx, user.userId);
+      }
+
       const order = await tx.order.create({
         data: {
           collegeId,
@@ -408,7 +440,16 @@ export class OrdersService {
 
       // FR-PAY-06: hold the wallet amount as a ledger entry.
       if (dto.paymentMethod === PaymentMethod.WALLET) {
-        const balance = await this.walletBalanceTx(tx, user.userId);
+        // Re-read and re-check under the lock. Between the courtesy check
+        // above and here another placement may have spent the same money;
+        // with the lock held, this read is the latest entry and nothing can
+        // append after it until this transaction ends. Throwing rolls back
+        // the order and task created above.
+        const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, user.userId);
+        if (balance < context.totals.totalMinor) {
+          throw this.insufficientWalletBalance(balance, context.totals.totalMinor);
+        }
+
         await tx.walletEntry.create({
           data: {
             userId: user.userId,
@@ -417,6 +458,9 @@ export class OrdersService {
             type: 'ORDER_HOLD',
             orderId: order.id,
             balanceAfterMinor: balance - context.totals.totalMinor,
+            // Strictly after the entry this balance was read from, so the
+            // ledger has one unambiguous latest row (see wallet-ledger.ts).
+            createdAt: nextCreatedAt,
             note: `Held for order ${reference}`,
           },
         });
@@ -511,7 +555,11 @@ export class OrdersService {
   // Student views and cancellation — FR-ORD-05
   // =======================================================================
 
-  async myOrders(user: AuthenticatedUser, limit = 20, cursor?: string) {
+  async myOrders(user: AuthenticatedUser, requestedLimit?: number, cursor?: string) {
+    // Clamped here as well as in the controller, so a caller that is not the
+    // controller cannot ask for an unbounded page either.
+    const limit = clampPageLimit(requestedLimit, MY_ORDERS_DEFAULT_LIMIT);
+
     const orders = await this.prisma.order.findMany({
       where: { ...this.tenant.scope(user), studentId: user.userId },
       select: {
@@ -788,8 +836,11 @@ export class OrdersService {
 
         assertTaskTransition(TaskStatus.UNFULFILLED, TaskEvent.REQUESTER_KEEPS_WAITING);
 
-        await tx.task.update({
-          where: { id: taskId },
+        // Conditional for the same reason as the two branches below: a
+        // "keep waiting" racing a "cancel" must not put a cancelled, refunded
+        // task back into the dispatch pool.
+        const moved = await tx.task.updateMany({
+          where: { id: taskId, status: 'UNFULFILLED' },
           data: {
             status: 'CREATED',
             broadcastRound: 0,
@@ -799,8 +850,17 @@ export class OrdersService {
             dispatchDueAt: new Date(),
           },
         });
+        if (moved.count === 0) throw this.alreadyDecided();
 
-        await tx.broadcastLog.deleteMany({ where: { taskId, outcome: 'PENDING' } });
+        // The rounds that found nobody are closed as EXPIRED, not deleted.
+        // broadcast_log is the record FR-DLV-09 / FR-ADM-05 report from, and
+        // its trigger refuses DELETE outright — so the delete that used to be
+        // here failed the whole transaction whenever a PENDING row existed,
+        // and "keep waiting" never took effect.
+        await tx.broadcastLog.updateMany({
+          where: { taskId, outcome: 'PENDING' },
+          data: { outcome: 'EXPIRED', resolvedAt: new Date() },
+        });
       });
 
       return {
@@ -811,34 +871,59 @@ export class OrdersService {
     }
 
     if (choice === 'COLLECT_IN_PERSON') {
+      // There is nothing to collect until the shop has packed it. Riders are
+      // called before the food is ready (FR-DLV-01), so a task can run out of
+      // rounds while the order is still PREPARING; completing it then would
+      // close an order the student has not received.
+      if (order!.status !== 'READY') {
+        throw this.notReadyToCollect();
+      }
+
+      const paidFromWallet = order!.paymentMethod === PaymentMethod.WALLET;
+      const refundsFeeToWallet = paidFromWallet && order!.deliveryFeeMinor > 0;
+
       // FR-DLV-07: no rider delivered it, so no delivery fee is due. The
       // refund is of the fee only — the food was made and is being collected.
       await this.prisma.$transaction(async (tx) => {
+        // Locked for any wallet order, not only one with a fee to refund: the
+        // capture entry below is a ledger write too.
+        if (paidFromWallet) await this.lockWallet(tx, order!.studentId);
+
         assertTaskTransition(TaskStatus.UNFULFILLED, TaskEvent.REQUESTER_COLLECTED_IN_PERSON);
         assertOrderTransition(OrderStatus.READY, OrderEvent.COLLECTED_IN_PERSON);
 
-        await tx.task.update({
-          where: { id: taskId },
+        // The two conditional updates decide; the checks above this
+        // transaction only choose the error message. A second request, or a
+        // parallel "cancel", finds the task no longer UNFULFILLED, matches
+        // zero rows, and is turned away before any refund is written.
+        const taskMoved = await tx.task.updateMany({
+          where: { id: taskId, status: 'UNFULFILLED' },
           data: {
             status: 'COMPLETED',
             completedAt: new Date(),
             resolutionNote: 'Collected in person by the requester; no rider was found.',
           },
         });
+        if (taskMoved.count === 0) throw this.alreadyDecided();
 
-        await tx.order.update({
-          where: { id: orderId },
+        const orderMoved = await tx.order.updateMany({
+          where: { id: orderId, status: DbOrderStatus.READY },
           data: {
             status: 'COMPLETED',
             completedAt: new Date(),
             // The delivery fee is refunded; the items are not.
             deliveryFeeMinor: 0,
             totalMinor: { decrement: order!.deliveryFeeMinor },
+            // The order is complete, so what remains of the hold is now the
+            // shop's: HELD becomes CAPTURED, exactly as on a rider-delivered
+            // order. Cash stays NOT_REQUIRED.
+            ...(paidFromWallet ? { paymentStatus: 'CAPTURED' as const } : {}),
           },
         });
+        if (orderMoved.count === 0) throw this.notReadyToCollect();
 
-        if (order!.paymentMethod === PaymentMethod.WALLET && order!.deliveryFeeMinor > 0) {
-          const balance = await this.walletBalanceTx(tx, order!.studentId);
+        if (refundsFeeToWallet) {
+          const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, order!.studentId);
           await tx.walletEntry.create({
             data: {
               userId: order!.studentId,
@@ -847,7 +932,31 @@ export class OrdersService {
               type: 'ORDER_RELEASE',
               orderId,
               balanceAfterMinor: balance + order!.deliveryFeeMinor,
+              // Strictly after the entry this balance was read from, so the
+              // ledger has one unambiguous latest row (see wallet-ledger.ts).
+              createdAt: nextCreatedAt,
               note: `Delivery fee refunded on ${order!.reference}; collected in person`,
+            },
+          });
+        }
+
+        // FR-PAY-06: the capture. The money left the wallet when the hold was
+        // written at placement, so this is a zero-amount marker that closes
+        // the hold rather than a second debit — the same entry the rider's
+        // completion path writes for a delivered order. Without it the ledger
+        // shows a hold that was never either captured or released.
+        if (paidFromWallet) {
+          const head = await readWalletHead(tx, order!.studentId);
+          await tx.walletEntry.create({
+            data: {
+              userId: order!.studentId,
+              direction: 'DEBIT',
+              amountMinor: 0,
+              type: 'ORDER_CAPTURE',
+              orderId,
+              balanceAfterMinor: head.balanceMinor,
+              createdAt: head.nextCreatedAt,
+              note: `Captured for order ${order!.reference}; collected in person`,
             },
           });
         }
@@ -864,26 +973,45 @@ export class OrdersService {
     }
 
     // CANCEL — FR-DLV-07 full refund.
+    const refundsToWallet = order!.paymentMethod === PaymentMethod.WALLET;
+
     await this.prisma.$transaction(async (tx) => {
+      if (refundsToWallet) await this.lockWallet(tx, order!.studentId);
+
       assertTaskTransition(TaskStatus.UNFULFILLED, TaskEvent.REQUESTER_CANCELLED);
 
-      await tx.task.update({
-        where: { id: taskId },
+      // ADR-001 applied to refunds: the status read at the top of this method
+      // is stale by now, so it is the WHERE clause that decides. Two parallel
+      // cancels both read UNFULFILLED; only one of these updates matches a
+      // row, and the other stops here having refunded nothing.
+      const taskMoved = await tx.task.updateMany({
+        where: { id: taskId, status: 'UNFULFILLED' },
         data: { status: 'CANCELLED', cancelledAt: new Date() },
       });
+      if (taskMoved.count === 0) throw this.alreadyDecided();
 
-      await tx.order.update({
-        where: { id: orderId },
+      // An order whose task ran out of riders is still with the shop. Any
+      // other status means something else finished or cancelled it first.
+      const orderMoved = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          status: {
+            in: [DbOrderStatus.SHOP_ACCEPTED, DbOrderStatus.PREPARING, DbOrderStatus.READY],
+          },
+        },
         data: {
           status: 'CANCELLED',
           cancelledAt: new Date(),
           cancelledBy: 'STUDENT',
           cancelledReason: 'No rider was available; cancelled by the student with a full refund.',
+          // The hold is released in full just below; see transitionOrderAndTask.
+          ...(refundsToWallet ? { paymentStatus: 'REFUNDED' as const } : {}),
         },
       });
+      if (orderMoved.count === 0) throw this.orderStateChanged();
 
-      if (order!.paymentMethod === PaymentMethod.WALLET) {
-        const balance = await this.walletBalanceTx(tx, order!.studentId);
+      if (refundsToWallet) {
+        const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, order!.studentId);
         await tx.walletEntry.create({
           data: {
             userId: order!.studentId,
@@ -892,6 +1020,9 @@ export class OrdersService {
             type: 'ORDER_RELEASE',
             orderId,
             balanceAfterMinor: balance + order!.totalMinor,
+            // Strictly after the entry this balance was read from, so the
+            // ledger has one unambiguous latest row (see wallet-ledger.ts).
+            createdAt: nextCreatedAt,
             note: `Full refund on ${order!.reference}; no rider available`,
           },
         });
@@ -923,6 +1054,10 @@ export class OrdersService {
 
     const orders = await this.prisma.order.findMany({
       where: {
+        // assertShopAccess has already checked the listing's college; the
+        // scope is repeated on the query itself so that this read obeys the
+        // tenancy rule on its own, not by virtue of a check made elsewhere.
+        ...this.tenant.scope(user),
         shopListingId: listingId,
         status: { in: ['PLACED', 'SHOP_ACCEPTED', 'PREPARING', 'READY', 'PICKED_UP'] },
       },
@@ -1049,8 +1184,12 @@ export class OrdersService {
       assertOrderTransition(order!.status as OrderStatus, OrderEvent.SHOP_ACCEPTED);
       assertOrderTransition(OrderStatus.SHOP_ACCEPTED, OrderEvent.PREPARATION_STARTED);
 
-      await tx.order.update({
-        where: { id: orderId },
+      // Conditional on PLACED. The check further up read the status before
+      // this transaction began; a student cancel or the accept-window sweep
+      // can land in between, and an unconditional write here would bring a
+      // cancelled — and already refunded — order back to life.
+      const accepted = await tx.order.updateMany({
+        where: { id: orderId, status: DbOrderStatus.PLACED },
         data: {
           status: DbOrderStatus.PREPARING,
           shopAcceptedAt: now,
@@ -1058,12 +1197,18 @@ export class OrdersService {
           expectedReadyAt,
         },
       });
+      if (accepted.count === 0) throw this.orderStateChanged();
 
       if (order!.task) {
-        await tx.task.update({
-          where: { id: order!.task.id },
+        // Same guard on the task: only one that is still waiting may be
+        // scheduled for dispatch. A cancelled task given a dispatchDueAt
+        // would be ignored by the dispatcher today, but should not depend on
+        // that.
+        const scheduled = await tx.task.updateMany({
+          where: { id: order!.task.id, status: 'CREATED' },
           data: { dispatchDueAt },
         });
+        if (scheduled.count === 0) throw this.orderStateChanged();
       }
     });
 
@@ -1151,15 +1296,23 @@ export class OrdersService {
     this.tenant.assertSameTenant(user, order, 'Order');
     await this.assertShopAccess(user, order!.shopListingId);
 
-    const nextStatus = assertOrderTransition(
+    // An order that is no longer PREPARING — cancelled a moment ago, or
+    // already marked ready from a second tablet — is a lost race, not a
+    // server fault: resolveOrderTransition answers it with 409 rather than
+    // letting the state machine's bare Error surface as a 500.
+    const nextStatus = resolveOrderTransition(
       order!.status as OrderStatus,
       OrderEvent.MARKED_READY,
     );
 
-    await this.prisma.order.update({
-      where: { id: orderId },
+    // Conditional on the status the transition was computed from, so an
+    // administrator's cancel landing between the read and this write is not
+    // overwritten with READY.
+    const marked = await this.prisma.order.updateMany({
+      where: { id: orderId, status: order!.status },
       data: { status: nextStatus as DbOrderStatus, readyAt: new Date() },
     });
+    if (marked.count === 0) throw this.orderStateChanged();
 
     return {
       orderId,
@@ -1183,13 +1336,20 @@ export class OrdersService {
    * that in three separate writes would leave a cancelled order with a live
    * task if the second one failed, and the task would then be broadcast for
    * an order that no longer exists.
+   *
+   * Each status write is a conditional UPDATE (ADR-001). The status is read
+   * only to ask the state machine where the event leads; whether this caller
+   * is the one that gets to make the move is decided by the WHERE clause.
+   * Two cancels arriving together both read PLACED, one update matches a row
+   * and the other matches none — and the loser throws before the ledger is
+   * touched, which is what keeps a hold from being released twice.
    */
   private async transitionOrderAndTask(params: {
     orderId: string;
     taskId: string | null;
     orderEvent: OrderEvent;
     taskEvent: TaskEvent;
-    orderData: Prisma.OrderUpdateInput;
+    orderData: Prisma.OrderUpdateManyMutationInput;
     releaseWalletHold: boolean;
     walletAmountMinor: number;
     userId: string;
@@ -1208,18 +1368,38 @@ export class OrdersService {
     } = params;
 
     await this.prisma.$transaction(async (tx) => {
+      // Wallet lock first, before any row is written, so that every
+      // wallet-writing transaction takes its locks in the same order.
+      if (releaseWalletHold) await this.lockWallet(tx, userId);
+
       const order = await tx.order.findUnique({
         where: { id: orderId },
         select: { status: true },
       });
       if (!order) throw new NotFoundException('Order not found');
 
-      const nextOrderStatus = assertOrderTransition(order.status as OrderStatus, orderEvent);
+      // Requests that lose a race queue on the wallet lock above, so by the
+      // time they read the order here it is already CANCELLED and the state
+      // machine has no move for it. That is the same lost race the
+      // conditional UPDATE below reports, so it gets the same 409 — thrown
+      // from the state machine's own Error it would reach the caller as a
+      // 500. This only words the refusal; the UPDATE still decides.
+      const nextOrderStatus = resolveOrderTransition(order.status as OrderStatus, orderEvent);
 
-      await tx.order.update({
-        where: { id: orderId },
-        data: { ...orderData, status: nextOrderStatus as DbOrderStatus },
+      const orderMoved = await tx.order.updateMany({
+        where: { id: orderId, status: order.status },
+        data: {
+          ...orderData,
+          status: nextOrderStatus as DbOrderStatus,
+          // A released hold is money returned, and the order has to say so:
+          // left at HELD, a cancelled order would claim to be sitting on
+          // funds the ledger shows were given back. Written in the same
+          // UPDATE as the status, so the two cannot disagree. Cash orders
+          // never held anything and keep NOT_REQUIRED.
+          ...(releaseWalletHold ? { paymentStatus: 'REFUNDED' as const } : {}),
+        },
       });
+      if (orderMoved.count === 0) throw this.orderStateChanged();
 
       if (taskId) {
         const task = await tx.task.findUnique({
@@ -1231,11 +1411,17 @@ export class OrdersService {
         // read and here) must not be forced backwards. The state machine
         // refuses, and refusing is correct: the cancellation is too late.
         if (task) {
-          const nextTaskStatus = assertTaskTransition(task.status as TaskStatus, taskEvent);
-          await tx.task.update({
-            where: { id: taskId },
+          const nextTaskStatus = resolveTaskTransition(task.status as TaskStatus, taskEvent);
+
+          // Conditional on the status just read: a rider accepting in the
+          // gap (ADR-001's own UPDATE) changes it, this matches nothing, and
+          // the whole cancellation rolls back rather than cancelling a task
+          // someone is now carrying.
+          const taskMoved = await tx.task.updateMany({
+            where: { id: taskId, status: task.status },
             data: { status: nextTaskStatus as never, cancelledAt: new Date() },
           });
+          if (taskMoved.count === 0) throw this.orderStateChanged();
         }
       }
 
@@ -1243,7 +1429,7 @@ export class OrdersService {
       // ledger is append-only (ADR-007), so a release is a new credit rather
       // than an edit to the original debit.
       if (releaseWalletHold) {
-        const balance = await this.walletBalanceTx(tx, userId);
+        const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, userId);
         await tx.walletEntry.create({
           data: {
             userId,
@@ -1252,6 +1438,9 @@ export class OrdersService {
             type: 'ORDER_RELEASE',
             orderId,
             balanceAfterMinor: balance + walletAmountMinor,
+            // Strictly after the entry this balance was read from, so the
+            // ledger has one unambiguous latest row (see wallet-ledger.ts).
+            createdAt: nextCreatedAt,
             note: `Hold released for cancelled order ${reference}`,
           },
         });
@@ -1259,10 +1448,30 @@ export class OrdersService {
     });
   }
 
+  /**
+   * May this user act on this shop listing's orders?
+   *
+   * Tenancy is checked first and for everyone. An administrator's authority
+   * stops at their own college (FR-TEN-03), so the listing's college is
+   * loaded and compared before the role is even looked at; only a super
+   * administrator, who works across tenants by definition, passes
+   * assertSameTenant unconditionally. Returning early for ADMIN before this
+   * check is what once let an admin of one college read another's queue.
+   */
   private async assertShopAccess(user: AuthenticatedUser, listingId: string): Promise<void> {
+    const listing = await this.prisma.shopListing.findUnique({
+      where: { id: listingId },
+      select: {
+        collegeId: true,
+        shop: { select: { staff: { select: { userId: true } } } },
+      },
+    });
+
+    this.tenant.assertSameTenant(user, listing, 'Shop');
+
     if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') return;
 
-    const isStaff = await this.isStaffOfListing(user.userId, listingId);
+    const isStaff = listing!.shop.staff.some((s) => s.userId === user.userId);
     if (!isStaff) {
       throw new ForbiddenException({
         code: 'NOT_SHOP_STAFF',
@@ -1272,8 +1481,75 @@ export class OrdersService {
   }
 
   // =======================================================================
+  // Conflict responses
+  // =======================================================================
+
+  /**
+   * A conditional UPDATE matched no row: the order moved on between this
+   * request reading it and trying to change it. 409 rather than 400 because
+   * the request was well-formed — it simply lost a race — and the right move
+   * for the client is to reload and look again.
+   */
+  private orderStateChanged(): ConflictException {
+    // One definition, shared with the state-machine translation, so a lost
+    // race reads the same whichever of the two noticed it.
+    return orderStateChanged();
+  }
+
+  /** The unfulfilled-order choice was already made by a parallel request. */
+  private alreadyDecided(): ConflictException {
+    return new ConflictException({
+      code: 'NOT_UNFULFILLED',
+      message: 'This order is not waiting on a decision.',
+    });
+  }
+
+  private notReadyToCollect(): ConflictException {
+    return new ConflictException({
+      code: 'ORDER_NOT_READY',
+      message:
+        'The shop has not finished preparing this order yet. You can collect it once it is marked ready.',
+    });
+  }
+
+  private insufficientWalletBalance(balanceMinor: number, totalMinor: number): BadRequestException {
+    return new BadRequestException({
+      code: 'INSUFFICIENT_WALLET_BALANCE',
+      message: `Your wallet has ${formatMinor(balanceMinor)}, and this order is ${formatMinor(
+        totalMinor,
+      )}. Choose cash on delivery instead.`,
+    });
+  }
+
+  // =======================================================================
   // Wallet balance helpers
   // =======================================================================
+
+  /**
+   * Serialise every writer to one user's wallet for the rest of the
+   * transaction.
+   *
+   * The ledger has no balance row to lock: the balance is whatever the latest
+   * entry says, and each new entry is computed from it. Two transactions that
+   * both read the same "latest" entry both write a balance derived from it,
+   * and one of the two movements silently vanishes from the running total —
+   * or, at placement, the same money is held twice.
+   *
+   * An advisory lock is a lock on a number rather than on a row, which is
+   * what is needed when the thing being protected is "the next row" and does
+   * not exist yet. The `_xact_` variant is released automatically at commit
+   * or rollback, so it cannot leak. The key must be byte-for-byte the same
+   * expression everywhere the wallet is written (rider.service.ts uses it
+   * too); a different prefix would be a different lock and protect nothing.
+   *
+   * Call it first, before the transaction writes anything, and read the
+   * balance only afterwards. $executeRaw rather than $queryRaw because the
+   * function returns `void`, which Prisma cannot deserialise as a result
+   * column.
+   */
+  private async lockWallet(tx: Prisma.TransactionClient, userId: string): Promise<void> {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${userId}))`;
+  }
 
   /**
    * The current balance, read from the last ledger entry rather than summed.
@@ -1285,19 +1561,9 @@ export class OrdersService {
   async walletBalance(userId: string): Promise<number> {
     const last = await this.prisma.walletEntry.findFirst({
       where: { userId },
-      orderBy: { createdAt: 'desc' },
-      select: { balanceAfterMinor: true },
-    });
-    return last?.balanceAfterMinor ?? 0;
-  }
-
-  private async walletBalanceTx(
-    tx: Prisma.TransactionClient,
-    userId: string,
-  ): Promise<number> {
-    const last = await tx.walletEntry.findFirst({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
+      // createdAt alone can tie at millisecond precision; the shared order
+      // adds a tie-break so the same row is "latest" on every read.
+      orderBy: [...WALLET_HEAD_ORDER],
       select: { balanceAfterMinor: true },
     });
     return last?.balanceAfterMinor ?? 0;
