@@ -95,6 +95,33 @@ const OFFERED_SET_SENTINEL = '-';
  */
 const PING_FRESHNESS_INTERVALS = 3;
 
+/**
+ * M8: how long the record of who was offered a task is kept.
+ *
+ * It has to outlive the task's whole time on offer — every round, plus
+ * however long the expiry sweep takes to get to it — because while the task
+ * is BROADCASTING a missing record now means "offered to nobody", not
+ * "unknown". The first version expired it at acceptance window + 120 s, which
+ * is shorter than a three-round search; from then on the record was gone, the
+ * check failed open, and any rider who knew the task id could accept it.
+ *
+ * A day is far beyond any search (rounds x window is minutes) and is renewed
+ * by each round, so in practice the key lapses a day after the task was last
+ * offered — a ceiling against leaking keys, not a deadline anything waits on.
+ */
+const OFFERED_SET_TTL_SECONDS = 24 * 60 * 60;
+
+/** What the offer list says about one rider and one task. */
+type OfferCheck =
+  /** The rider is on the list. */
+  | 'offered'
+  /** There is a list and the rider is not on it. */
+  | 'not-offered'
+  /** There is no list for this task at all. */
+  | 'no-list'
+  /** Redis could not be asked. */
+  | 'unavailable';
+
 export interface EligibleRider {
   userId: string;
   distanceM: number;
@@ -562,12 +589,7 @@ export class DispatchService {
 
     // M8: record who is being offered this task *before* the offer leaves, so
     // the fastest possible accept still finds its own name on the list.
-    const newlyOffered = await this.recordOfferedRiders(
-      taskId,
-      eligibleIds,
-      newRound,
-      acceptanceWindowSeconds,
-    );
+    const newlyOffered = await this.recordOfferedRiders(taskId, eligibleIds, newRound);
 
     // ADR-006: on a cash order the rider pays the shop out of their own
     // pocket at pickup and collects the full total at the door. That is
@@ -629,18 +651,22 @@ export class DispatchService {
    * rider shown round 1 who taps a moment after round 2 goes out was offered
    * the task, and refusing them would be pedantry.
    *
-   * The TTL outlives the acceptance window with room to spare for the expiry
-   * sweep; once the window has closed the accept UPDATE refuses on its own.
+   * The key outlives the whole search (OFFERED_SET_TTL_SECONDS) and every
+   * round renews it, because `accept` treats a task that is on offer with no
+   * list as offered to nobody. A round that found no riders still writes the
+   * sentinel, so "nobody" is a record rather than an absence.
    *
-   * Redis failing here must not stop dispatch (ADR-002). The accept path
-   * fails open when the set is missing, so the cost of an outage is the M8
-   * check being skipped for a while — not riders unable to work.
+   * Redis failing here must not stop dispatch (ADR-002) — but it does have a
+   * cost now, and it is the safe one: if this write fails and Redis then
+   * comes back, the task is on offer with no list, and accepts for it are
+   * refused until the next round re-records it (at most one acceptance
+   * window). While Redis is actually down, `accept` cannot ask at all and
+   * fails open.
    */
   private async recordOfferedRiders(
     taskId: string,
     riderIds: string[],
     round: number,
-    acceptanceWindowSeconds: number,
   ): Promise<string[]> {
     const key = redisKeys.offeredRiders(taskId);
 
@@ -651,47 +677,56 @@ export class DispatchService {
       const pipeline = this.redis.client.multi();
       if (round <= 1) pipeline.del(key);
       pipeline.sadd(key, OFFERED_SET_SENTINEL, ...riderIds);
-      pipeline.expire(key, acceptanceWindowSeconds + 120);
+      pipeline.expire(key, OFFERED_SET_TTL_SECONDS);
       await pipeline.exec();
 
       return riderIds.filter((id) => !already.has(id));
     } catch (error) {
       this.logger.warn(
-        `Could not record offered riders for task ${taskId}; accepts will not be ` +
-          `checked against the offer list: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not record offered riders for task ${taskId}; once Redis answers again, ` +
+          `accepts are refused until the next round re-records them: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
       );
       return riderIds;
     }
   }
 
   /**
-   * M8: was this rider offered this task?
+   * M8: what does the offer list say about this rider and this task?
    *
-   * `null` means "cannot say" — Redis is down, or the set is gone (flushed,
-   * or a task put on offer by something other than `broadcast`). The caller
-   * fails open on null, the same policy as the dispatch lock: Redis is never
-   * the reason a delivery cannot happen.
+   * Three answers that the caller must not blur together:
+   *
+   *  - the list exists, and the rider is or is not on it;
+   *  - there is no list (`no-list`) — which for a task that is on offer means
+   *    nobody was offered it, and is for `accept` to judge;
+   *  - Redis could not be asked (`unavailable`) — the only case that fails
+   *    open, the same policy as the dispatch lock: Redis being down is never
+   *    the reason a delivery cannot happen.
+   *
+   * "No list" and "could not ask" used to be one answer, and both failed
+   * open. That made an expired or flushed key indistinguishable from an
+   * outage, and the offer check silently optional.
    */
-  private async wasOffered(taskId: string, userId: string): Promise<boolean | null> {
+  private async checkOffer(taskId: string, userId: string): Promise<OfferCheck> {
     const key = redisKeys.offeredRiders(taskId);
 
     try {
       const results = await this.redis.client.multi().exists(key).sismember(key, userId).exec();
-      const exists = results?.[0]?.[1] === 1;
-      if (!exists) {
-        this.logger.warn(
-          `No offer list for task ${taskId}; accepting without the offered-rider check`,
-        );
-        return null;
-      }
-      return results?.[1]?.[1] === 1;
+
+      // A pipeline reports a failed command per entry rather than rejecting.
+      const failed = results?.find(([error]) => error !== null);
+      if (!results || failed) throw failed?.[0] ?? new Error('Redis returned no result');
+
+      if (results[0]?.[1] !== 1) return 'no-list';
+      return results[1]?.[1] === 1 ? 'offered' : 'not-offered';
     } catch (error) {
       this.logger.warn(
         `Could not read the offer list for task ${taskId}; proceeding unchecked: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
-      return null;
+      return 'unavailable';
     }
   }
 
@@ -973,15 +1008,28 @@ export class DispatchService {
     // dispatcher had deliberately not offered them.
     //
     // This is a permission check, not the race guard: it does not decide who
-    // wins, only who may enter. `null` means the list could not be consulted,
-    // and that fails open — see wasOffered.
+    // wins, only who may enter.
     //
     // It comes *before* the status pre-check below, so the answer is the true
     // one. The other way round, a rider who was never offered a task and
     // tried one somebody already held was told ALREADY_TAKEN — "you were too
     // slow" — about a race they were never in, and whether they heard that or
     // NOT_OFFERED_TO_YOU depended on how quickly the real winner had tapped.
-    if ((await this.wasOffered(taskId, userId)) === false) {
+    const offer = await this.checkOffer(taskId, userId);
+
+    // A task that is on offer always has a list: `broadcast` writes one for
+    // every round, sentinel and all, with a TTL far longer than any search.
+    // So on offer and no list means nobody was offered it — the key was
+    // flushed, or the row was put into BROADCASTING by something other than
+    // the dispatcher — and that is refused, not waved through.
+    //
+    // For a task that is *not* on offer a missing list protects nothing (the
+    // UPDATE below refuses it whoever asks), so it falls through to the
+    // status pre-check and its more useful answer. `unavailable` — Redis
+    // could not be asked at all — is the one case that fails open.
+    const isOnOffer = task.status === 'BROADCASTING' && task.broadcastRound >= 1;
+
+    if (offer === 'not-offered' || (offer === 'no-list' && isOnOffer)) {
       throw new ConflictException({
         code: 'NOT_OFFERED_TO_YOU',
         message: 'That delivery was not offered to you. Offers you can take appear on your Work tab.',

@@ -1,23 +1,33 @@
-import { wsEvents } from '@hoppo/shared';
+import { redisKeys, wsEvents } from '@hoppo/shared';
 import { DispatchGateway } from '../dispatch.gateway';
 import { DispatchService } from '../dispatch.service';
 
 /**
  * Fakes for the dispatch and rider specs.
  *
- * These specs exist to pin behaviour that a code review accepted but nothing
- * executed. Two rules follow from that, and the fakes are built around them:
+ * Two rules shape them:
  *
- *  1. **The real classes run.** DispatchService and DispatchGateway are the
- *     production ones; only the three edges are replaced — the database, Redis
- *     and the Socket.IO server. An assertion about "who was told" is therefore
- *     an assertion about what the real gateway handed the real socket layer.
+ *  1. **The real classes run.** DispatchService, DispatchGateway and
+ *     RiderService are the production ones; only the three edges are replaced
+ *     — the database, Redis and the Socket.IO server.
  *
- *  2. **The fakes do not know which implementation they are serving.** The
- *     Prisma fake answers any model and any method, so the same spec runs
- *     against the code before a fix and after it — which is the only way to
- *     show a spec fails on the old behaviour rather than on a missing mock.
+ *  2. **The database fake holds rows and honours `where`.** An earlier version
+ *     answered `{ count: 1 }` to every `updateMany` whatever it was asked,
+ *     which meant a spec could only notice a missing predicate by comparing
+ *     the call's arguments to a copy of themselves. Mutation testing showed
+ *     what that is worth: of twelve predicates deleted one at a time, eight
+ *     left every test green. Here a write changes the rows its `where`
+ *     matches and reports how many — so a conditional UPDATE that has lost a
+ *     condition matches a row it should not have, and the spec fails on what
+ *     happened next, the way production would.
+ *
+ * Nothing in here is specific to one spec. What a spec wants to be true, it
+ * seeds as rows.
  */
+
+export { wsEvents };
+
+type Row = Record<string, any>;
 
 // ---------------------------------------------------------------------------
 // Socket.IO server
@@ -33,11 +43,8 @@ export interface Emission {
 }
 
 /**
- * Records every emit with the rooms it was addressed to.
- *
- * Mirrors the part of Socket.IO's BroadcastOperator the gateway uses:
- * `to`/`in` take a room or a list and accumulate, `except` excludes, `emit`
- * sends, `disconnectSockets` closes.
+ * Records every emit with the rooms it was addressed to. Mirrors the part of
+ * Socket.IO's BroadcastOperator the gateway uses.
  */
 export class FakeServer {
   readonly emissions: Emission[] = [];
@@ -82,57 +89,429 @@ export class FakeServer {
   }
 }
 
-export { wsEvents };
+// ---------------------------------------------------------------------------
+// Matching a Prisma `where` against a row
+// ---------------------------------------------------------------------------
+
+const OPERATORS = new Set(['equals', 'in', 'notIn', 'lt', 'lte', 'gt', 'gte', 'not']);
+
+const isPlainObject = (v: unknown): v is Row =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
+
+/** Dates compare by instant, everything else by identity. */
+const comparable = (v: unknown): unknown => (v instanceof Date ? v.getTime() : v);
+
+const same = (a: unknown, b: unknown): boolean => comparable(a ?? null) === comparable(b ?? null);
+
+function matchesOperators(actual: unknown, ops: Row): boolean {
+  return Object.entries(ops).every(([op, expected]) => {
+    switch (op) {
+      case 'equals':
+        return same(actual, expected);
+      case 'in':
+        return (expected as unknown[]).some((e) => same(actual, e));
+      case 'notIn':
+        return !(expected as unknown[]).some((e) => same(actual, e));
+      case 'not':
+        return isPlainObject(expected) ? !matchesOperators(actual, expected) : !same(actual, expected);
+      // SQL semantics: a comparison with NULL is never true.
+      case 'lt':
+        return actual != null && (comparable(actual) as number) < (comparable(expected) as number);
+      case 'lte':
+        return actual != null && (comparable(actual) as number) <= (comparable(expected) as number);
+      case 'gt':
+        return actual != null && (comparable(actual) as number) > (comparable(expected) as number);
+      case 'gte':
+        return actual != null && (comparable(actual) as number) >= (comparable(expected) as number);
+      default:
+        throw new Error(`fake database: unsupported where operator "${op}"`);
+    }
+  });
+}
+
+/**
+ * Does `row` satisfy a Prisma `where`?
+ *
+ * Supports what the services under test send: equality (including `null`),
+ * the comparison operators above, AND / OR / NOT, a relation filter matched
+ * against a nested object on the row, and compound unique keys
+ * (`taskId_round: { taskId, round }`). Anything else throws — a condition the
+ * fake does not understand must never be mistaken for one that matched.
+ */
+export function matchesWhere(row: Row, where: Row | undefined): boolean {
+  if (!where) return true;
+
+  return Object.entries(where).every(([key, expected]) => {
+    if (expected === undefined) return true;
+    if (key === 'AND') return [expected].flat().every((w) => matchesWhere(row, w));
+    if (key === 'OR') return (expected as Row[]).some((w) => matchesWhere(row, w));
+    if (key === 'NOT') return ![expected].flat().some((w) => matchesWhere(row, w));
+
+    if (!isPlainObject(expected)) return same(row[key], expected);
+
+    if (Object.keys(expected).every((k) => OPERATORS.has(k))) {
+      return matchesOperators(row[key], expected);
+    }
+    // A relation filter: `riderState: { workModeOn: true }`.
+    if (isPlainObject(row[key])) return matchesWhere(row[key], expected);
+    // A compound unique key: `taskId_round: { taskId, round }`.
+    if (key.includes('_') && !(key in row)) return matchesWhere(row, expected);
+    // A filter on a relation the row does not have matches nothing.
+    return false;
+  });
+}
+
+function applyData(row: Row, data: Row): void {
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined) continue;
+    if (isPlainObject(value) && 'increment' in value) row[key] = (row[key] ?? 0) + value.increment;
+    else if (isPlainObject(value) && 'decrement' in value) row[key] = (row[key] ?? 0) - value.decrement;
+    else if (isPlainObject(value) && 'set' in value) row[key] = value.set;
+    else row[key] = value;
+  }
+}
+
+function sortRows(rows: Row[], orderBy: Row | Row[] | undefined): Row[] {
+  const keys = [orderBy ?? []].flat().flatMap((o) => Object.entries(o as Row));
+  return [...rows].sort((a, b) => {
+    for (const [field, direction] of keys) {
+      const [x, y] = [comparable(a[field]) as number, comparable(b[field]) as number];
+      if (x !== y) return (x < y ? -1 : 1) * (direction === 'desc' ? -1 : 1);
+    }
+    return 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The tiny SQL the services send raw
+// ---------------------------------------------------------------------------
+
+const camel = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+
+type Token = { kind: 'word' | 'string' | 'param' | 'number' | 'symbol'; text: string };
+
+function tokenize(sql: string): Token[] {
+  const tokens: Token[] = [];
+  const pattern =
+    /\s+|'((?:[^']|'')*)'|\$(\d+)|(\d+)|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_.]*)|(::[a-z]+)|(<=|>=|<>|\|\||[=<>(),+*-])/gy;
+  let match: RegExpExecArray | null;
+  let at = 0;
+  while (at < sql.length) {
+    pattern.lastIndex = at;
+    match = pattern.exec(sql);
+    if (!match) throw new Error(`fake database: cannot read SQL at "${sql.slice(at, at + 30)}"`);
+    at = pattern.lastIndex;
+    if (match[1] !== undefined) tokens.push({ kind: 'string', text: match[1] });
+    else if (match[2] !== undefined) tokens.push({ kind: 'param', text: match[2] });
+    else if (match[3] !== undefined) tokens.push({ kind: 'number', text: match[3] });
+    else if (match[4] !== undefined) tokens.push({ kind: 'word', text: match[4] });
+    else if (match[5] !== undefined) tokens.push({ kind: 'word', text: match[5] });
+    else if (match[7] !== undefined) tokens.push({ kind: 'symbol', text: match[7] });
+    // Whitespace and `::text` casts carry no meaning here.
+  }
+  return tokens;
+}
+
+type Expr = (row: Row) => unknown;
+
+/**
+ * A recursive-descent reader for the handful of statements the services send
+ * with `$executeRaw` / `$queryRaw`:
+ *
+ *   UPDATE "t" SET col = expr, ... WHERE expr [RETURNING expr AS "alias", ...]
+ *   SELECT expr AS "alias", ... FROM "t" WHERE expr
+ *
+ * with AND / OR / parentheses, comparisons, IS [NOT] NULL, `now()`, `+`,
+ * string and number literals, and `$n` parameters.
+ *
+ * It exists so the WHERE clause of a raw conditional UPDATE is *evaluated*
+ * against the rows, like every other write here. Anything it cannot read
+ * throws, loudly — an unparsed condition must never count as satisfied.
+ */
+class SqlReader {
+  private at = 0;
+
+  constructor(
+    private readonly tokens: Token[],
+    private readonly params: unknown[],
+  ) {}
+
+  peek(offset = 0): Token | undefined {
+    return this.tokens[this.at + offset];
+  }
+
+  isWord(word: string, offset = 0): boolean {
+    const t = this.peek(offset);
+    return t?.kind === 'word' && t.text.toUpperCase() === word;
+  }
+
+  isSymbol(symbol: string): boolean {
+    const t = this.peek();
+    return t?.kind === 'symbol' && t.text === symbol;
+  }
+
+  takeWord(word?: string): string {
+    const t = this.tokens[this.at++];
+    if (t?.kind !== 'word' || (word && t.text.toUpperCase() !== word)) {
+      throw new Error(`fake database: expected ${word ?? 'a name'} in SQL, found "${t?.text}"`);
+    }
+    return t.text;
+  }
+
+  takeSymbol(symbol: string): void {
+    const t = this.tokens[this.at++];
+    if (t?.kind !== 'symbol' || t.text !== symbol) {
+      throw new Error(`fake database: expected "${symbol}" in SQL, found "${t?.text}"`);
+    }
+  }
+
+  done(): boolean {
+    return this.at >= this.tokens.length;
+  }
+
+  expression(): Expr {
+    let left = this.conjunction();
+    while (this.isWord('OR')) {
+      this.takeWord();
+      const [a, b] = [left, this.conjunction()];
+      left = (row) => Boolean(a(row)) || Boolean(b(row));
+    }
+    return left;
+  }
+
+  private conjunction(): Expr {
+    let left = this.comparison();
+    while (this.isWord('AND')) {
+      this.takeWord();
+      const [a, b] = [left, this.comparison()];
+      left = (row) => Boolean(a(row)) && Boolean(b(row));
+    }
+    return left;
+  }
+
+  private comparison(): Expr {
+    const left = this.sum();
+
+    if (this.isWord('IS')) {
+      this.takeWord();
+      const negated = this.isWord('NOT');
+      if (negated) this.takeWord();
+      this.takeWord('NULL');
+      return (row) => (left(row) == null) !== negated;
+    }
+
+    if (this.isWord('IN')) {
+      this.takeWord();
+      this.takeSymbol('(');
+      const options = [this.sum()];
+      while (this.isSymbol(',')) {
+        this.takeSymbol(',');
+        options.push(this.sum());
+      }
+      this.takeSymbol(')');
+      return (row) => options.some((o) => same(left(row), o(row)));
+    }
+
+    const operator = this.peek();
+    if (operator?.kind === 'symbol' && ['=', '<', '>', '<=', '>=', '<>'].includes(operator.text)) {
+      this.at++;
+      const right = this.sum();
+      return (row) => {
+        const [x, y] = [comparable(left(row)), comparable(right(row))];
+        // SQL: any comparison with NULL is not true.
+        if (x == null || y == null) return false;
+        switch (operator.text) {
+          case '=':
+            return x === y;
+          case '<>':
+            return x !== y;
+          case '<':
+            return (x as number) < (y as number);
+          case '>':
+            return (x as number) > (y as number);
+          case '<=':
+            return (x as number) <= (y as number);
+          default:
+            return (x as number) >= (y as number);
+        }
+      };
+    }
+
+    return left;
+  }
+
+  private sum(): Expr {
+    let left = this.primary();
+    while (this.isSymbol('+')) {
+      this.takeSymbol('+');
+      const [a, b] = [left, this.primary()];
+      left = (row) => (a(row) as number) + (b(row) as number);
+    }
+    return left;
+  }
+
+  private primary(): Expr {
+    const t = this.tokens[this.at++];
+    if (!t) throw new Error('fake database: SQL ended early');
+
+    if (t.kind === 'symbol' && t.text === '(') {
+      const inner = this.expression();
+      this.takeSymbol(')');
+      return inner;
+    }
+    if (t.kind === 'param') {
+      const value = this.params[Number(t.text) - 1];
+      return () => value;
+    }
+    if (t.kind === 'string') return () => t.text;
+    if (t.kind === 'number') return () => Number(t.text);
+    if (t.kind === 'word') {
+      if (t.text.toUpperCase() === 'NULL') return () => null;
+      if (t.text.toLowerCase() === 'now') {
+        this.takeSymbol('(');
+        this.takeSymbol(')');
+        return () => new Date();
+      }
+      return (row) => row[camel(t.text)];
+    }
+    throw new Error(`fake database: unexpected "${t.text}" in SQL`);
+  }
+
+  /** `expr [AS "alias"], ...` up to a keyword or the end. */
+  projection(): { alias: string; value: Expr }[] {
+    const columns: { alias: string; value: Expr }[] = [];
+    do {
+      if (columns.length > 0) this.takeSymbol(',');
+      const first = this.peek();
+      const value = this.expression();
+      let alias = first?.kind === 'word' ? camel(first.text) : `column${columns.length}`;
+      if (this.isWord('AS')) {
+        this.takeWord();
+        alias = this.takeWord();
+      }
+      columns.push({ alias, value });
+    } while (this.isSymbol(','));
+    return columns;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Prisma
 // ---------------------------------------------------------------------------
 
 /**
- * What an unconfigured call returns, by method name. Chosen so that a
- * conditional write "matches one row" unless a spec says otherwise — the
- * interesting case in every spec is the one it configures explicitly.
- */
-function defaultResult(method: string): unknown {
-  switch (method) {
-    case 'findMany':
-      return [];
-    case 'findUnique':
-    case 'findFirst':
-      return null;
-    case 'count':
-      return 0;
-    case 'updateMany':
-    case 'deleteMany':
-    case 'createMany':
-      return { count: 1 };
-    default:
-      // create / update / upsert / findUniqueOrThrow: a row with an id.
-      return { id: 'fake-row' };
-  }
-}
-
-/**
- * A Prisma stand-in: `prisma.<anyModel>.<anyMethod>` is a jest mock, created
- * on first touch and stable afterwards, so a spec can configure a call before
- * the code makes it and inspect it after.
+ * An in-memory database with Prisma's shape.
  *
- * `$transaction(fn)` runs `fn` with the same object. That is deliberate: a
- * write made inside a transaction and one made outside it land on the same
- * mock, so "was this row ever deleted?" has one place to look.
+ * `prisma.<model>.<method>` is a jest mock wrapped round a real
+ * implementation over that model's rows, so a spec can both rely on the
+ * behaviour and inspect (or, sparingly, override) a call.
+ *
+ * - `prisma.$seed(model, rows)` puts rows in. They are stored *by reference*,
+ *   so a task row whose `order` is the same object as a row in the `order`
+ *   table stays in step with it, the way a join would.
+ * - Reads return shallow copies: a service holding a row it read earlier does
+ *   not see later writes to it — which is exactly the stale read that the
+ *   conditional UPDATEs exist to survive. `prisma.$staleRead(model, row)`
+ *   makes the *next* `findUnique` on a model return a row the table no longer
+ *   agrees with, which is what "somebody else committed in between" is.
+ * - `$transaction` rolls every table back if its callback throws, and
+ *   transactions run one at a time.
+ * - `$executeRaw` / `$queryRaw` evaluate the SQL's WHERE against the rows
+ *   (see SqlReader). The advisory wallet lock is recorded in `$locks`.
  */
 export function fakePrisma(): any {
+  const tables = new Map<string, Row[]>();
   const models = new Map<string, Record<string, jest.Mock>>();
+  const staleReads = new Map<string, Row[]>();
+  const locks: string[] = [];
+  let nextId = 1;
+
+  const table = (name: string): Row[] => {
+    if (!tables.has(name)) tables.set(name, []);
+    return tables.get(name)!;
+  };
+
+  const implementations = (name: string): Record<string, (args: any) => unknown> => {
+    const find = (where: Row | undefined) => table(name).filter((row) => matchesWhere(row, where));
+    const insert = (data: Row) => {
+      const row = { id: `${name}-${nextId++}`, ...data };
+      table(name).push(row);
+      return row;
+    };
+
+    return {
+      findUnique: ({ where }) => {
+        const stale = staleReads.get(name)?.shift();
+        if (stale) return { ...stale };
+        const [row] = find(where);
+        return row ? { ...row } : null;
+      },
+      findUniqueOrThrow: ({ where }) => {
+        const [row] = find(where);
+        if (!row) throw new Error(`fake database: no ${name} matches ${JSON.stringify(where)}`);
+        return { ...row };
+      },
+      findFirst: ({ where, orderBy } = {}) => {
+        const [row] = sortRows(find(where), orderBy);
+        return row ? { ...row } : null;
+      },
+      findMany: ({ where, orderBy, take } = {}) =>
+        sortRows(find(where), orderBy)
+          .slice(0, take ?? undefined)
+          .map((row) => ({ ...row })),
+      count: ({ where } = {}) => find(where).length,
+      create: ({ data }) => ({ ...insert(data) }),
+      createMany: ({ data, skipDuplicates }) => {
+        let count = 0;
+        for (const item of [data].flat() as Row[]) {
+          // A duplicate, for this purpose, is a row already carrying every
+          // value the new one would — enough for the keyed inserts sent here.
+          if (skipDuplicates && find(item).length > 0) continue;
+          insert(item);
+          count++;
+        }
+        return { count };
+      },
+      update: ({ where, data }) => {
+        const [row] = find(where);
+        // As Prisma does (P2025): an `update` that matches nothing throws.
+        if (!row) throw new Error(`fake database: no ${name} to update for ${JSON.stringify(where)}`);
+        applyData(row, data);
+        return { ...row };
+      },
+      updateMany: ({ where, data }) => {
+        const rows = find(where);
+        for (const row of rows) applyData(row, data);
+        return { count: rows.length };
+      },
+      upsert: ({ where, update, create }) => {
+        const [row] = find(where);
+        if (!row) return { ...insert(create) };
+        applyData(row, update);
+        return { ...row };
+      },
+      deleteMany: ({ where } = {}) => {
+        const doomed = new Set(find(where));
+        tables.set(name, table(name).filter((row) => !doomed.has(row)));
+        return { count: doomed.size };
+      },
+    };
+  };
 
   const model = (name: string) => {
     if (!models.has(name)) {
+      const impl = implementations(name);
       const methods: Record<string, jest.Mock> = {};
       models.set(
         name,
         new Proxy(methods, {
           get(target, method: string) {
             if (!(method in target)) {
-              target[method] = jest.fn().mockResolvedValue(defaultResult(method));
+              const run = impl[method];
+              target[method] = jest.fn(async (args: any) => {
+                if (!run) throw new Error(`fake database: ${name}.${method} is not implemented`);
+                return run(args);
+              });
             }
             return target[method];
           },
@@ -142,21 +521,122 @@ export function fakePrisma(): any {
     return models.get(name)!;
   };
 
+  /** Run one raw statement against the rows. */
+  const raw = (strings: TemplateStringsArray | string[], values: unknown[]): { count: number; rows: Row[] } => {
+    const sql = strings.reduce((text, part, i) => `${text}$${i}${part}`);
+
+    if (/pg_advisory_xact_lock/.test(sql)) {
+      locks.push(String(values[0]));
+      return { count: 1, rows: [] };
+    }
+
+    const reader = new SqlReader(tokenize(sql), values);
+    const project = (columns: { alias: string; value: Expr }[], row: Row) =>
+      Object.fromEntries(columns.map((c) => [c.alias, c.value(row)]));
+
+    if (reader.isWord('UPDATE')) {
+      reader.takeWord('UPDATE');
+      const rows = table(reader.takeWord());
+      reader.takeWord('SET');
+
+      const assignments: { column: string; value: Expr }[] = [];
+      do {
+        if (assignments.length > 0) reader.takeSymbol(',');
+        const column = camel(reader.takeWord());
+        reader.takeSymbol('=');
+        assignments.push({ column, value: reader.expression() });
+      } while (reader.isSymbol(','));
+
+      reader.takeWord('WHERE');
+      const where = reader.expression();
+      const returning = reader.isWord('RETURNING') ? (reader.takeWord(), reader.projection()) : null;
+      if (!reader.done()) throw new Error(`fake database: unread SQL after "${reader.peek()?.text}"`);
+
+      const matched = rows.filter((row) => Boolean(where(row)));
+      for (const row of matched) {
+        // Every right-hand side sees the row as it was, as in SQL.
+        const next = assignments.map((a) => [a.column, a.value(row)] as const);
+        for (const [column, value] of next) row[column] = value;
+      }
+      return { count: matched.length, rows: returning ? matched.map((row) => project(returning, row)) : [] };
+    }
+
+    if (reader.isWord('SELECT')) {
+      reader.takeWord('SELECT');
+      const columns = reader.projection();
+      reader.takeWord('FROM');
+      const rows = table(reader.takeWord());
+      reader.takeWord('WHERE');
+      const where = reader.expression();
+      if (!reader.done()) throw new Error(`fake database: unread SQL after "${reader.peek()?.text}"`);
+
+      const matched = rows.filter((row) => Boolean(where(row)));
+      return { count: matched.length, rows: matched.map((row) => project(columns, row)) };
+    }
+
+    throw new Error(`fake database: cannot run SQL: ${sql.trim().slice(0, 60)}`);
+  };
+
   const root: Record<string, unknown> = {
-    $executeRaw: jest.fn().mockResolvedValue(1),
-    $queryRaw: jest.fn().mockResolvedValue([]),
+    $executeRaw: jest.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => raw(strings, values).count),
+    $queryRaw: jest.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => raw(strings, values).rows),
+    $locks: locks,
+    $seed: <T extends Row>(name: string, rows: T[]): T[] => {
+      table(name).push(...rows);
+      return rows;
+    },
+    $rows: (name: string): Row[] => table(name),
+    $staleRead: (name: string, row: Row) => {
+      staleReads.set(name, [...(staleReads.get(name) ?? []), row]);
+    },
   };
 
   const prisma: any = new Proxy(root, {
     get(target, prop: string | symbol) {
-      // Not thenable: `await prisma` must not try to call a mock named "then".
+      // Not thenable: `await prisma` must not go looking for a model "then".
       if (typeof prop === 'symbol' || prop === 'then') return undefined;
       if (prop in target) return target[prop];
       return model(prop);
     },
   });
 
-  root.$transaction = jest.fn(async (fn: (tx: unknown) => unknown) => fn(prisma));
+  // Transactions run one at a time. Two that interleaved here would see each
+  // other's uncommitted writes, and a rollback would undo both — neither of
+  // which a real database allows. Serialising them is the honest
+  // approximation: it cannot reproduce a race (that is what the live
+  // harnesses in apps/api/test are for), but it never invents one either.
+  let queue: Promise<unknown> = Promise.resolve();
+
+  root.$transaction = jest.fn((fn: (tx: unknown) => unknown) => {
+    const run = queue.then(() => transact(fn));
+    queue = run.catch(() => undefined);
+    return run;
+  });
+
+  const transact = async (fn: (tx: unknown) => unknown) => {
+    // Remember every row, by identity and by content, so a throw puts both
+    // the membership of each table and the contents of each row back.
+    const before = [...tables].map(
+      ([name, rows]) => [name, rows.map((row) => [row, { ...row }] as const)] as const,
+    );
+    try {
+      return await fn(prisma);
+    } catch (error) {
+      for (const [name, rows] of before) {
+        tables.set(
+          name,
+          rows.map(([row, copy]) => {
+            for (const key of Object.keys(row)) delete row[key];
+            return Object.assign(row, copy);
+          }),
+        );
+      }
+      for (const name of tables.keys()) {
+        if (!before.some(([known]) => known === name)) tables.set(name, []);
+      }
+      throw error;
+    }
+  };
 
   return prisma;
 }
@@ -166,40 +646,68 @@ export function fakePrisma(): any {
 // ---------------------------------------------------------------------------
 
 /**
- * RedisService, with the handful of raw-client commands the dispatcher uses
- * for the offered-riders set. `offered` is what SMEMBERS / SISMEMBER answer
- * from; leave it null for "no such key".
+ * RedisService over in-memory sets with TTLs — enough of the raw client for
+ * the offered-riders set. `down()` makes every raw-client command reject, the
+ * way an unreachable Redis does.
  */
-export function fakeRedis(opts: { offered?: string[] | null } = {}) {
-  const state = { offered: opts.offered ?? null };
+export function fakeRedis() {
+  const sets = new Map<string, Set<string>>();
+  const ttls = new Map<string, number>();
+  let failing = false;
+
+  const guard = () => {
+    if (failing) throw new Error('connect ECONNREFUSED 127.0.0.1:6379');
+  };
 
   const pipeline = () => {
-    const queued: (() => [null, unknown])[] = [];
+    const queued: (() => unknown)[] = [];
     const chain: any = {
-      del: jest.fn(() => (queued.push(() => [null, 1]), chain)),
-      sadd: jest.fn((_key: string, ...members: string[]) => {
-        client.saddCalls.push(members);
-        return queued.push(() => [null, members.length]), chain;
-      }),
-      expire: jest.fn(() => (queued.push(() => [null, 1]), chain)),
-      exists: jest.fn(() => (queued.push(() => [null, state.offered === null ? 0 : 1]), chain)),
-      sismember: jest.fn((_key: string, member: string) => {
-        return queued.push(() => [null, state.offered?.includes(member) ? 1 : 0]), chain;
-      }),
-      exec: jest.fn(async () => queued.map((run) => run())),
+      del: (key: string) => (queued.push(() => (ttls.delete(key), sets.delete(key) ? 1 : 0)), chain),
+      sadd: (key: string, ...members: string[]) => {
+        queued.push(() => {
+          if (!sets.has(key)) sets.set(key, new Set());
+          for (const member of members) sets.get(key)!.add(member);
+          return members.length;
+        });
+        return chain;
+      },
+      expire: (key: string, seconds: number) =>
+        (queued.push(() => (sets.has(key) ? (ttls.set(key, seconds), 1) : 0)), chain),
+      exists: (key: string) => (queued.push(() => (sets.has(key) ? 1 : 0)), chain),
+      sismember: (key: string, member: string) =>
+        (queued.push(() => (sets.get(key)?.has(member) ? 1 : 0)), chain),
+      exec: async () => {
+        guard();
+        return queued.map((run) => [null, run()]);
+      },
     };
     return chain;
   };
 
-  const client = {
-    saddCalls: [] as string[][],
-    smembers: jest.fn(async () => state.offered ?? []),
-    multi: jest.fn(pipeline),
-  };
-
   return {
-    state,
-    client,
+    sets,
+    ttls,
+    /** Make Redis unreachable (or reachable again). */
+    down: (isDown = true) => {
+      failing = isDown;
+    },
+    /** Record `riderIds` as having been offered `taskId`, as a broadcast would. */
+    offer: (taskId: string, riderIds: string[], ttlSeconds = 86_400) => {
+      sets.set(redisKeys.offeredRiders(taskId), new Set(['-', ...riderIds]));
+      ttls.set(redisKeys.offeredRiders(taskId), ttlSeconds);
+    },
+    /** Who a task is recorded as offered to, without the sentinel; null if no record. */
+    offeredTo: (taskId: string): string[] | null => {
+      const members = sets.get(redisKeys.offeredRiders(taskId));
+      return members ? [...members].filter((m) => m !== '-').sort() : null;
+    },
+    client: {
+      smembers: jest.fn(async (key: string) => {
+        guard();
+        return [...(sets.get(key) ?? [])];
+      }),
+      multi: jest.fn(pipeline),
+    },
     findRidersNear: jest.fn().mockResolvedValue([]),
     getBusyRiders: jest.fn().mockResolvedValue([]),
     markRiderBusy: jest.fn().mockResolvedValue(undefined),
@@ -219,12 +727,12 @@ export function fakeRedis(opts: { offered?: string[] | null } = {}) {
  * A real gateway and a real dispatcher over the fakes.
  *
  * The constructors are called through a loose signature because the specs
- * that use this are also run against older revisions of these classes, whose
+ * that use this are also run against other revisions of these classes, whose
  * parameter lists differ; an arity mismatch must not be what fails there.
  */
-export function buildDispatch(opts: { offered?: string[] | null; shopApproved?: boolean } = {}) {
+export function buildDispatch(opts: { shopApproved?: boolean } = {}) {
   const prisma = fakePrisma();
-  const redis = fakeRedis({ offered: opts.offered });
+  const redis = fakeRedis();
   const server = new FakeServer();
   const shopAccess = { hasApprovedShop: jest.fn().mockResolvedValue(opts.shopApproved ?? true) };
   const jwt = { verifyAsync: jest.fn() };

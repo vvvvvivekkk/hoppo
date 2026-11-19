@@ -50,12 +50,7 @@ describe('disconnectUser', () => {
 describe('handleConnection and shop approval', () => {
   function connecting(ctx: ReturnType<typeof buildDispatch>, role: string) {
     ctx.jwt.verifyAsync.mockResolvedValue({ sub: 'user-1' });
-    ctx.prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      collegeId: 'col-1',
-      role,
-      status: 'ACTIVE',
-    });
+    ctx.prisma.$seed('user', [{ id: 'user-1', collegeId: 'col-1', role, status: 'ACTIVE' }]);
     return {
       handshake: { auth: { token: 'signed' }, headers: {} },
       data: {} as Record<string, unknown>,

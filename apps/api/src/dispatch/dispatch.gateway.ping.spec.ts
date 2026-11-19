@@ -17,8 +17,10 @@ afterAll(() => jest.restoreAllMocks());
 
 /** A connected, authenticated rider's socket, online in work mode. */
 function riderSocket(ctx: ReturnType<typeof buildDispatch>) {
-  ctx.prisma.riderState.findUnique.mockResolvedValue({ workModeOn: true });
-  ctx.prisma.collegeConfig.findUnique.mockResolvedValue({ riderPingIntervalSeconds: 15 });
+  if (ctx.prisma.$rows('riderState').length === 0) {
+    ctx.prisma.$seed('riderState', [{ userId: 'rider-1', workModeOn: true, lastPingAt: null }]);
+    ctx.prisma.$seed('collegeConfig', [{ collegeId: 'col-1', riderPingIntervalSeconds: 15 }]);
+  }
   return {
     data: { user: { userId: 'rider-1', collegeId: 'col-1', role: 'STUDENT' } } as Record<string, any>,
   };
@@ -54,6 +56,7 @@ describe('RIDER_PING validation (L9)', () => {
     expect(reply).toEqual({ ok: false, reason: 'INVALID_POSITION' });
     expect(ctx.redis.setRiderPosition).not.toHaveBeenCalled();
     expect(ctx.prisma.riderState.update).not.toHaveBeenCalled();
+    expect(ctx.prisma.$rows('riderState')[0].lastPingAt).toBeNull();
   });
 
   it.each([
@@ -68,6 +71,12 @@ describe('RIDER_PING validation (L9)', () => {
     const reply = await ctx.gateway.handleRiderPing(client as never, body);
 
     expect(reply).toEqual({ ok: true });
+    // The audit copy in the database is written too.
+    expect(ctx.prisma.$rows('riderState')[0]).toMatchObject({
+      lastLatitude: body.latitude,
+      lastLongitude: body.longitude,
+      lastPingAt: expect.any(Date),
+    });
     expect(ctx.redis.setRiderPosition).toHaveBeenCalledWith({
       collegeId: 'col-1',
       userId: 'rider-1',
