@@ -1,19 +1,28 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Banner, Button, Field, Panel } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
 /** A-01 */
 export default function LoginPage() {
-  const { login } = useApi();
+  const { login, notice } = useApi();
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // A second submit in the same tick (Enter and a tap landing together) would
+  // otherwise send two logins before `busy` has rendered the button disabled.
+  const submitting = useRef(false);
+
+  // Why they are here, when they did not choose to be: suspended, signed out,
+  // or holding an account that belongs in a different app.
+  const message = error ?? notice;
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -21,6 +30,7 @@ export default function LoginPage() {
     } catch (e) {
       setError(describeError(e));
     } finally {
+      submitting.current = false;
       setBusy(false);
     }
   }
@@ -35,7 +45,7 @@ export default function LoginPage() {
 
         <Panel>
           <form onSubmit={submit} className="space-y-4 p-4">
-            {error && <Banner tone="error">{error}</Banner>}
+            {message && <Banner tone="error">{message}</Banner>}
 
             <Field
               label="Email"

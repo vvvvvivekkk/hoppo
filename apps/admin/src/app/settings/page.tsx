@@ -2,7 +2,7 @@
 
 import { RADIUS_MAX_M, RADIUS_MIN_M, formatDistance } from '@hoppo/shared';
 import type { FlaggedShop } from '@hoppo/api-client';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
@@ -28,15 +28,22 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const saving = useRef(false);
 
   const load = useCallback(async () => {
     try {
-      const result = await api.admin.flaggedShops();
+      // The current radius has no endpoint of its own. Every flagged shop
+      // carries it, and so does every shop waiting in the approval queue, so
+      // both are read; with neither there is nothing to read it from, and the
+      // field says "not known" rather than showing a guess.
+      const [result, waiting] = await Promise.all([
+        api.admin.flaggedShops(),
+        api.admin.shopQueue(1).catch(() => null),
+      ]);
       setFlagged(result.items);
-      // The current radius is not exposed on its own endpoint, but every
-      // flagged shop carries it. With none flagged there is nothing to read
-      // it from, so the field starts empty rather than showing a guess.
-      setRadius((prev) => prev ?? result.items[0]?.currentRadiusM ?? null);
+      setRadius(
+        (prev) => prev ?? result.items[0]?.currentRadiusM ?? waiting?.items[0]?.radiusM ?? null,
+      );
       setError(null);
     } catch (e) {
       setError(describeError(e));
@@ -48,7 +55,8 @@ export default function SettingsPage() {
   }, [load]);
 
   async function save() {
-    if (pending === null) return;
+    if (pending === null || saving.current) return;
+    saving.current = true;
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -62,6 +70,7 @@ export default function SettingsPage() {
     } catch (e) {
       setError(describeError(e));
     } finally {
+      saving.current = false;
       setBusy(false);
     }
   }
@@ -94,7 +103,7 @@ export default function SettingsPage() {
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-semibold">Current</span>
             <span className="nums rounded-md bg-[var(--color-surface-sunken)] px-3 py-1 text-xl font-black">
-              {radius !== null ? formatDistance(radius) : 'unknown'}
+              {radius !== null ? formatDistance(radius) : 'not known yet'}
             </span>
           </div>
 
@@ -109,6 +118,19 @@ export default function SettingsPage() {
               </Button>
             ))}
           </div>
+
+          {/*
+            With the current radius unknown, this page cannot tell whether a
+            choice widens or narrows it — so the FR-TEN-05 warning is given
+            regardless, instead of being silently skipped.
+          */}
+          {radius === null && pending !== null && (
+            <Banner tone="warn">
+              The current radius could not be read, so this may be a reduction. If it is,
+              shops already approved outside {formatDistance(pending)} stay active and are
+              flagged below for you to review.
+            </Banner>
+          )}
 
           {/* FR-TEN-05 made explicit before the change, not after. */}
           {shrinking && (

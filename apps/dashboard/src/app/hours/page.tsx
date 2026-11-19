@@ -1,9 +1,10 @@
 'use client';
 
 import { formatMinuteOfDay } from '@hoppo/shared';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
 import { useListing } from '@/lib/use-listing';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -13,9 +14,14 @@ interface Window {
   closeMinute: number;
 }
 
-/** "09:00" to 540. */
-function toMinutes(time: string): number {
+/**
+ * "09:00" to 540. Null for a cleared or half-typed time input, which reports
+ * its value as "" — turning that into NaN and sending it would have the API
+ * reject the whole week over one empty box.
+ */
+function toMinutes(time: string): number | null {
   const [h, m] = time.split(':').map(Number);
+  if (!Number.isInteger(h) || !Number.isInteger(m)) return null;
   return h * 60 + m;
 }
 
@@ -39,7 +45,7 @@ function toTime(minute: number): string {
  */
 export default function HoursPage() {
   const { api } = useApi();
-  const { listingId, shop, error: listingError, loading } = useListing();
+  const { listingId, listing, shop, error: listingError, loading, reload } = useListing();
 
   const [week, setWeek] = useState<Record<number, Window[]>>({});
   const [closure, setClosure] = useState<{ until: string | null; note: string | null }>({
@@ -49,6 +55,17 @@ export default function HoursPage() {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const running = useRef(false);
+  /**
+   * Whether the schedule on screen came from the server.
+   *
+   * Until it has, the week is an empty object — which is also exactly what
+   * "closed every day" looks like. Saving in that state (after a failed load)
+   * would replace the shop's real hours with nothing, so Save stays disabled
+   * until there is a loaded schedule to edit.
+   */
+  const [loaded, setLoaded] = useState(false);
+  const [refused, setRefused] = useState(false);
 
   const load = useCallback(async () => {
     if (!listingId) return;
@@ -65,20 +82,47 @@ export default function HoursPage() {
       setWeek(grouped);
       setClosure({ until: catalog.temporarilyClosedUntil, note: catalog.closureNote });
       setError(null);
+      setLoaded(true);
+      setRefused(false);
     } catch (e) {
-      setError(describeError(e));
+      if (isAwaitingApproval(e)) {
+        setRefused(true);
+        setError(null);
+        void reload();
+      } else {
+        setError(describeError(e));
+      }
     }
-  }, [api, listingId]);
+  }, [api, listingId, reload]);
+
+  /** One change at a time, and never a second copy of the same one. */
+  async function run(action: () => Promise<void>) {
+    if (running.current) return;
+    running.current = true;
+    setBusy(true);
+    setError(null);
+    setSaved(null);
+    try {
+      await action();
+    } catch (e) {
+      if (isAwaitingApproval(e)) {
+        setRefused(true);
+        void reload();
+      } else {
+        setError(describeError(e));
+      }
+    } finally {
+      running.current = false;
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     void load();
   }, [load]);
 
   async function save() {
-    if (!listingId) return;
-    setBusy(true);
-    setError(null);
-    setSaved(null);
+    if (!listingId || !loaded) return;
 
     const hours = Object.entries(week).flatMap(([day, windows]) =>
       windows.map((w) => ({
@@ -88,21 +132,25 @@ export default function HoursPage() {
       })),
     );
 
-    try {
+    await run(async () => {
       const result = await api.catalog.setHours(listingId, hours);
       setSaved(result.message);
       await load();
-    } catch (e) {
-      setError(describeError(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
-  function setWindow(day: number, index: number, patch: Partial<Window>) {
+  function setWindow(day: number, index: number, patch: Partial<Record<keyof Window, number | null>>) {
+    // A cleared time box has no minute to store; keep the last real time.
+    const open = patch.openMinute ?? undefined;
+    const close = patch.closeMinute ?? undefined;
+    if (open === undefined && close === undefined) return;
+
     setWeek((prev) => {
       const windows = [...(prev[day] ?? [])];
-      windows[index] = { ...windows[index], ...patch };
+      windows[index] = {
+        openMinute: open ?? windows[index].openMinute,
+        closeMinute: close ?? windows[index].closeMinute,
+      };
       return { ...prev, [day]: windows };
     });
   }
@@ -136,8 +184,29 @@ export default function HoursPage() {
   }
 
   if (loading) return <p className="text-[var(--color-ink-faint)]">Loading…</p>;
-  if (listingError) return <Banner tone="error">{listingError}</Banner>;
-  if (!listingId) return <Banner tone="warn">Register a shop first.</Banner>;
+  if (listingError) {
+    return (
+      <div className="space-y-4">
+        <Banner tone="error">{listingError}</Banner>
+        <Button tone="secondary" onClick={() => void reload()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  if (!listingId || !listing) return <Banner tone="warn">Register a shop first.</Banner>;
+
+  if (refused || listing.status === 'REJECTED' || listing.status === 'SUSPENDED') {
+    return (
+      <div className="space-y-6">
+        <h1 className="text-3xl font-black tracking-tight">Opening hours</h1>
+        <RegistrationStatus shopName={shop?.name} listing={listing} refused={refused} />
+        <p className="text-[var(--color-ink-faint)]">
+          Opening hours can be set once the shop is approved.
+        </p>
+      </div>
+    );
+  }
 
   const closedNow = closure.until !== null && new Date(closure.until).getTime() > Date.now();
   const totalWindows = Object.values(week).flat().length;
@@ -168,17 +237,10 @@ export default function HoursPage() {
             <Button
               loading={busy}
               onClick={() =>
-                void (async () => {
-                  setBusy(true);
-                  try {
-                    await api.catalog.clearClosure(listingId);
-                    await load();
-                  } catch (e) {
-                    setError(describeError(e));
-                  } finally {
-                    setBusy(false);
-                  }
-                })()
+                void run(async () => {
+                  await api.catalog.clearClosure(listingId);
+                  await load();
+                })
               }
             >
               Reopen now
@@ -186,21 +248,13 @@ export default function HoursPage() {
           </div>
         ) : (
           <ClosureForm
-            disabled={busy}
+            disabled={busy || !loaded}
             onSubmit={(hours, note) =>
-              void (async () => {
-                setBusy(true);
-                setError(null);
-                try {
-                  const reopenAt = new Date(Date.now() + hours * 3_600_000).toISOString();
-                  await api.catalog.setClosure(listingId, reopenAt, note || undefined);
-                  await load();
-                } catch (e) {
-                  setError(describeError(e));
-                } finally {
-                  setBusy(false);
-                }
-              })()
+              void run(async () => {
+                const reopenAt = new Date(Date.now() + hours * 3_600_000).toISOString();
+                await api.catalog.setClosure(listingId, reopenAt, note || undefined);
+                await load();
+              })
             }
           />
         )}
@@ -214,7 +268,20 @@ export default function HoursPage() {
           </Button>
         </div>
 
-        {totalWindows === 0 && (
+        {!loaded && (
+          <div className="border-b border-[var(--color-line)] px-5 py-3 text-[var(--color-ink-faint)]">
+            {error
+              ? 'Your hours could not be loaded, so they cannot be changed from here yet.'
+              : 'Loading your hours…'}{' '}
+            {error && (
+              <button className="font-semibold underline" onClick={() => void load()}>
+                Try again
+              </button>
+            )}
+          </div>
+        )}
+
+        {loaded && totalWindows === 0 && (
           <div className="border-b border-[var(--color-line)] bg-[var(--color-waiting-bg)] px-5 py-3 font-medium text-[var(--color-waiting)]">
             No hours set, so students will see this shop as closed and cannot order. Add at
             least one window.
@@ -222,7 +289,7 @@ export default function HoursPage() {
         )}
 
         <div className="divide-y divide-[var(--color-line)]">
-          {DAYS.map((label, day) => {
+          {loaded && DAYS.map((label, day) => {
             const windows = week[day] ?? [];
             return (
               <div key={day} className="flex flex-wrap items-start gap-4 p-5">
@@ -278,7 +345,7 @@ export default function HoursPage() {
         </div>
 
         <div className="border-t border-[var(--color-line)] p-5">
-          <Button large loading={busy} onClick={() => void save()}>
+          <Button large loading={busy} disabled={!loaded} onClick={() => void save()}>
             Save hours
           </Button>
         </div>

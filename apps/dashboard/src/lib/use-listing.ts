@@ -1,7 +1,7 @@
 'use client';
 
 import type { MyShop } from '@hoppo/api-client';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { describeError, useApi } from '@/lib/api';
 
 /**
@@ -18,21 +18,41 @@ export function useListing() {
   const [listingId, setListingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const { shops: mine } = await api.shops.mine();
-        setShops(mine);
-        const listings = mine.flatMap((s) => s.listings);
-        setListingId((listings.find((l) => l.status === 'ACTIVE') ?? listings[0])?.id ?? null);
-      } catch (e) {
-        setError(describeError(e));
-      }
-    })();
+  const reload = useCallback(async () => {
+    try {
+      const { shops: mine } = await api.shops.mine();
+      setShops(mine);
+      const listings = mine.flatMap((s) => s.listings);
+      setListingId(
+        (prev) =>
+          listings.find((l) => l.id === prev)?.id ??
+          (listings.find((l) => l.status === 'ACTIVE') ?? listings[0])?.id ??
+          null,
+      );
+      setError(null);
+    } catch (e) {
+      setError(describeError(e));
+    }
   }, [api]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
 
   const shop = shops?.find((s) => s.listings.some((l) => l.id === listingId)) ?? null;
   const listing = shop?.listings.find((l) => l.id === listingId) ?? null;
 
-  return { shops, shop, listing, listingId, error, loading: shops === null };
+  return {
+    shops,
+    shop,
+    listing,
+    listingId,
+    // Only an error while there is nothing to show. A failed re-read with a
+    // listing already on screen is not a reason to replace the page.
+    error: shops === null ? error : null,
+    // Loading means "no answer yet" — a failed first read is an answer, and
+    // leaving it as loading is what used to strand the page on "Loading…".
+    loading: shops === null && error === null,
+    reload,
+  };
 }

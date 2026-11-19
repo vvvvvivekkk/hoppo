@@ -1,7 +1,7 @@
 'use client';
 
 import type { College } from '@hoppo/api-client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
@@ -42,6 +42,10 @@ export default function RegisterPage() {
   const [colleges, setColleges] = useState<College[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Registration creates an account and a shop. A second copy of the request
+  // would be refused as "that mobile number is already registered" — an
+  // error shown to someone whose registration has in fact just succeeded.
+  const submitting = useRef(false);
 
   // D-02
   const [name, setName] = useState('');
@@ -127,6 +131,8 @@ export default function RegisterPage() {
   }
 
   async function submit() {
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError(null);
 
@@ -175,6 +181,7 @@ export default function RegisterPage() {
     } catch (e) {
       setError(describeError(e));
     } finally {
+      submitting.current = false;
       setBusy(false);
     }
   }

@@ -1,7 +1,8 @@
 'use client';
 
 import type { VerificationQueueItem } from '@hoppo/api-client';
-import { useCallback, useEffect, useState } from 'react';
+import { ApiError } from '@hoppo/api-client';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Field, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
@@ -30,6 +31,13 @@ const REJECTION_REASONS = [
   { value: 'OTHER', label: 'Something else (explain below)' },
 ];
 
+const GOVT_ID_LABELS: Record<string, string> = {
+  DRIVING_LICENCE: 'Driving licence',
+  VOTER_ID: 'Voter ID',
+  PASSPORT: 'Passport',
+  AADHAAR_MASKED: 'Aadhaar (masked)',
+};
+
 export default function StudentsPage() {
   const { api } = useApi();
   const [items, setItems] = useState<VerificationQueueItem[]>([]);
@@ -37,7 +45,14 @@ export default function StudentsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  /**
+   * Rows with a decision in the air. The ref is the guard and the state is
+   * the picture: two clicks handled before React re-renders both see "not
+   * busy", and a single busy id is overwritten by a decision on the next row,
+   * which re-enables the first row's buttons while its request is still out.
+   */
+  const pending = useRef(new Set<string>());
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
 
   const load = useCallback(async () => {
     try {
@@ -57,7 +72,9 @@ export default function StudentsPage() {
   }, [load]);
 
   async function act(id: string, action: () => Promise<{ message: string }>) {
-    setBusyId(id);
+    if (pending.current.has(id)) return;
+    pending.current.add(id);
+    setBusyIds(new Set(pending.current));
     setError(null);
     setNotice(null);
     try {
@@ -69,9 +86,18 @@ export default function StudentsPage() {
       setTotal((t) => Math.max(0, t - 1));
       await load();
     } catch (e) {
-      setError(describeError(e));
+      // ALREADY_DECIDED is two administrators working one queue, not a fault:
+      // say so, and either way reload so the row shows where it stands now.
+      // (Reload first: a successful load clears the banner.)
+      await load();
+      setError(
+        e instanceof ApiError && e.code === 'ALREADY_DECIDED'
+          ? 'Someone else has already decided that one. The queue below is up to date.'
+          : describeError(e),
+      );
     } finally {
-      setBusyId(null);
+      pending.current.delete(id);
+      setBusyIds(new Set(pending.current));
     }
   }
 
@@ -101,7 +127,7 @@ export default function StudentsPage() {
               <Row
                 key={item.id}
                 item={item}
-                busy={busyId === item.id}
+                busy={busyIds.has(item.id)}
                 onApprove={(note) => act(item.id, () => api.admin.approveVerification(item.id, note))}
                 onReject={(reason, note) =>
                   act(item.id, () => api.admin.rejectVerification(item.id, reason, note))
@@ -175,7 +201,9 @@ function Row({
                   // stored, so that is all there is to show. The absence of a
                   // full number here is the design working, not data missing.
                   <span>
-                    {item.govtIdType.toLowerCase().replace(/_/g, ' ')} ····{item.govtIdLast4}
+                    {GOVT_ID_LABELS[item.govtIdType] ??
+                      item.govtIdType.toLowerCase().replace(/_/g, ' ')}{' '}
+                    ····{item.govtIdLast4}
                   </span>
                 ) : (
                   <span className="text-[var(--color-ink-faint)]">college ID only</span>

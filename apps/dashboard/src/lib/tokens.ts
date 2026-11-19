@@ -49,6 +49,20 @@ export function createTokenStore(onChange?: () => void): TokenStore {
     },
 
     clear() {
+      // Clearing an empty store is not a change, and must not announce one.
+      // It used to: a signed-out visitor's /auth/me returned 401, the client
+      // cleared the (already empty) tokens, that notified the provider, the
+      // provider refetched /auth/me, and round it went — over 17,000 requests
+      // in three minutes from one idle tab on the welcome screen. Only a real
+      // browser found it; typecheck, build and the API walk all passed.
+      let hadTokens = cached !== null;
+      try {
+        hadTokens = hadTokens || window.sessionStorage.getItem(STORAGE_KEY) !== null;
+      } catch {
+        /* unreadable storage: fall back to what was cached */
+      }
+      if (!hadTokens) return;
+
       cached = null;
       try {
         window.sessionStorage.removeItem(STORAGE_KEY);

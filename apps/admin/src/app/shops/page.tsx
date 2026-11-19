@@ -1,7 +1,8 @@
 'use client';
 
 import type { ShopQueueItem } from '@hoppo/api-client';
-import { useCallback, useEffect, useState } from 'react';
+import { ApiError } from '@hoppo/api-client';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Field, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
@@ -37,7 +38,14 @@ export default function ShopsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  /**
+   * Rows with a decision in the air. The ref is the guard and the state is
+   * the picture: two clicks handled before React re-renders both see "not
+   * busy", and a single busy id is overwritten by a decision on the next row,
+   * which re-enables the first row's buttons while its request is still out.
+   */
+  const pending = useRef(new Set<string>());
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
 
   const load = useCallback(async () => {
     try {
@@ -57,7 +65,9 @@ export default function ShopsPage() {
   }, [load]);
 
   async function act(id: string, action: () => Promise<unknown>, message: string) {
-    setBusyId(id);
+    if (pending.current.has(id)) return;
+    pending.current.add(id);
+    setBusyIds(new Set(pending.current));
     setError(null);
     setNotice(null);
     try {
@@ -67,9 +77,18 @@ export default function ShopsPage() {
       setTotal((t) => Math.max(0, t - 1));
       await load();
     } catch (e) {
-      setError(describeError(e));
+      // ALREADY_DECIDED is two administrators working one queue, not a fault:
+      // say so, and either way reload so the row shows where it stands now.
+      // (Reload first: a successful load clears the banner.)
+      await load();
+      setError(
+        e instanceof ApiError && e.code === 'ALREADY_DECIDED'
+          ? 'Someone else has already decided that one. The queue below is up to date.'
+          : describeError(e),
+      );
     } finally {
-      setBusyId(null);
+      pending.current.delete(id);
+      setBusyIds(new Set(pending.current));
     }
   }
 
@@ -97,7 +116,7 @@ export default function ShopsPage() {
               <ShopRow
                 key={item.listingId}
                 item={item}
-                busy={busyId === item.listingId}
+                busy={busyIds.has(item.listingId)}
                 onApprove={() =>
                   act(
                     item.listingId,

@@ -39,27 +39,49 @@ export function usePolling<T>(
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const inFlight = useRef(false);
+  const inFlight = useRef<Promise<T | null> | null>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
-  const run = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
+  const run = useCallback((): Promise<T | null> => {
+    if (inFlight.current) return inFlight.current;
 
-    try {
-      const next = await fetcherRef.current();
-      setData(next);
-      setError(null);
-    } catch (e) {
-      // Keep whatever was last shown; surface the error alongside it. A
-      // momentary network blip must not blank a queue someone is reading.
-      setError(e instanceof Error ? e : new Error(String(e)));
-    } finally {
-      inFlight.current = false;
-      setLoading(false);
-    }
+    const attempt = (async () => {
+      try {
+        const next = await fetcherRef.current();
+        setData(next);
+        setError(null);
+        return next;
+      } catch (e) {
+        // Keep whatever was last shown; surface the error alongside it. A
+        // momentary network blip must not blank a queue someone is reading.
+        setError(e instanceof Error ? e : new Error(String(e)));
+        return null;
+      } finally {
+        inFlight.current = null;
+        setLoading(false);
+      }
+    })();
+
+    inFlight.current = attempt;
+    return attempt;
   }, []);
+
+  /**
+   * Fetch now, and mean it.
+   *
+   * The interval skips a tick while a request is in flight, which is right
+   * for a timer and wrong for "I just accepted an order, show me the queue":
+   * the request already in the air was sent *before* the action and returns
+   * the queue as it was, so the card comes back with its Accept button live
+   * for up to three seconds — long enough to tap it again and be told the
+   * order is "already preparing". So this waits out whatever is in flight and
+   * then asks afresh. Resolves to the new data, or null if that fetch failed.
+   */
+  const refresh = useCallback(async (): Promise<T | null> => {
+    if (inFlight.current) await inFlight.current;
+    return run();
+  }, [run]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -91,5 +113,5 @@ export function usePolling<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run, intervalMs, ...deps]);
 
-  return { data, error, loading, refresh: run };
+  return { data, error, loading, refresh };
 }

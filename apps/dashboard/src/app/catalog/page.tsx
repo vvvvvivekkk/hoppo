@@ -2,9 +2,10 @@
 
 import { formatMinor, rupeesToMinor, minorToRupees } from '@hoppo/shared';
 import type { CatalogItem } from '@hoppo/api-client';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, EmptyState, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
 import { useListing } from '@/lib/use-listing';
 
 /**
@@ -17,42 +18,92 @@ import { useListing } from '@/lib/use-listing';
  */
 export default function CatalogPage() {
   const { api } = useApi();
-  const { listingId, shop, error: listingError, loading } = useListing();
+  const { listingId, listing, shop, error: listingError, loading, reload } = useListing();
 
   const [catalog, setCatalog] = useState<Awaited<ReturnType<typeof api.catalog.get>> | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The API refused the menu because the shop is not approved yet.
+  const [refused, setRefused] = useState(false);
   const [busy, setBusy] = useState(false);
+  // The guard against a second request; `busy` is only how it looks. Two taps
+  // handled before React re-renders would both read busy === false.
+  const running = useRef(false);
 
   const load = useCallback(async () => {
     if (!listingId) return;
     try {
       setCatalog(await api.catalog.get(listingId));
       setError(null);
+      setRefused(false);
     } catch (e) {
-      setError(describeError(e));
+      if (isAwaitingApproval(e)) {
+        setRefused(true);
+        setError(null);
+        void reload();
+      } else {
+        setError(describeError(e));
+      }
     }
-  }, [api, listingId]);
+  }, [api, listingId, reload]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   async function run(action: () => Promise<unknown>) {
+    if (running.current) return;
+    running.current = true;
     setBusy(true);
     setError(null);
     try {
       await action();
       await load();
     } catch (e) {
-      setError(describeError(e));
+      if (isAwaitingApproval(e)) {
+        setRefused(true);
+        void reload();
+      } else {
+        // Show the menu as the server has it, not as the failed change left
+        // it — and only then the reason, because a successful load clears it.
+        await load();
+        setError(describeError(e));
+      }
     } finally {
+      running.current = false;
       setBusy(false);
     }
   }
 
   if (loading) return <p className="text-[var(--color-ink-faint)]">Loading…</p>;
-  if (listingError) return <Banner tone="error">{listingError}</Banner>;
-  if (!listingId) return <EmptyState title="No shop yet" body="Register a shop to add a menu." />;
+  if (listingError) {
+    return (
+      <div className="space-y-4">
+        <Banner tone="error">{listingError}</Banner>
+        <Button tone="secondary" onClick={() => void reload()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  if (!listingId || !listing) {
+    return <EmptyState title="No shop yet" body="Register a shop to add a menu." />;
+  }
+
+  // A rejected or suspended shop cannot change its menu (the API refuses with
+  // LISTING_NOT_EDITABLE), and one the API has just refused as unapproved
+  // cannot either. Show where the registration stands rather than a form
+  // whose every button fails.
+  if (refused || listing.status === 'REJECTED' || listing.status === 'SUSPENDED') {
+    return (
+      <div className="space-y-6">
+        <h1 className="text-3xl font-black tracking-tight">Menu</h1>
+        <RegistrationStatus shopName={shop?.name} listing={listing} refused={refused} />
+        <p className="text-[var(--color-ink-faint)]">
+          The menu can be edited once the shop is approved.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

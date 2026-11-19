@@ -1,10 +1,11 @@
 'use client';
 
 import { formatMinor } from '@hoppo/shared';
-import type { MyShop, ShopQueueOrder } from '@hoppo/api-client';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiError, type MyShop, type ShopQueueOrder } from '@hoppo/api-client';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Banner, Button, Card, EmptyState, Status } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { isAwaitingApproval, RegistrationStatus } from '@/lib/approval';
 import { OrderAlert, type AlertState } from '@/lib/alert';
 import { usePolling } from '@/lib/poll';
 
@@ -21,27 +22,78 @@ export default function OrdersPage() {
   const { api } = useApi();
   const [listingId, setListingId] = useState<string | null>(null);
   const [shops, setShops] = useState<MyShop[] | null>(null);
-  const [shopError, setShopError] = useState<string | null>(null);
+  const [shopError, setShopError] = useState<{ message: string; awaiting: boolean } | null>(null);
+  const [retrying, setRetrying] = useState(false);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const { shops: mine } = await api.shops.mine();
-        setShops(mine);
-        const firstActive =
-          mine.flatMap((s) => s.listings).find((l) => l.status === 'ACTIVE') ??
-          mine.flatMap((s) => s.listings)[0];
-        setListingId(firstActive?.id ?? null);
-      } catch (e) {
-        setShopError(describeError(e));
-      }
-    })();
+  const loadShops = useCallback(async () => {
+    try {
+      const { shops: mine } = await api.shops.mine();
+      const listings = mine.flatMap((s) => s.listings);
+      setShops(mine);
+      // Keep the listing already on screen if it still exists; a re-read must
+      // not swap the queue to a different college's listing under the owner.
+      setListingId(
+        (prev) =>
+          listings.find((l) => l.id === prev)?.id ??
+          (listings.find((l) => l.status === 'ACTIVE') ?? listings[0])?.id ??
+          null,
+      );
+      setShopError(null);
+    } catch (e) {
+      setShopError({ message: describeError(e), awaiting: isAwaitingApproval(e) });
+    }
   }, [api]);
 
-  if (shopError) return <Banner tone="error">{shopError}</Banner>;
-  if (!shops) return <p className="text-[var(--color-ink-faint)]">Loading your shop…</p>;
+  useEffect(() => {
+    void loadShops();
+  }, [loadShops]);
 
-  const listing = shops.flatMap((s) => s.listings).find((l) => l.id === listingId);
+  const listing = shops?.flatMap((s) => s.listings).find((l) => l.id === listingId) ?? null;
+  const waitingOnAdmin =
+    shopError?.awaiting === true || (listing !== null && listing.status !== 'ACTIVE');
+
+  // An owner waiting for approval leaves this page open. Re-read the
+  // registration every so often so that approval shows up without a reload.
+  useEffect(() => {
+    if (!waitingOnAdmin) return;
+    const timer = setInterval(() => void loadShops(), 15_000);
+    return () => clearInterval(timer);
+  }, [waitingOnAdmin, loadShops]);
+
+  // The registration could not be read at all. With a previous answer on
+  // screen there is nothing to say; without one, say what happened and offer
+  // the retry, rather than leaving a dead page until someone reloads.
+  if (!shops && shopError) {
+    if (shopError.awaiting) {
+      return (
+        <EmptyState
+          title="Waiting for approval"
+          body="Your shop is waiting for a campus administrator to review it. Nothing is visible to students until it is approved."
+        />
+      );
+    }
+
+    return (
+      <div className="space-y-4">
+        <Banner tone="error">{shopError.message}</Banner>
+        <Button
+          tone="secondary"
+          loading={retrying}
+          onClick={() =>
+            void (async () => {
+              setRetrying(true);
+              await loadShops();
+              setRetrying(false);
+            })()
+          }
+        >
+          Try again
+        </Button>
+      </div>
+    );
+  }
+
+  if (!shops) return <p className="text-[var(--color-ink-faint)]">Loading your shop…</p>;
 
   if (!listing) {
     return (
@@ -52,56 +104,57 @@ export default function OrdersPage() {
     );
   }
 
+  const shopName = shops.find((s) => s.listings.some((l) => l.id === listing.id))?.name;
+
   // FR-SHOP-09: a shop that is not approved cannot receive orders, so showing
   // an empty queue would be misleading. Say why instead.
   if (listing.status !== 'ACTIVE') {
-    return (
-      <div className="space-y-4">
-        <Card className="p-6">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-2xl font-bold">
-                {shops.find((s) => s.listings.some((l) => l.id === listing.id))?.name}
-              </p>
-              <p className="text-[var(--color-ink-faint)]">
-                {listing.college.name} · {listing.distanceLabel} from campus
-              </p>
-            </div>
-            <Status status={listing.status} />
-          </div>
-        </Card>
-
-        {listing.status === 'PENDING_VERIFICATION' && (
-          <Banner tone="warn">
-            Your shop is waiting for a campus administrator to review it. You can set up your
-            menu and hours in the meantime — nothing is visible to students until it is approved.
-          </Banner>
-        )}
-
-        {listing.status === 'REJECTED' && (
-          <Banner tone="error">
-            This registration was rejected
-            {listing.rejectionReason
-              ? `: ${listing.rejectionReason.toLowerCase().replace(/_/g, ' ')}`
-              : ''}
-            .{listing.rejectionNote ? ` ${listing.rejectionNote}` : ''}
-          </Banner>
-        )}
-
-        {listing.status === 'SUSPENDED' && (
-          <Banner tone="error">
-            This shop has been suspended and is hidden from students. Contact your campus
-            administrator.
-          </Banner>
-        )}
-      </div>
-    );
+    return <RegistrationStatus shopName={shopName} listing={listing} />;
   }
 
-  return <Queue listingId={listing.id} />;
+  return (
+    <Queue
+      listingId={listing.id}
+      // The queue itself can be refused as "not approved" while /shops/mine
+      // still reads ACTIVE. Re-read the registration when that happens, and
+      // show its status in place of the queue.
+      onRefused={() => void loadShops()}
+      refusedPanel={<RegistrationStatus shopName={shopName} listing={listing} refused />}
+    />
+  );
 }
 
-function Queue({ listingId }: { listingId: string }) {
+/**
+ * Refusals that mean "the order moved on while you were looking at it".
+ *
+ * Each is a normal outcome of two people acting on one order — the student
+ * cancels as the shop taps Accept — and not a fault to apologise for. The
+ * API's own wording tells the caller to refresh; the dashboard has already
+ * done that by the time these are shown, so they say what happened instead.
+ */
+const ORDER_MOVED_ON: Record<string, string> = {
+  ORDER_STATE_CHANGED:
+    'That order changed while you were answering it — the student may have cancelled. The queue below is up to date.',
+  ORDER_NOT_READY:
+    'That order is not at that stage yet. The queue below is up to date.',
+  NOT_AWAITING_ACCEPTANCE:
+    'That order had already been answered. The queue below is up to date.',
+  ACCEPT_WINDOW_EXPIRED:
+    'The time to answer that order ran out, so it was cancelled. The queue below is up to date.',
+};
+
+const ORDER_GONE =
+  'That order is no longer in your queue — it was cancelled or completed while you were answering. The queue below is up to date.';
+
+function Queue({
+  listingId,
+  onRefused,
+  refusedPanel,
+}: {
+  listingId: string;
+  onRefused: () => void;
+  refusedPanel: ReactNode;
+}) {
   const { api } = useApi();
 
   // FR-SHP-01: the queue must stay current without anyone refreshing. Three
@@ -115,8 +168,19 @@ function Queue({ listingId }: { listingId: string }) {
 
   const alertRef = useRef<OrderAlert | null>(null);
   const [alertState, setAlertState] = useState<AlertState>('blocked');
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ tone: 'warn' | 'error'; text: string } | null>(null);
+
+  /**
+   * Orders with a request in the air.
+   *
+   * The ref is the guard and the state is the picture. State alone is not
+   * enough: two taps handled before React re-renders both see "not busy" and
+   * both send. And a single id is not enough either: answering a second order
+   * while the first is still in flight would overwrite it and re-enable the
+   * first order's buttons mid-request.
+   */
+  const pending = useRef(new Set<string>());
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
 
   if (!alertRef.current) alertRef.current = new OrderAlert();
 
@@ -125,9 +189,19 @@ function Queue({ listingId }: { listingId: string }) {
     return () => alert.dispose();
   }, []);
 
+  // The API refused the queue because the shop is not approved. That is a
+  // state to show, not a connection problem to retry around.
+  const refused = isAwaitingApproval(error);
+
+  useEffect(() => {
+    if (refused) onRefused();
+    // Only on the transition into the refused state, not on every poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refused]);
+
   const waiting = useMemo(
-    () => (data?.items ?? []).filter((o) => o.status === 'PLACED'),
-    [data],
+    () => (refused ? [] : (data?.items ?? []).filter((o) => o.status === 'PLACED')),
+    [data, refused],
   );
 
   /**
@@ -141,28 +215,61 @@ function Queue({ listingId }: { listingId: string }) {
     else alert.stopRepeating();
   }, [waiting.length]);
 
+  const waitingCount = useRef(0);
+  waitingCount.current = waiting.length;
+
   const arm = useCallback(async () => {
-    const next = await alertRef.current!.arm();
+    const alert = alertRef.current!;
+    const next = await alert.arm();
     setAlertState(next);
+    // Turning the sound on with an order already waiting should be heard now,
+    // not up to eight seconds later when the repeat next comes round.
+    if (next === 'ready' && waitingCount.current > 0) alert.chime();
   }, []);
 
   async function act(
-    orderId: string,
+    order: ShopQueueOrder,
     action: () => Promise<{ message?: string }>,
   ) {
-    setBusyId(orderId);
-    setActionError(null);
+    if (pending.current.has(order.id)) return;
+    pending.current.add(order.id);
+    setBusyIds(new Set(pending.current));
+    setNotice(null);
+
     try {
       await action();
       await refresh();
     } catch (e) {
-      setActionError(describeError(e));
+      // Whatever went wrong, look again before saying anything: most refusals
+      // here mean the order moved on, and the queue should show where it is
+      // now rather than leave a card with buttons that can only fail.
+      const fresh = await refresh();
+      const now = fresh?.items.find((o) => o.id === order.id);
+      const code = e instanceof ApiError ? e.code : null;
+
+      if (code && ORDER_MOVED_ON[code]) {
+        setNotice({ tone: 'warn', text: ORDER_MOVED_ON[code] });
+      } else if (fresh && !now) {
+        setNotice({ tone: 'warn', text: ORDER_GONE });
+      } else if (fresh && now && now.status !== order.status) {
+        setNotice({ tone: 'warn', text: ORDER_MOVED_ON.ORDER_STATE_CHANGED });
+      } else if (!isAwaitingApproval(e)) {
+        setNotice({ tone: 'error', text: describeError(e) });
+      }
     } finally {
-      setBusyId(null);
+      pending.current.delete(order.id);
+      setBusyIds(new Set(pending.current));
     }
   }
 
+  if (refused) return <>{refusedPanel}</>;
+
   const active = (data?.items ?? []).filter((o) => o.status !== 'PLACED');
+
+  // "Could not reach the server" is only true of a failure to reach it. A
+  // refusal the server did send (rate limiting, a permission problem) is
+  // shown in its own words.
+  const unreachable = !(error instanceof ApiError) || error.isRetryable;
 
   return (
     <div className="space-y-5">
@@ -189,12 +296,15 @@ function Queue({ listingId }: { listingId: string }) {
 
       {error && (
         <Banner tone="warn">
-          Could not reach the server just now — showing the last known queue. Retrying
-          automatically.
+          {unreachable
+            ? data
+              ? 'Could not reach the server just now — showing the last known queue. Retrying automatically.'
+              : 'Could not reach the server just now. Retrying automatically.'
+            : describeError(error)}
         </Banner>
       )}
 
-      {actionError && <Banner tone="error">{actionError}</Banner>}
+      {notice && <Banner tone={notice.tone}>{notice.text}</Banner>}
 
       <section aria-labelledby="waiting-heading">
         <h2 id="waiting-heading" className="mb-3 flex items-center gap-3 text-2xl font-bold">
@@ -208,7 +318,13 @@ function Queue({ listingId }: { listingId: string }) {
 
         {waiting.length === 0 ? (
           <EmptyState
-            title={loading ? 'Checking for orders…' : 'No new orders'}
+            title={
+              loading
+                ? 'Checking for orders…'
+                : data
+                  ? 'No new orders'
+                  : 'The queue could not be loaded yet'
+            }
             body="New orders appear here the moment a student places them, with a chime."
           />
         ) : (
@@ -217,13 +333,12 @@ function Queue({ listingId }: { listingId: string }) {
               <WaitingCard
                 key={order.id}
                 order={order}
-                busy={busyId === order.id}
-                acceptWindowSeconds={data?.acceptWindowSeconds ?? 300}
+                busy={busyIds.has(order.id)}
                 onAccept={(prepMinutes) =>
-                  act(order.id, () => api.shops.acceptOrder(listingId, order.id, prepMinutes))
+                  void act(order, () => api.shops.acceptOrder(listingId, order.id, prepMinutes))
                 }
                 onReject={(reason) =>
-                  act(order.id, () => api.shops.rejectOrder(listingId, order.id, reason))
+                  void act(order, () => api.shops.rejectOrder(listingId, order.id, reason))
                 }
               />
             ))}
@@ -244,8 +359,8 @@ function Queue({ listingId }: { listingId: string }) {
               <ActiveCard
                 key={order.id}
                 order={order}
-                busy={busyId === order.id}
-                onReady={() => act(order.id, () => api.shops.markReady(listingId, order.id))}
+                busy={busyIds.has(order.id)}
+                onReady={() => void act(order, () => api.shops.markReady(listingId, order.id))}
               />
             ))}
           </div>
@@ -259,13 +374,11 @@ function Queue({ listingId }: { listingId: string }) {
 function WaitingCard({
   order,
   busy,
-  acceptWindowSeconds,
   onAccept,
   onReject,
 }: {
   order: ShopQueueOrder;
   busy: boolean;
-  acceptWindowSeconds: number;
   onAccept: (prepMinutes?: number) => void;
   onReject: (reason: string) => void;
 }) {
@@ -317,7 +430,11 @@ function WaitingCard({
 
           <p className="mt-1 text-[var(--color-ink-faint)]">
             {order.student.name} · {order.dropLandmark ?? 'campus delivery point'} ·{' '}
-            {order.paymentMethod === 'CASH' ? 'Cash on delivery' : 'Paid online'}
+            {order.paymentMethod === 'CASH'
+              ? 'Cash on delivery'
+              : order.paymentMethod === 'WALLET'
+                ? 'Paid from Hoppo wallet'
+                : 'Paid online'}
           </p>
 
           <ul className="mt-4 space-y-1">
@@ -402,7 +519,12 @@ function WaitingCard({
                   {reason}
                 </Button>
               ))}
-              <Button tone="quiet" className="w-full" onClick={() => setRejecting(false)}>
+              <Button
+                tone="quiet"
+                className="w-full"
+                disabled={busy}
+                onClick={() => setRejecting(false)}
+              >
                 Cancel
               </Button>
             </div>
