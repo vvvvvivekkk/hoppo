@@ -1,13 +1,22 @@
 import type { ApiClient, TokenPair } from './client';
 import type {
+  ActiveTask,
   AuthUser,
+  BrowseShop,
   Catalog,
   CatalogCategory,
   CatalogItem,
   College,
   FlaggedShop,
+  ItemSearchResult,
+  MyOrder,
   MyShop,
+  OrderDetail,
+  OrderQuote,
+  OrderRequestBody,
   Paged,
+  RiderStatus,
+  ShopDetail,
   ShopQueue,
   ShopQueueItem,
   VerificationQueueItem,
@@ -275,6 +284,186 @@ export function endpoints(client: ApiClient) {
         }>('/admin/college/radius', { serviceableRadiusM }),
 
       flaggedShops: () => client.get<{ items: FlaggedShop[] }>('/admin/college/radius/flagged'),
+    },
+
+    verification: {
+      /** FR-SVER-01: status, plus what it unlocks. */
+      me: () =>
+        client.get<{
+          status: 'UNSUBMITTED' | 'PENDING' | 'VERIFIED' | 'REJECTED';
+          verifiedAt: string | null;
+          profile: { rollNumber: string | null; department: string | null; yearOfStudy: number | null };
+          latestSubmission: {
+            id: string;
+            status: string;
+            submittedAt: string;
+            decidedAt: string | null;
+            rejectionReason: string | null;
+            rejectionNote: string | null;
+          } | null;
+          submissionsUsed: number;
+          submissionsAllowed: number;
+          unlocked: {
+            browseShops: boolean;
+            placeOrders: boolean;
+            workMode: boolean;
+            chat: boolean;
+            community: boolean;
+          };
+        }>('/verification/me'),
+
+      /** FR-SVER-02 */
+      submit: (body: {
+        rollNumber: string;
+        department: string;
+        yearOfStudy: number;
+        idCardUrl: string;
+        govtIdType?: string;
+        govtIdLast4?: string;
+      }) =>
+        client.post<{
+          submissionId: string;
+          status: string;
+          submissionsUsed: number;
+          submissionsAllowed: number;
+          message: string;
+        }>('/verification/submit', body),
+
+      /** FR-WM-02 */
+      acceptRiderTerms: () =>
+        client.post<{ accepted: boolean; version: string }>('/verification/rider-terms/accept', {}),
+    },
+
+    browse: {
+      /** FR-CAT-06 */
+      shops: (query?: {
+        category?: string;
+        q?: string;
+        sort?: 'distance' | 'rating' | 'prepTime';
+        openNow?: boolean;
+        limit?: number;
+        cursor?: string;
+      }) => client.get<{ items: BrowseShop[]; nextCursor: string | null }>('/browse/shops', query),
+
+      shop: (listingId: string) => client.get<ShopDetail>(`/browse/shops/${listingId}`),
+
+      items: (q: string) =>
+        client.get<{ query: string; items: ItemSearchResult[] }>('/browse/items', { q }),
+    },
+
+    orders: {
+      /** FR-ORD-03 */
+      quote: (body: OrderRequestBody) => client.post<OrderQuote>('/orders/quote', body),
+
+      /** FR-ORD-04 */
+      place: (body: OrderRequestBody & { paymentMethod: string; expectedTotalMinor: number; studentNote?: string }) =>
+        client.post<{
+          orderId: string;
+          reference: string;
+          status: string;
+          taskId: string;
+          totals: OrderQuote['totals'];
+          message: string;
+        }>('/orders', body),
+
+      mine: (limit?: number, cursor?: string) =>
+        client.get<{ items: MyOrder[]; nextCursor: string | null }>('/orders', { limit, cursor }),
+
+      detail: (orderId: string) => client.get<OrderDetail>(`/orders/${orderId}`),
+
+      /** FR-ORD-05 */
+      cancel: (orderId: string, reason?: string) =>
+        client.post<{ orderId: string; status: string; message: string }>(
+          `/orders/${orderId}/cancel`,
+          { reason },
+        ),
+
+      /** FR-DLV-07 */
+      resolveUnfulfilled: (orderId: string, choice: 'KEEP_WAITING' | 'COLLECT_IN_PERSON' | 'CANCEL') =>
+        client.post<{ orderId: string; choice: string; message: string }>(
+          `/orders/${orderId}/unfulfilled`,
+          { choice },
+        ),
+    },
+
+    rider: {
+      /** FR-WM-08 */
+      status: () => client.get<RiderStatus>('/rider/status'),
+
+      /** FR-WM-01, FR-WM-05 */
+      setWorkMode: (enabled: boolean, latitude?: number, longitude?: number) =>
+        client.post<{ workModeOn: boolean; activeTaskId: string | null; message: string }>(
+          '/rider/work-mode',
+          { enabled, latitude, longitude },
+        ),
+
+      /** FR-WM-03, HTTP fallback for the socket. */
+      ping: (latitude: number, longitude: number) =>
+        client.post<{ ok: boolean }>('/rider/ping', { latitude, longitude }),
+
+      /** FR-DLV-04 */
+      accept: (taskId: string) =>
+        client.post<{
+          taskId: string;
+          status: string;
+          feeMinor: number;
+          pickupLabel: string;
+          dropLabel: string;
+          chatRoomId: string;
+        }>(`/rider/tasks/${taskId}/accept`, {}),
+
+      /** FR-DLV-08 */
+      abandon: (taskId: string, reason: string) =>
+        client.post<{ taskId: string; abandoned: boolean; barred: boolean; message: string }>(
+          `/rider/tasks/${taskId}/abandon`,
+          { reason },
+        ),
+
+      task: (taskId: string) => client.get<ActiveTask>(`/rider/tasks/${taskId}`),
+
+      /** FR-DLV-11 */
+      confirmPickup: (taskId: string, proofImageKey?: string) =>
+        client.post<{ taskId: string; status: string; message: string }>(
+          `/rider/tasks/${taskId}/pickup`,
+          { proofImageKey },
+        ),
+
+      /** FR-DLV-13, FR-DLV-14 */
+      submitHandoverCode: (taskId: string, code: string) =>
+        client.post<{
+          taskId: string;
+          status: string;
+          feeMinor: number;
+          feeLabel: string;
+          settledInCash: boolean;
+          message: string;
+        }>(`/rider/tasks/${taskId}/handover`, { code }),
+    },
+
+    tasks: {
+      /** FR-DLV-12: the requester's side. */
+      handoverCode: (taskId: string) =>
+        client.get<{
+          taskId: string;
+          codeIssuedAt: string | null;
+          codeLength: number;
+          canReissue: boolean;
+          message: string;
+        }>(`/tasks/${taskId}/handover-code`),
+
+      reissueHandoverCode: (taskId: string) =>
+        client.post<{ taskId: string; code: string; message: string }>(
+          `/tasks/${taskId}/handover-code/reissue`,
+          {},
+        ),
+    },
+
+    uploads: {
+      url: (body: { kind: string; contentType: string; sizeBytes: number; originalFilename?: string }) =>
+        client.post<{ uploadUrl: string; key: string; expiresInSeconds: number }>(
+          '/uploads/url',
+          body,
+        ),
     },
 
     health: {

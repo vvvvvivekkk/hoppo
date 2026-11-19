@@ -239,3 +239,257 @@ export interface FlaggedShop {
   lifetimeOrders: number;
   flaggedAt: string;
 }
+
+// ===========================================================================
+// Student and rider shapes
+// ===========================================================================
+
+export interface BrowseShop {
+  listingId: string;
+  shop: { id: string; name: string; category: string; locationType: string };
+  distanceM: number;
+  distanceLabel: string;
+  averageRating: number | null;
+  ratingCount: number;
+  medianPrepMinutes: number | null;
+  itemCount: number;
+  /** FR-CAT-05: a closed shop is shown as closed, not hidden. */
+  isOpen: boolean;
+  closedReason: string | null;
+  opensInMinutes: number | null;
+  closureNote: string | null;
+}
+
+export interface ShopDetail {
+  listingId: string;
+  shop: {
+    id: string;
+    name: string;
+    category: string;
+    locationType: string;
+    address: string;
+    fssaiLicenceNumber: string | null;
+  };
+  distanceM: number;
+  distanceLabel: string;
+  averageRating: number | null;
+  ratingCount: number;
+  isOpen: boolean;
+  closedReason: string | null;
+  opensInMinutes: number | null;
+  closureNote: string | null;
+  hours: { dayOfWeek: number; openMinute: number; closeMinute: number }[];
+  categories: {
+    id: string;
+    name: string;
+    sortOrder: number;
+    items: CatalogItem[];
+  }[];
+}
+
+export interface ItemSearchResult {
+  id: string;
+  name: string;
+  description: string | null;
+  priceMinor: number;
+  prepMinutes: number;
+  imageUrl: string | null;
+  isAvailable: boolean;
+  listingId: string;
+  shop: { id: string; name: string; category: string };
+  distanceM: number;
+  distanceLabel: string;
+  shopIsOpen: boolean;
+}
+
+export interface OrderRequestBody {
+  listingId: string;
+  lines: { catalogItemId: string; quantity: number; note?: string }[];
+  deliveryPointId?: string;
+  dropLandmark?: string;
+  dropLatitude?: number;
+  dropLongitude?: number;
+}
+
+export interface OrderQuote {
+  listingId: string;
+  shop: { id: string; name: string };
+  lines: {
+    catalogItemId: string;
+    name: string;
+    unitPriceMinor: number;
+    quantity: number;
+    lineTotalMinor: number;
+    note: string | null;
+  }[];
+  drop: { deliveryPointId: string | null; label: string; latitude: number; longitude: number };
+  distanceM: number;
+  distanceLabel: string;
+  totals: {
+    itemsSubtotalMinor: number;
+    deliveryFeeMinor: number;
+    platformFeeMinor: number;
+    totalMinor: number;
+    commissionMinor: number;
+    itemsSubtotalLabel: string;
+    deliveryFeeLabel: string;
+    platformFeeLabel: string;
+    totalLabel: string;
+  };
+  estimatedPrepMinutes: number;
+  shopIsOpen: boolean;
+  closedReason: string | null;
+}
+
+export interface MyOrder {
+  id: string;
+  reference: string;
+  status: OrderStatus;
+  totalMinor: number;
+  totalLabel: string;
+  placedAt: string;
+  completedAt: string | null;
+  cancelledAt: string | null;
+  canCancel: boolean;
+  shopListing: { id: string; shop: { id: string; name: string } };
+  items: { nameSnapshot: string; quantity: number }[];
+  task: { id: string; status: TaskStatus; riderId: string | null } | null;
+}
+
+export interface OrderDetail {
+  id: string;
+  reference: string;
+  status: OrderStatus;
+  itemsSubtotalMinor: number;
+  deliveryFeeMinor: number;
+  platformFeeMinor: number;
+  totalMinor: number;
+  totalLabel: string;
+  paymentMethod: string;
+  paymentStatus: string;
+  dropLandmark: string | null;
+  studentNote: string | null;
+  statedPrepMinutes: number | null;
+  expectedReadyAt: string | null;
+  placedAt: string;
+  shopAcceptedAt: string | null;
+  readyAt: string | null;
+  pickedUpAt: string | null;
+  deliveredAt: string | null;
+  completedAt: string | null;
+  cancelledAt: string | null;
+  cancelledBy: string | null;
+  cancelledReason: string | null;
+  canCancel: boolean;
+  shopListing: { id: string; shop: { id: string; name: string; ownerMobile: string } };
+  items: {
+    nameSnapshot: string;
+    unitPriceMinor: number;
+    quantity: number;
+    lineTotalMinor: number;
+    note: string | null;
+  }[];
+  task: {
+    id: string;
+    status: TaskStatus;
+    feeMinor: number;
+    broadcastRound: number;
+    offerExpiresAt: string | null;
+    assignedAt: string | null;
+    pickedUpAt: string | null;
+  } | null;
+  /** FR-TRST-02 and FR-PRIV-03: rating and count, never the mobile number. */
+  rider: { id: string; name: string; averageRating: number | null; completedTasks: number } | null;
+  /** FR-DLV-12: whether a handover code is live, for the requester only. */
+  handoverCodeAvailable: boolean;
+}
+
+export interface RiderStatus {
+  workModeOn: boolean;
+  workModeOnAt: string | null;
+  lastPingAt: string | null;
+  canEnable: {
+    verified: boolean;
+    termsAccepted: boolean;
+    termsVersionCurrent: boolean;
+    notBarred: boolean;
+  };
+  barredUntil: string | null;
+  pingIntervalSeconds: number;
+  idleTimeoutMinutes: number;
+  activeTask: ActiveTask | null;
+  today: { completedTasks: number; earningsMinor: number; earningsLabel: string };
+  lifetime: {
+    completedTasks: number;
+    earningsMinor: number;
+    earningsLabel: string;
+    acceptanceRate: number | null;
+    abandonedTasks: number;
+    averageRating: number | null;
+  };
+}
+
+export interface ActiveTask {
+  id: string;
+  type: string;
+  status: TaskStatus;
+  riderId: string | null;
+  pickupLabel: string;
+  pickupLatitude: number;
+  pickupLongitude: number;
+  dropLabel: string;
+  dropLatitude: number;
+  dropLongitude: number;
+  distanceM: number;
+  feeMinor: number;
+  feeLabel: string;
+  description: string | null;
+  collectionRef: string | null;
+  reimbursementMinor: number | null;
+  otpAttempts: number;
+  assignedAt: string | null;
+  pickedUpAt: string | null;
+  chatRoom: { id: string; isArchived: boolean } | null;
+  order: {
+    id: string;
+    reference: string;
+    status: OrderStatus;
+    paymentMethod: string;
+    totalMinor: number;
+    itemsSubtotalMinor: number;
+    expectedReadyAt: string | null;
+    studentNote: string | null;
+    items: { nameSnapshot: string; quantity: number }[];
+    student: { id: string; name: string };
+    shopListing: { shop: { name: string; ownerMobile: string; address: string } };
+  } | null;
+  /** ADR-003: enabled only once the shop has marked the order ready. */
+  canConfirmPickup: boolean;
+  canAbandon: boolean;
+  awaitingHandoverCode: boolean;
+  /** ADR-006: what the rider pays the shop and collects at the door, in cash. */
+  cashToPayShopMinor: number;
+  cashToCollectMinor: number;
+}
+
+/** The task offer pushed over the socket (FR-DLV-03). */
+export interface TaskOffer {
+  taskId: string;
+  type: string;
+  round: number;
+  pickupLabel: string;
+  pickupLatitude: number;
+  pickupLongitude: number;
+  dropLabel: string;
+  dropLatitude: number;
+  dropLongitude: number;
+  distanceM: number;
+  feeMinor: number;
+  description: string | null;
+  reimbursementMinor: number | null;
+  orderReference: string | null;
+  shopName: string | null;
+  expectedReadyAt: string | null;
+  expiresAt: string;
+  acceptanceWindowSeconds: number;
+}

@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "Hoppo",
+    "slug": "hoppo",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "hoppo",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "app.hoppo.student",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Hoppo uses your location to show nearby task offers while you are in work mode, and to match you with pickups close to you.",
+        "UIBackgroundModes": ["remote-notification"]
+      }
+    },
+    "android": {
+      "package": "app.hoppo.student",
+      "adaptiveIcon": { "backgroundColor": "#0F766E" },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "CAMERA",
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "web": { "bundler": "metro", "output": "single" },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Hoppo uses your location to send you task offers near you while you are in work mode."
+        }
+      ]
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}
