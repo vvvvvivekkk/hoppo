@@ -1,0 +1,12 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 10 blocks post-install scripts by default. These four genuinely need
+# them: Prisma downloads its query engine binary, argon2 compiles a native
+# addon. Everything else stays blocked.
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - prisma
+  - argon2

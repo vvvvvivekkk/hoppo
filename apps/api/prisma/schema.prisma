@@ -1,0 +1,1422 @@
+// Hoppo data model
+// ---------------------------------------------------------------------------
+// Every table that holds college-scoped data carries `collegeId`. Constraint
+// C-1 in the SRS says no query may ever return another college's rows, and
+// the tenant guard in the API enforces that on every request. The column
+// exists here so the guard has something to filter on.
+//
+// Money is stored as integer minor units (paise), never as a float. 100 = ₹1.
+// FR-PAY-07. Floating point cannot represent 0.1 exactly, so money in a float
+// column drifts: add ₹0.10 ten times and you do not get ₹1.00.
+//
+// Table and column names are snake_case in the database (via @@map / @map)
+// and camelCase in TypeScript, which is the convention each side expects.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+  // Lets the datasource block declare the PostGIS extension, so
+  // `prisma migrate` creates it rather than us remembering to by hand.
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis, pg_trgm]
+}
+
+// ===========================================================================
+// ENUMS
+// ===========================================================================
+
+enum CollegeStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum UserRole {
+  STUDENT
+  SHOP_OWNER
+  SHOP_STAFF
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+/// Lifecycle of a student's identity verification (FR-SVER-01 .. FR-SVER-07).
+enum VerificationStatus {
+  UNSUBMITTED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Controlled list required by FR-SVER-05. An administrator must pick one of
+/// these; free text is optional and additional, never a substitute.
+enum RejectionReason {
+  ID_CARD_ILLEGIBLE
+  ID_CARD_EXPIRED
+  NAME_MISMATCH
+  ROLL_NUMBER_MISMATCH
+  NOT_ENROLLED_AT_COLLEGE
+  DOCUMENT_INCOMPLETE
+  SUSPECTED_FORGERY
+  DUPLICATE_ACCOUNT
+  ADDRESS_OUTSIDE_RADIUS
+  LICENCE_INVALID
+  OTHER
+}
+
+/// Section 11 of the SRS. We deliberately do not store full government ID
+/// numbers or images — only the type, the last four characters, and the
+/// decision. AADHAAR_MASKED exists only for the case where a college
+/// mandates it (FR-ID-03) and is not the default path.
+enum GovtIdType {
+  DRIVING_LICENCE
+  VOTER_ID
+  PASSPORT
+  AADHAAR_MASKED
+}
+
+enum ShopStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  REJECTED
+}
+
+enum LocationType {
+  ON_CAMPUS
+  OFF_CAMPUS
+}
+
+enum ShopDocumentType {
+  ESTABLISHMENT_LICENCE
+  GSTIN_CERTIFICATE
+  OWNER_PHOTO_ID
+  FRONTAGE_PHOTO
+  CAMPUS_PERMIT
+  FSSAI_LICENCE
+}
+
+/// The order's own lifecycle. Distinct from TaskStatus — see the note on the
+/// Task model about why these are two separate state machines.
+enum OrderStatus {
+  PLACED
+  SHOP_ACCEPTED
+  PREPARING
+  READY
+  PICKED_UP
+  DELIVERED
+  COMPLETED
+  CANCELLED
+}
+
+enum OrderCancelledBy {
+  STUDENT
+  SHOP
+  SYSTEM
+  ADMIN
+}
+
+enum TaskType {
+  SHOP_ORDER
+  PARCEL_PICKUP
+  PEER_ERRAND
+}
+
+/// Appendix A of the SRS is the authority for the transitions between these.
+enum TaskStatus {
+  CREATED
+  BROADCASTING
+  ASSIGNED
+  PICKED_UP
+  DELIVERED
+  COMPLETED
+  UNFULFILLED
+  ESCALATED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  ONLINE
+  WALLET
+}
+
+enum PaymentStatus {
+  NOT_REQUIRED
+  PENDING
+  HELD
+  CAPTURED
+  REFUNDED
+  FAILED
+}
+
+enum WalletDirection {
+  CREDIT
+  DEBIT
+}
+
+enum WalletEntryType {
+  DELIVERY_FEE_EARNED
+  ERRAND_REIMBURSEMENT
+  ORDER_HOLD
+  ORDER_CAPTURE
+  ORDER_RELEASE
+  WITHDRAWAL
+  ADJUSTMENT
+}
+
+enum WithdrawalStatus {
+  REQUESTED
+  APPROVED
+  PAID
+  REJECTED
+}
+
+enum ChatRoomType {
+  TASK
+  DIRECT
+  GROUP
+}
+
+enum PostCategory {
+  NOTES_RESOURCES
+  INTERNSHIPS_JOBS
+  LOST_FOUND
+  BUY_SELL
+  ANNOUNCEMENTS
+  GENERAL
+}
+
+enum PostStatus {
+  PUBLISHED
+  HIDDEN_PENDING_REVIEW
+  REMOVED
+}
+
+enum ReportTargetType {
+  POST
+  COMMENT
+  MESSAGE
+  USER
+}
+
+enum ReportStatus {
+  OPEN
+  ACTIONED
+  DISMISSED
+}
+
+enum OtpPurpose {
+  PHONE_VERIFY
+  EMAIL_VERIFY
+  PASSWORD_RESET
+  SHOP_LOGIN
+}
+
+enum BroadcastOutcome {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+enum DevicePlatform {
+  ANDROID
+  IOS
+  WEB
+}
+
+// ===========================================================================
+// TENANCY
+// ===========================================================================
+
+/// One college. The tenant boundary for everything else in the system.
+model College {
+  id        String        @id @default(uuid())
+  name      String
+  shortName String?       @map("short_name")
+  address   String
+  city      String
+  state     String
+  /// Decimal degrees, WGS 84. Used as the centre point for radius validation.
+  latitude  Float
+  longitude Float
+  /// FR-AUTH-03: when set, only email addresses on this domain may register.
+  emailDomain String?     @map("email_domain")
+  contactName  String?    @map("contact_name")
+  contactPhone String?    @map("contact_phone")
+  contactEmail String?    @map("contact_email")
+  status    CollegeStatus @default(ACTIVE)
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+
+  config         CollegeConfig?
+  feeBands       FeeBand[]
+  deliveryPoints DeliveryPoint[]
+  users          User[]
+  shopListings   ShopListing[]
+  orders         Order[]
+  tasks          Task[]
+  chatRooms      ChatRoom[]
+  posts          Post[]
+
+  @@index([status])
+  @@map("college")
+}
+
+/// Everything an administrator can tune per college (FR-ADM-03, NFR-M-01).
+/// These live in the database rather than in code so that changing the
+/// delivery fee does not require a deployment.
+model CollegeConfig {
+  collegeId String @id @map("college_id")
+
+  /// FR-TEN-01 default 3 km, FR-TEN-04 permitted range 1 km to 5 km.
+  serviceableRadiusM Int @default(3000) @map("serviceable_radius_m")
+
+  /// FR-DLV-03: how long a rider has to accept an offer, in seconds.
+  acceptanceWindowSeconds Int @default(60) @map("acceptance_window_seconds")
+
+  /// FR-DLV-06: how many times to re-broadcast before giving up.
+  maxBroadcastRounds Int @default(3) @map("max_broadcast_rounds")
+
+  /// FR-DLV-02: how close a rider must be to the pickup point, round 1.
+  initialProximityM Int @default(1500) @map("initial_proximity_m")
+
+  /// FR-DLV-06: how much further to look on each subsequent round.
+  proximityIncrementM Int @default(1000) @map("proximity_increment_m")
+
+  /// FR-DLV-06: fee bump per re-broadcast round, in minor units.
+  feeIncrementMinor Int @default(500) @map("fee_increment_minor")
+
+  /// FR-DLV-01: broadcast once the order's remaining preparation time drops
+  /// below this, so the rider arrives close to the ready time rather than
+  /// standing at the counter for ten minutes.
+  dispatchLeadMinutes Int @default(7) @map("dispatch_lead_minutes")
+
+  /// FR-WM-06: auto-disable work mode after this long with no ping.
+  workModeIdleTimeoutMinutes Int @default(120) @map("work_mode_idle_timeout_minutes")
+
+  /// FR-WM-03: how often a rider's device reports its position.
+  riderPingIntervalSeconds Int @default(15) @map("rider_ping_interval_seconds")
+
+  /// FR-SHP-02: how long a shop has to accept an order, in seconds.
+  shopAcceptWindowSeconds Int @default(300) @map("shop_accept_window_seconds")
+
+  /// FR-DLV-14: OTP attempts before the task escalates to an administrator.
+  maxOtpAttempts Int @default(5) @map("max_otp_attempts")
+
+  /// FR-ORD-03: optional platform fee, in minor units.
+  platformFeeMinor Int @default(0) @map("platform_fee_minor")
+
+  /// Commission retained from the item subtotal, in basis points.
+  /// 1000 = 10%. Basis points avoid storing a percentage as a float.
+  commissionBps Int @default(0) @map("commission_bps")
+
+  /// FR-PAY-05: minimum wallet balance before a withdrawal may be requested.
+  minWithdrawalMinor Int @default(10000) @map("min_withdrawal_minor")
+
+  /// FR-SVER-06: resubmission throttle.
+  maxVerificationSubmissions Int @default(3) @map("max_verification_submissions")
+  verificationWindowDays     Int @default(7) @map("verification_window_days")
+
+  /// FR-TRST-05: automatic work-mode ban after repeated abandonment.
+  abandonmentBanThreshold    Int @default(3) @map("abandonment_ban_threshold")
+  abandonmentWindowDays      Int @default(7) @map("abandonment_window_days")
+  abandonmentBanHours        Int @default(48) @map("abandonment_ban_hours")
+
+  /// FR-CHAT-08 / FR-DLV-15: how long archived task chat history is kept.
+  chatRetentionDays Int @default(180) @map("chat_retention_days")
+
+  /// FR-COMM-07: report count at which content auto-hides pending review.
+  reportHideThreshold Int @default(5) @map("report_hide_threshold")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college College @relation(fields: [collegeId], references: [id], onDelete: Cascade)
+
+  @@map("college_config")
+}
+
+/// FR-ORD-10: the delivery fee is a base amount plus a distance band, both
+/// configured per college. A task's distance is matched against these rows.
+model FeeBand {
+  id         String @id @default(uuid())
+  collegeId  String @map("college_id")
+  /// Inclusive lower bound, in metres.
+  minDistanceM Int  @map("min_distance_m")
+  /// Exclusive upper bound, in metres. Null means "and everything beyond".
+  maxDistanceM Int? @map("max_distance_m")
+  feeMinor     Int  @map("fee_minor")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  college College @relation(fields: [collegeId], references: [id], onDelete: Cascade)
+
+  @@unique([collegeId, minDistanceM])
+  @@index([collegeId])
+  @@map("fee_band")
+}
+
+/// FR-ORD-02 / FR-ADM-03: the campus locations a student may choose as a drop
+/// point — hostel blocks, departments, the library, the gates.
+model DeliveryPoint {
+  id        String  @id @default(uuid())
+  collegeId String  @map("college_id")
+  name      String
+  /// Free-text hint shown under the name, e.g. "main entrance, near the gate".
+  description String?
+  latitude  Float
+  longitude Float
+  isActive  Boolean @default(true) @map("is_active")
+  sortOrder Int     @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college College @relation(fields: [collegeId], references: [id], onDelete: Cascade)
+
+  @@index([collegeId, isActive])
+  @@map("delivery_point")
+}
+
+// ===========================================================================
+// IDENTITY
+// ===========================================================================
+
+model User {
+  id   String @id @default(uuid())
+  /// Nullable on purpose: a SUPER_ADMIN belongs to no single college.
+  /// Every other role must have one, which a database check constraint
+  /// enforces (see the migration).
+  collegeId String? @map("college_id")
+  role      UserRole
+  status     UserStatus @default(ACTIVE)
+  name       String
+  /// E.164, e.g. +919346375528. Unique across the platform (FR-AUTH-04).
+  mobile     String     @unique
+  email      String     @unique
+  /// Argon2id. NFR-S-02 requires a memory-hard algorithm, which rules out
+  /// bcrypt-with-low-rounds and definitely rules out SHA-256.
+  passwordHash String   @map("password_hash")
+  avatarUrl    String?  @map("avatar_url")
+
+  mobileVerifiedAt DateTime? @map("mobile_verified_at")
+  emailVerifiedAt  DateTime? @map("email_verified_at")
+
+  /// FR-AUTH-06 lockout state.
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until")
+  lastLoginAt      DateTime? @map("last_login_at")
+
+  /// FR-SVER-08: set when an administrator suspends the account.
+  suspendedAt     DateTime? @map("suspended_at")
+  suspendedReason String?   @map("suspended_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college College? @relation(fields: [collegeId], references: [id])
+
+  studentProfile          StudentProfile?
+  riderState              RiderState?
+  verificationSubmissions VerificationSubmission[]
+  refreshTokens           RefreshToken[]
+  deviceTokens            DeviceToken[]
+  notificationPrefs       NotificationPreference[]
+  shopStaffOf             ShopStaff[]
+
+  orders            Order[]
+  requestedTasks    Task[]              @relation("TaskRequester")
+  ridingTasks       Task[]              @relation("TaskRider")
+  walletEntries     WalletEntry[]
+  withdrawals       WithdrawalRequest[]
+  chatMemberships   ChatMember[]
+  sentMessages      Message[]
+  messageReceipts   MessageReceipt[]
+  createdChatRooms  ChatRoom[]          @relation("ChatRoomCreator")
+  posts             Post[]
+  comments          Comment[]
+  postVotes         PostVote[]
+  savedPosts        SavedPost[]
+  ratingsGiven      Rating[]            @relation("RatingRater")
+  ratingsReceived   Rating[]            @relation("RatingRatee")
+  reportsFiled      Report[]            @relation("ReportReporter")
+  reportsHandled    Report[]            @relation("ReportHandler")
+  blocksMade        BlockedUser[]       @relation("BlockOwner")
+  blocksAgainst     BlockedUser[]       @relation("BlockTarget")
+  auditEntries      AuditLog[]          @relation("AuditActor")
+  verificationsDecided VerificationSubmission[] @relation("VerificationDecider")
+  shopListingsApproved ShopListing[]    @relation("ShopListingApprover")
+  withdrawalsHandled   WithdrawalRequest[] @relation("WithdrawalHandler")
+  riderReliability     RiderReliability?
+
+  @@index([collegeId, role, status])
+  @@index([collegeId, status])
+  @@map("user")
+}
+
+/// The college-specific half of a student's identity.
+model StudentProfile {
+  userId String @id @map("user_id")
+
+  rollNumber String  @map("roll_number")
+  department String
+  yearOfStudy Int    @map("year_of_study")
+
+  /// Private bucket. Never exposed through a student- or shop-facing
+  /// endpoint (C-3, NFR-S-03).
+  idCardUrl String? @map("id_card_url")
+
+  /// Section 11: type and last four characters only. Never the full number,
+  /// never the image after the decision is made.
+  govtIdType       GovtIdType? @map("govt_id_type")
+  govtIdLast4      String?     @map("govt_id_last4")
+  govtIdVerifiedAt DateTime?   @map("govt_id_verified_at")
+
+  verificationStatus VerificationStatus @default(UNSUBMITTED) @map("verification_status")
+  verifiedAt         DateTime?          @map("verified_at")
+  verifiedByUserId   String?            @map("verified_by_user_id")
+
+  /// FR-WM-02: rider terms acceptance, recorded with version and timestamp.
+  riderTermsVersion    String?   @map("rider_terms_version")
+  riderTermsAcceptedAt DateTime? @map("rider_terms_accepted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([verificationStatus])
+  @@map("student_profile")
+}
+
+/// FR-SVER-06 limits a student to three submissions in any seven-day period,
+/// which means submissions need their own history table rather than a single
+/// status field on the profile.
+model VerificationSubmission {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  collegeId String @map("college_id")
+
+  rollNumber  String @map("roll_number")
+  department  String
+  yearOfStudy Int    @map("year_of_study")
+  idCardUrl   String @map("id_card_url")
+
+  govtIdType  GovtIdType? @map("govt_id_type")
+  govtIdLast4 String?     @map("govt_id_last4")
+  /// FR-ID-03: a temporary pointer to the uploaded image, cleared within 24
+  /// hours of the decision. A scheduled job nulls this and deletes the object.
+  govtIdImageUrl       String?   @map("govt_id_image_url")
+  govtIdImageExpiresAt DateTime? @map("govt_id_image_expires_at")
+
+  /// FR-ID-03: explicit consent, with the purpose statement shown at the time.
+  consentGivenAt    DateTime? @map("consent_given_at")
+  consentPurposeText String?  @map("consent_purpose_text")
+
+  status           VerificationStatus @default(PENDING)
+  decidedByUserId  String?            @map("decided_by_user_id")
+  decidedAt        DateTime?          @map("decided_at")
+  rejectionReason  RejectionReason?   @map("rejection_reason")
+  rejectionNote    String?            @map("rejection_note")
+
+  submittedAt DateTime @default(now()) @map("submitted_at")
+
+  user      User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  decidedBy User? @relation("VerificationDecider", fields: [decidedByUserId], references: [id])
+
+  @@index([collegeId, status, submittedAt])
+  @@index([userId, submittedAt])
+  @@map("verification_submission")
+}
+
+/// A rider's live availability. One row per student, created lazily the first
+/// time they turn on work mode.
+///
+/// The authoritative copy of a rider's *position* lives in Redis as a GEO set,
+/// refreshed every ping. This table holds the last known value for audit and
+/// for the admin console, not for proximity search — hitting Postgres every
+/// fifteen seconds per rider would not scale.
+model RiderState {
+  userId String @id @map("user_id")
+
+  workModeOn Boolean   @default(false) @map("work_mode_on")
+  workModeOnAt DateTime? @map("work_mode_on_at")
+
+  lastLatitude  Float?    @map("last_latitude")
+  lastLongitude Float?    @map("last_longitude")
+  lastPingAt    DateTime? @map("last_ping_at")
+
+  /// FR-WM-07: at most one active task per rider in this release. The unique
+  /// constraint here is what makes that structurally true rather than merely
+  /// checked in code.
+  activeTaskId String? @unique @map("active_task_id")
+
+  /// FR-TRST-05: set when automatically barred for repeated abandonment.
+  barredUntil DateTime? @map("barred_until")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activeTask Task? @relation("RiderActiveTask", fields: [activeTaskId], references: [id])
+
+  @@index([workModeOn, lastPingAt])
+  @@map("rider_state")
+}
+
+/// FR-TRST-03: derived metrics, recomputed on task completion rather than
+/// aggregated on every read.
+model RiderReliability {
+  userId String @id @map("user_id")
+
+  tasksOffered   Int @default(0) @map("tasks_offered")
+  tasksAccepted  Int @default(0) @map("tasks_accepted")
+  tasksCompleted Int @default(0) @map("tasks_completed")
+  tasksAbandoned Int @default(0) @map("tasks_abandoned")
+
+  /// Basis points: 9500 = 95.00%. Integer, so no float drift.
+  acceptanceRateBps  Int @default(0) @map("acceptance_rate_bps")
+  abandonmentRateBps Int @default(0) @map("abandonment_rate_bps")
+
+  avgDeliverySeconds Int? @map("avg_delivery_seconds")
+
+  /// Sum and count rather than a stored average, so a new rating is a cheap
+  /// increment and the average is always exact.
+  ratingSum   Int @default(0) @map("rating_sum")
+  ratingCount Int @default(0) @map("rating_count")
+
+  /// FR-TRST-04: raised when the average drops below the configured floor.
+  flaggedForReviewAt DateTime? @map("flagged_for_review_at")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("rider_reliability")
+}
+
+/// FR-AUTH-05: refresh tokens are rows so that logout and "sign out
+/// everywhere" can actually revoke them. A stateless JWT cannot be revoked.
+model RefreshToken {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  /// SHA-256 of the token. The raw token is never stored, same reasoning as
+  /// passwords: a leaked table should not be a leaked session.
+  tokenHash String   @unique @map("token_hash")
+  /// Groups tokens issued to one device, so rotation can revoke the chain.
+  familyId  String   @map("family_id")
+  userAgent String?  @map("user_agent")
+  ipAddress String?  @map("ip_address")
+  expiresAt DateTime @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@map("refresh_token")
+}
+
+/// FR-AUTH-02 / FR-AUTH-07: one-time passwords for phone and email
+/// verification and for password reset. NFR-S-04: stored hashed, expiring,
+/// single-use.
+model OtpChallenge {
+  id        String     @id @default(uuid())
+  purpose   OtpPurpose
+  /// Mobile number or email address, depending on purpose.
+  recipient String
+  codeHash  String     @map("code_hash")
+  attempts  Int        @default(0)
+  maxAttempts Int      @default(5) @map("max_attempts")
+  expiresAt DateTime   @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  @@index([recipient, purpose, createdAt])
+  @@map("otp_challenge")
+}
+
+/// FR-NOTF-01: push tokens, one row per device.
+model DeviceToken {
+  id       String         @id @default(uuid())
+  userId   String         @map("user_id")
+  platform DevicePlatform
+  token    String         @unique
+  lastSeenAt DateTime     @default(now()) @map("last_seen_at")
+  createdAt  DateTime     @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_token")
+}
+
+/// FR-NOTF-03: per-category opt-outs. Task offers cannot be disabled while
+/// work mode is on, which the notification service enforces.
+model NotificationPreference {
+  userId   String  @map("user_id")
+  category String
+  pushEnabled  Boolean @default(true) @map("push_enabled")
+  smsEnabled   Boolean @default(true) @map("sms_enabled")
+  emailEnabled Boolean @default(true) @map("email_enabled")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, category])
+  @@map("notification_preference")
+}
+
+// ===========================================================================
+// SHOPS
+// ===========================================================================
+
+/// The merchant itself — one row however many colleges it serves.
+model Shop {
+  id        String  @id @default(uuid())
+  name      String
+  category  String
+  ownerName String  @map("owner_name")
+  ownerMobile String @map("owner_mobile")
+  ownerEmail  String @map("owner_email")
+
+  address String
+  city    String
+  state   String
+  pincode String?
+  latitude  Float
+  longitude Float
+  /// True once the owner has dragged the map pin rather than accepting the
+  /// geocoded guess (FR-SHOP-04). Useful when reviewing a borderline distance.
+  pinAdjusted Boolean @default(false) @map("pin_adjusted")
+
+  locationType LocationType @map("location_type")
+
+  /// Captured when the shop sells prepared food. A delivery platform carrying
+  /// prepared food is an e-commerce food business operator under FSSAI rules,
+  /// and each shop must have its own licence on file.
+  fssaiLicenceNumber String?   @map("fssai_licence_number")
+  fssaiExpiresAt     DateTime? @map("fssai_expires_at")
+  gstin              String?
+
+  /// Razorpay Route sub-merchant id, so payments split at the gateway and
+  /// settle to the shop directly. Keeping customer money in our own account
+  /// and paying shops later would make us a payment intermediary, which in
+  /// India needs RBI payment-aggregator authorisation.
+  razorpayAccountId String? @map("razorpay_account_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  listings  ShopListing[]
+  documents ShopDocument[]
+  staff     ShopStaff[]
+
+  @@index([locationType])
+  @@map("shop")
+}
+
+/// FR-SHOP-13: a shop may attach to more than one college when it lies within
+/// the radius of each, and must keep a separate catalog and order queue per
+/// college. That requirement is only expressible with a join table — the
+/// distance, the approval decision, the catalog, the hours and the orders all
+/// belong to the *pairing* of a shop and a college, not to the shop alone.
+model ShopListing {
+  id        String @id @default(uuid())
+  shopId    String @map("shop_id")
+  collegeId String @map("college_id")
+
+  /// Geodesic distance, computed once at registration with PostGIS
+  /// ST_Distance over geography, which measures over the curved surface of
+  /// the earth. Straight-line maths on latitude and longitude is wrong by
+  /// enough to matter at a 3 km threshold (C-2, FR-SHOP-05).
+  distanceFromCollegeM Int @map("distance_from_college_m")
+
+  status ShopStatus @default(PENDING_VERIFICATION)
+
+  approvedByUserId String?          @map("approved_by_user_id")
+  approvedAt       DateTime?        @map("approved_at")
+  rejectionReason  RejectionReason? @map("rejection_reason")
+  rejectionNote    String?          @map("rejection_note")
+
+  /// FR-TEN-05: when a college shrinks its radius, shops already approved
+  /// under the old radius stay active but are flagged for review.
+  flaggedForRadiusReviewAt DateTime? @map("flagged_for_radius_review_at")
+
+  /// FR-CAT-04: a temporary closure that expires on its own.
+  temporarilyClosedUntil DateTime? @map("temporarily_closed_until")
+  closureNote            String?   @map("closure_note")
+
+  /// Denormalised rating aggregate, for sorting shop lists cheaply.
+  ratingSum   Int @default(0) @map("rating_sum")
+  ratingCount Int @default(0) @map("rating_count")
+
+  submittedAt DateTime @default(now()) @map("submitted_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  shop       Shop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  college    College @relation(fields: [collegeId], references: [id], onDelete: Cascade)
+  approvedBy User?   @relation("ShopListingApprover", fields: [approvedByUserId], references: [id])
+
+  categories CatalogCategory[]
+  items      CatalogItem[]
+  hours      ShopHours[]
+  orders     Order[]
+
+  @@unique([shopId, collegeId])
+  @@index([collegeId, status])
+  @@index([collegeId, status, distanceFromCollegeM])
+  @@map("shop_listing")
+}
+
+/// FR-SHOP-08: supporting documents. Stored in the private bucket, encrypted,
+/// reachable only through an authenticated administrator endpoint.
+model ShopDocument {
+  id     String           @id @default(uuid())
+  shopId String           @map("shop_id")
+  docType ShopDocumentType @map("doc_type")
+  fileUrl String           @map("file_url")
+  /// Original filename, for the admin preview label only.
+  fileName String?         @map("file_name")
+  mimeType String?         @map("mime_type")
+  sizeBytes Int?           @map("size_bytes")
+  uploadedAt DateTime      @default(now()) @map("uploaded_at")
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, docType])
+  @@map("shop_document")
+}
+
+/// Who may operate a shop's dashboard.
+model ShopStaff {
+  shopId String   @map("shop_id")
+  userId String   @map("user_id")
+  isOwner Boolean @default(false) @map("is_owner")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([shopId, userId])
+  @@index([userId])
+  @@map("shop_staff")
+}
+
+/// FR-CAT-04: opening hours per day of the week. Several rows per day are
+/// allowed, which is how a shop closed for an afternoon break is expressed.
+model ShopHours {
+  id            String @id @default(uuid())
+  shopListingId String @map("shop_listing_id")
+  /// 0 = Sunday .. 6 = Saturday
+  dayOfWeek Int    @map("day_of_week")
+  /// Minutes from midnight, local time. 540 = 09:00. Storing minutes rather
+  /// than a time string makes "is it open now" a plain integer comparison.
+  openMinute  Int @map("open_minute")
+  closeMinute Int @map("close_minute")
+
+  shopListing ShopListing @relation(fields: [shopListingId], references: [id], onDelete: Cascade)
+
+  @@index([shopListingId, dayOfWeek])
+  @@map("shop_hours")
+}
+
+/// FR-CAT-01: categories are per listing, so a shop can present a different
+/// menu to different colleges.
+model CatalogCategory {
+  id            String @id @default(uuid())
+  shopListingId String @map("shop_listing_id")
+  name          String
+  sortOrder     Int    @default(0) @map("sort_order")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  shopListing ShopListing   @relation(fields: [shopListingId], references: [id], onDelete: Cascade)
+  items       CatalogItem[]
+
+  @@unique([shopListingId, name])
+  @@index([shopListingId])
+  @@map("catalog_category")
+}
+
+model CatalogItem {
+  id            String  @id @default(uuid())
+  shopListingId String  @map("shop_listing_id")
+  categoryId    String? @map("category_id")
+
+  name        String
+  description String?
+  priceMinor  Int     @map("price_minor")
+  prepMinutes Int     @default(10) @map("prep_minutes")
+  imageUrl    String? @map("image_url")
+
+  /// FR-CAT-03: hidden from students without being deleted, so that order
+  /// history keeps pointing at a real row.
+  isAvailable Boolean @default(true) @map("is_available")
+  isDeleted   Boolean @default(false) @map("is_deleted")
+
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  shopListing ShopListing      @relation(fields: [shopListingId], references: [id], onDelete: Cascade)
+  category    CatalogCategory? @relation(fields: [categoryId], references: [id])
+  orderItems  OrderItem[]
+
+  @@index([shopListingId, isAvailable, isDeleted])
+  @@index([categoryId])
+  /// Trigram index for FR-CAT-06 item search. A trigram index stores
+  /// three-character slices of the text, which is what lets a
+  /// `LIKE '%paneer%'` search use an index instead of reading every row.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("catalog_item")
+}
+
+// ===========================================================================
+// ORDERS AND TASKS
+// ===========================================================================
+
+model Order {
+  id        String @id @default(uuid())
+  collegeId String @map("college_id")
+  /// Short human-readable reference shown to students and shops, e.g. HP-7F3K2.
+  reference String @unique
+  studentId String @map("student_id")
+  shopListingId String @map("shop_listing_id")
+
+  status OrderStatus @default(PLACED)
+
+  itemsSubtotalMinor Int @map("items_subtotal_minor")
+  deliveryFeeMinor   Int @map("delivery_fee_minor")
+  platformFeeMinor   Int @default(0) @map("platform_fee_minor")
+  totalMinor         Int @map("total_minor")
+  /// Commission retained from the shop's share, recorded at placement so a
+  /// later rate change does not rewrite history.
+  commissionMinor    Int @default(0) @map("commission_minor")
+
+  paymentMethod PaymentMethod @map("payment_method")
+  paymentStatus PaymentStatus @default(PENDING) @map("payment_status")
+  paymentRef    String?       @map("payment_ref")
+
+  /// Either a configured campus point or a free-text landmark (FR-ORD-02).
+  deliveryPointId   String? @map("delivery_point_id")
+  dropLandmark      String? @map("drop_landmark")
+  dropLatitude      Float?  @map("drop_latitude")
+  dropLongitude     Float?  @map("drop_longitude")
+  studentNote       String? @map("student_note")
+
+  /// FR-SHP-02: the shop may revise the stated preparation time on acceptance.
+  statedPrepMinutes Int?      @map("stated_prep_minutes")
+  expectedReadyAt   DateTime? @map("expected_ready_at")
+
+  placedAt      DateTime  @default(now()) @map("placed_at")
+  shopAcceptedAt DateTime? @map("shop_accepted_at")
+  readyAt       DateTime? @map("ready_at")
+  pickedUpAt    DateTime? @map("picked_up_at")
+  deliveredAt   DateTime? @map("delivered_at")
+  completedAt   DateTime? @map("completed_at")
+
+  cancelledAt     DateTime?         @map("cancelled_at")
+  cancelledBy     OrderCancelledBy? @map("cancelled_by")
+  cancelledReason String?           @map("cancelled_reason")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college     College     @relation(fields: [collegeId], references: [id])
+  student     User        @relation(fields: [studentId], references: [id])
+  shopListing ShopListing @relation(fields: [shopListingId], references: [id])
+
+  items OrderItem[]
+  task  Task?
+
+  @@index([collegeId, status, placedAt])
+  @@index([shopListingId, status, placedAt])
+  @@index([studentId, placedAt])
+  @@map("order")
+}
+
+/// Line items snapshot the name and price at the time of ordering, so that a
+/// later price change does not retroactively alter an old receipt.
+model OrderItem {
+  id            String  @id @default(uuid())
+  orderId       String  @map("order_id")
+  catalogItemId String? @map("catalog_item_id")
+
+  nameSnapshot   String @map("name_snapshot")
+  unitPriceMinor Int    @map("unit_price_minor")
+  quantity       Int
+  lineTotalMinor Int    @map("line_total_minor")
+  note           String?
+
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  catalogItem CatalogItem? @relation(fields: [catalogItemId], references: [id])
+
+  @@index([orderId])
+  @@map("order_item")
+}
+
+/// A deliverable job.
+///
+/// Why Order and Task are separate state machines: an order is a commercial
+/// document between a student and a shop, and a task is a physical movement
+/// job offered to riders. A PARCEL_PICKUP has a task and no order at all. The
+/// two machines touch at exactly one point — pickup — and the rule there is:
+/// the shop's confirmation *unlocks* the rider's button, and only the rider's
+/// tap writes pickedUpAt on both rows, inside one transaction. Without that
+/// rule, FR-SHP-06 and FR-DLV-11 both claim to own the same transition and
+/// the two rows drift apart.
+model Task {
+  id        String   @id @default(uuid())
+  collegeId String   @map("college_id")
+  type      TaskType
+  status    TaskStatus @default(CREATED)
+
+  /// Set only for SHOP_ORDER tasks (FR-ORD-09).
+  orderId String? @unique @map("order_id")
+
+  requesterId String  @map("requester_id")
+  /// Null until a rider wins the task. This column is the concurrency control
+  /// for FR-DLV-04: assignment is a single conditional UPDATE with
+  /// `WHERE id = $1 AND rider_id IS NULL`, and zero rows affected means
+  /// another rider got there first. Never read-then-write.
+  riderId String? @map("rider_id")
+
+  pickupLabel     String  @map("pickup_label")
+  pickupLatitude  Float   @map("pickup_latitude")
+  pickupLongitude Float   @map("pickup_longitude")
+  dropLabel       String  @map("drop_label")
+  dropLatitude    Float   @map("drop_latitude")
+  dropLongitude   Float   @map("drop_longitude")
+  distanceM       Int     @map("distance_m")
+
+  description String?
+  /// FR-ORD-07: collection reference for a parcel pickup.
+  collectionRef String? @map("collection_ref")
+  /// FR-ORD-08: declared reimbursement for a peer errand.
+  reimbursementMinor Int? @map("reimbursement_minor")
+
+  /// The fee as currently offered. Rises with each re-broadcast round
+  /// (FR-DLV-06); baseFeeMinor keeps the original quote so the increment can
+  /// be accounted for separately from what the requester agreed to pay.
+  baseFeeMinor Int @map("base_fee_minor")
+  feeMinor     Int @map("fee_minor")
+
+  broadcastRound Int @default(0) @map("broadcast_round")
+  currentProximityM Int? @map("current_proximity_m")
+  /// When the live acceptance window closes. The dispatcher scans on this.
+  offerExpiresAt DateTime? @map("offer_expires_at")
+  /// When this task becomes eligible for its first broadcast (FR-DLV-01).
+  dispatchDueAt  DateTime? @map("dispatch_due_at")
+
+  /// Argon2id hash of the six-digit handover code (NFR-S-04). The plaintext
+  /// is shown to the requester once and never stored.
+  otpHash     String? @map("otp_hash")
+  otpAttempts Int     @default(0) @map("otp_attempts")
+  otpIssuedAt DateTime? @map("otp_issued_at")
+
+  /// FR-DLV-11: optional proof photo for non-shop pickups.
+  pickupProofUrl String? @map("pickup_proof_url")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  firstBroadcastAt DateTime? @map("first_broadcast_at")
+  assignedAt  DateTime? @map("assigned_at")
+  pickedUpAt  DateTime? @map("picked_up_at")
+  deliveredAt DateTime? @map("delivered_at")
+  completedAt DateTime? @map("completed_at")
+  cancelledAt DateTime? @map("cancelled_at")
+  escalatedAt DateTime? @map("escalated_at")
+
+  /// FR-ADM-04: how an administrator closed out an escalated task.
+  resolutionNote String? @map("resolution_note")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college   College @relation(fields: [collegeId], references: [id])
+  order     Order?  @relation(fields: [orderId], references: [id])
+  requester User    @relation("TaskRequester", fields: [requesterId], references: [id])
+  rider     User?   @relation("TaskRider", fields: [riderId], references: [id])
+
+  broadcasts    BroadcastLog[]
+  chatRoom      ChatRoom?
+  walletEntries WalletEntry[]
+  ratings       Rating[]
+  heldByRider   RiderState?    @relation("RiderActiveTask")
+
+  /// The dispatcher's hot path: "which tasks in this college need attention
+  /// right now". Status first because it is the most selective column.
+  @@index([status, dispatchDueAt])
+  @@index([status, offerExpiresAt])
+  @@index([collegeId, status, createdAt])
+  @@index([riderId, status])
+  @@index([requesterId, createdAt])
+  @@map("task")
+}
+
+/// FR-DLV-09 / FR-ADM-05: one row per broadcast round, so "how long did it
+/// take to find a rider" and "how often do we fail to" are answerable without
+/// guessing.
+model BroadcastLog {
+  id     String @id @default(uuid())
+  taskId String @map("task_id")
+  round  Int
+  radiusM Int   @map("radius_m")
+  feeMinor Int  @map("fee_minor")
+  eligibleCount Int @map("eligible_count")
+  sentAt   DateTime @default(now()) @map("sent_at")
+  outcome  BroadcastOutcome @default(PENDING)
+  acceptedByUserId String? @map("accepted_by_user_id")
+  resolvedAt DateTime? @map("resolved_at")
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, round])
+  @@index([taskId])
+  @@map("broadcast_log")
+}
+
+// ===========================================================================
+// CHAT
+// ===========================================================================
+
+model ChatRoom {
+  id        String       @id @default(uuid())
+  collegeId String       @map("college_id")
+  type      ChatRoomType
+  /// Set for TASK rooms (FR-DLV-10).
+  taskId    String?      @unique @map("task_id")
+  name        String?
+  description String?
+  createdByUserId String? @map("created_by_user_id")
+
+  /// FR-CHAT-08: a task room stops accepting messages on completion but keeps
+  /// its history readable.
+  isArchived Boolean   @default(false) @map("is_archived")
+  archivedAt DateTime? @map("archived_at")
+
+  lastMessageAt DateTime? @map("last_message_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  college   College @relation(fields: [collegeId], references: [id])
+  task      Task?   @relation(fields: [taskId], references: [id])
+  createdBy User?   @relation("ChatRoomCreator", fields: [createdByUserId], references: [id])
+
+  members  ChatMember[]
+  messages Message[]
+
+  @@index([collegeId, type])
+  @@index([collegeId, lastMessageAt])
+  @@map("chat_room")
+}
+
+model ChatMember {
+  roomId String  @map("room_id")
+  userId String  @map("user_id")
+  isAdmin Boolean @default(false) @map("is_admin")
+  /// FR-CHAT-03: read-up-to pointer, which answers "how many unread" with one
+  /// comparison instead of a per-message scan.
+  lastReadMessageId String?   @map("last_read_message_id")
+  mutedUntil        DateTime? @map("muted_until")
+  joinedAt          DateTime  @default(now()) @map("joined_at")
+  leftAt            DateTime? @map("left_at")
+
+  room ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+  @@index([userId, leftAt])
+  @@map("chat_member")
+}
+
+model Message {
+  id       String @id @default(uuid())
+  roomId   String @map("room_id")
+  senderId String @map("sender_id")
+
+  body          String?
+  attachmentUrl String? @map("attachment_url")
+  attachmentType String? @map("attachment_type")
+  attachmentSizeBytes Int? @map("attachment_size_bytes")
+
+  /// Client-generated id, so a message queued offline and re-sent on
+  /// reconnection is not stored twice (FR-CHAT-04).
+  clientMessageId String? @map("client_message_id")
+
+  sentAt    DateTime  @default(now()) @map("sent_at")
+  editedAt  DateTime? @map("edited_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  room     ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  sender   User     @relation(fields: [senderId], references: [id])
+  receipts MessageReceipt[]
+
+  @@unique([senderId, clientMessageId])
+  @@index([roomId, sentAt])
+  @@map("message")
+}
+
+/// FR-CHAT-03 asks for per-message sent / delivered / read state, which a
+/// single read-up-to pointer cannot express. One row per recipient per
+/// message, written on delivery and on read.
+model MessageReceipt {
+  messageId String    @map("message_id")
+  userId    String    @map("user_id")
+  deliveredAt DateTime? @map("delivered_at")
+  readAt      DateTime? @map("read_at")
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, userId])
+  @@index([userId, readAt])
+  @@map("message_receipt")
+}
+
+/// FR-CHAT-07
+model BlockedUser {
+  ownerId  String   @map("owner_id")
+  targetId String   @map("target_id")
+  reason   String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  owner  User @relation("BlockOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  target User @relation("BlockTarget", fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@id([ownerId, targetId])
+  @@map("blocked_user")
+}
+
+// ===========================================================================
+// COMMUNITY
+// ===========================================================================
+
+model Post {
+  id        String       @id @default(uuid())
+  collegeId String       @map("college_id")
+  authorId  String       @map("author_id")
+  category  PostCategory
+  title     String
+  body      String
+  attachmentUrl String?  @map("attachment_url")
+  linkUrl       String?  @map("link_url")
+
+  /// Denormalised counters, kept in step with the vote and comment tables
+  /// inside the same transaction as the insert.
+  upvoteCount  Int @default(0) @map("upvote_count")
+  commentCount Int @default(0) @map("comment_count")
+  reportCount  Int @default(0) @map("report_count")
+
+  status PostStatus @default(PUBLISHED)
+  /// FR-COMM-08: an administrator can pin a post to the top of the feed.
+  pinnedAt DateTime? @map("pinned_at")
+  /// FR-COMM-06: an edited post shows a marker.
+  editedAt DateTime? @map("edited_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  college College @relation(fields: [collegeId], references: [id])
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  comments Comment[]
+  votes    PostVote[]
+  saves    SavedPost[]
+
+  @@index([collegeId, status, createdAt])
+  @@index([collegeId, category, status, createdAt])
+  @@index([collegeId, status, upvoteCount])
+  /// FR-COMM-05: keyword search across titles and bodies.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([body(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("post")
+}
+
+/// FR-COMM-04 gives posts an upvote count but nothing that records who voted,
+/// which means a student could upvote the same post forever. One row per
+/// voter per post, with the primary key doing the deduplication.
+model PostVote {
+  postId String   @map("post_id")
+  userId String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@map("post_vote")
+}
+
+model SavedPost {
+  postId String   @map("post_id")
+  userId String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@index([userId, createdAt])
+  @@map("saved_post")
+}
+
+model Comment {
+  id       String @id @default(uuid())
+  postId   String @map("post_id")
+  authorId String @map("author_id")
+  body     String
+  status   PostStatus @default(PUBLISHED)
+  reportCount Int @default(0) @map("report_count")
+  createdAt DateTime @default(now()) @map("created_at")
+  editedAt  DateTime? @map("edited_at")
+
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@map("comment")
+}
+
+// ===========================================================================
+// MONEY
+// ===========================================================================
+
+/// FR-PAY-02: an append-only ledger. Rows are never updated or deleted —
+/// a correction is a new, opposite entry. balanceAfterMinor is carried on each
+/// row so a statement needs no running total computed at read time, and so a
+/// mismatch is immediately visible.
+model WalletEntry {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  direction WalletDirection
+  amountMinor Int @map("amount_minor")
+  type      WalletEntryType
+  taskId    String? @map("task_id")
+  orderId   String? @map("order_id")
+  counterpartyUserId String? @map("counterparty_user_id")
+  note      String?
+  balanceAfterMinor Int @map("balance_after_minor")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  task Task? @relation(fields: [taskId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([taskId])
+  @@map("wallet_entry")
+}
+
+/// FR-PAY-05: settled manually by an administrator in this release.
+model WithdrawalRequest {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  amountMinor Int @map("amount_minor")
+  status WithdrawalStatus @default(REQUESTED)
+
+  /// Payout destination. Held only as long as needed to settle.
+  bankAccountLast4 String? @map("bank_account_last4")
+  bankIfsc         String? @map("bank_ifsc")
+  upiId            String? @map("upi_id")
+
+  handledByUserId String?   @map("handled_by_user_id")
+  handledAt       DateTime? @map("handled_at")
+  payoutReference String?   @map("payout_reference")
+  rejectionNote   String?   @map("rejection_note")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user      User  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  handledBy User? @relation("WithdrawalHandler", fields: [handledByUserId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@map("withdrawal_request")
+}
+
+// ===========================================================================
+// TRUST, MODERATION, AUDIT
+// ===========================================================================
+
+/// FR-TRST-01. FR-TRST-06 says a rated party may not see individually
+/// attributable ratings; that is an API-layer rule, not a storage one — the
+/// rows must keep rater and task for dispute resolution and abuse detection.
+/// The read endpoints expose aggregates only, and suppress even those until
+/// the rating count passes a floor.
+model Rating {
+  id      String @id @default(uuid())
+  taskId  String @map("task_id")
+  raterId String @map("rater_id")
+  rateeId String @map("ratee_id")
+  /// 1 to 5, enforced by a check constraint in the migration.
+  score   Int
+  comment String?
+  /// Set when the rating is of a shop rather than of a person.
+  shopListingId String? @map("shop_listing_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  task  Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  rater User @relation("RatingRater", fields: [raterId], references: [id], onDelete: Cascade)
+  ratee User @relation("RatingRatee", fields: [rateeId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, raterId, rateeId])
+  @@index([rateeId, createdAt])
+  @@map("rating")
+}
+
+model Report {
+  id         String @id @default(uuid())
+  collegeId  String @map("college_id")
+  reporterId String @map("reporter_id")
+  targetType ReportTargetType @map("target_type")
+  targetId   String @map("target_id")
+  reason     String
+  detail     String?
+  status     ReportStatus @default(OPEN)
+
+  handledByUserId String?   @map("handled_by_user_id")
+  handledAt       DateTime? @map("handled_at")
+  resolutionNote  String?   @map("resolution_note")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  reporter  User  @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  handledBy User? @relation("ReportHandler", fields: [handledByUserId], references: [id])
+
+  @@unique([reporterId, targetType, targetId])
+  @@index([collegeId, status, createdAt])
+  @@index([targetType, targetId])
+  @@map("report")
+}
+
+/// FR-ADM-06 / FR-SVER-09: append-only. Nothing in the application updates or
+/// deletes a row here, and the migration revokes UPDATE and DELETE on this
+/// table from the application role so that "immutable" is enforced by the
+/// database rather than by good intentions.
+model AuditLog {
+  id      String @id @default(uuid())
+  /// Null for system-initiated actions such as the dispatcher timing out.
+  actorId String? @map("actor_id")
+  /// Recorded even when the actor is a super admin with no college.
+  collegeId String? @map("college_id")
+  action    String
+  targetType String @map("target_type")
+  targetId   String @map("target_id")
+  /// Structured detail: before/after values, reason codes, request id.
+  detail    Json?
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([collegeId, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("audit_log")
+}

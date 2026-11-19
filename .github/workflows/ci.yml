@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      # PostGIS, because the geodesic distance function in the integrity
+      # migration will not install without it — which is the point: CI should
+      # fail if the extension is missing rather than skipping the check.
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: hoppo
+          POSTGRES_PASSWORD: hoppo_test_password
+          POSTGRES_DB: hoppo_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U hoppo -d hoppo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://hoppo:hoppo_test_password@localhost:5432/hoppo_test?schema=public
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Apply migrations
+        run: pnpm --filter @hoppo/api prisma:deploy
+
+      - name: Check the schema and the database agree
+        # A non-empty diff means someone edited the schema without generating
+        # a migration, which would break the next deploy.
+        run: |
+          cd apps/api
+          npx prisma migrate diff \
+            --from-schema-datasource prisma/schema.prisma \
+            --to-schema-datamodel prisma/schema.prisma \
+            --exit-code && echo "schema and database agree"
+
+      - run: pnpm --filter @hoppo/api prisma:generate
+
+      - name: Seed
+        run: pnpm --filter @hoppo/api prisma:seed
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Test
+        run: pnpm -r test

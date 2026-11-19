@@ -1,0 +1,81 @@
+# Local development dependencies for Hoppo.
+#
+# Start with:  pnpm db:up
+# Stop with:   pnpm db:down
+#
+# Nothing here is production configuration. Production uses managed Postgres
+# and managed Redis; see docs/architecture.md.
+
+name: hoppo
+
+services:
+  # PostgreSQL with PostGIS.
+  #
+  # PostGIS is a PostgreSQL extension that teaches the database about
+  # geography. We use it for exactly one thing that matters: computing the
+  # real (geodesic) distance between a shop and its college, over the curved
+  # surface of the earth rather than on a flat map. See FR-SHOP-05 / C-2.
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: hoppo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hoppo
+      POSTGRES_PASSWORD: hoppo_dev_password
+      POSTGRES_DB: hoppo
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U hoppo -d hoppo']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Redis holds hot, short-lived state:
+  #   - rider presence as GEO sets (one per college), refreshed on each ping
+  #   - pub/sub so multiple API instances can fan out one broadcast
+  #   - rate-limit counters
+  # Postgres remains the system of record. If Redis is wiped, riders simply
+  # re-report their position on the next ping. See docs/architecture.md.
+  redis:
+    image: redis:7-alpine
+    container_name: hoppo-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # MinIO stands in for Cloudflare R2 during local development. Both speak the
+  # S3 API, so the application code is identical against either one.
+  minio:
+    image: minio/minio:latest
+    container_name: hoppo-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: hoppo
+      MINIO_ROOT_PASSWORD: hoppo_dev_password
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
