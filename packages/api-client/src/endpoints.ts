@@ -1,14 +1,37 @@
 import type { ApiClient, TokenPair } from './client';
 import type {
+  AccountDeletion,
+  AccountExport,
   ActiveTask,
+  AdminDeliveryPoint,
+  AdminOrderDetail,
+  AdminOrderList,
+  AdminOrderListQuery,
+  AdminOrderSummary,
+  AdminShopDetail,
+  AdminShopListItem,
+  AdminShopListQuery,
+  AdminStudentDetail,
+  AdminStudentListItem,
+  AdminStudentListQuery,
+  AuditLogEntry,
+  AuditLogQuery,
   AuthUser,
   BrowseShop,
   Catalog,
   CatalogCategory,
   CatalogItem,
   College,
+  CollegeConfig,
+  CollegeConfigUpdate,
+  CollegeConfigUpdateResult,
   CollegeRadius,
   DeliveryPoint,
+  DeliveryPointCreate,
+  DeliveryPointUpdate,
+  Escalation,
+  EscalationOutcome,
+  EscalationResolution,
   FlaggedShop,
   ItemSearchResult,
   MyOrder,
@@ -16,13 +39,35 @@ import type {
   OrderDetail,
   OrderQuote,
   OrderRequestBody,
+  OrderStatus,
   Paged,
+  PasswordChange,
+  PlatformAdmin,
+  PlatformAdminCreate,
+  PlatformCollege,
+  PlatformCollegeCreate,
+  PrivacyNotice,
+  PrivacyNoticeAcceptance,
+  ProfileUpdate,
   RiderStatus,
   ShopDetail,
+  ShopOrderHistory,
+  ShopOrderHistoryQuery,
   ShopQueue,
   ShopQueueItem,
+  ShopReinstatement,
+  ShopSuspension,
+  StudentReinstatement,
+  StudentSuspension,
   VerificationQueueItem,
 } from './types';
+
+/** The API takes several statuses as one comma-separated value. */
+function statusList(status?: OrderStatus | OrderStatus[]): string | undefined {
+  if (status === undefined) return undefined;
+  const joined = Array.isArray(status) ? status.join(',') : status;
+  return joined || undefined;
+}
 
 /**
  * Endpoint wrappers.
@@ -60,6 +105,8 @@ export function endpoints(client: ApiClient) {
         password: string;
         collegeId: string;
         mobileOtpChallengeId: string;
+        /** FR-PRIV-01: the `version` of the notice shown and accepted. */
+        privacyNoticeVersion?: string;
       }) => client.anonymousPost<TokenPair & { userId: string }>('/auth/register', body),
 
       me: () => client.get<{ user: AuthUser }>('/auth/me'),
@@ -79,6 +126,22 @@ export function endpoints(client: ApiClient) {
           code,
           newPassword,
         }),
+
+      /**
+       * S-50. Any signed-in role.
+       *
+       * The change ends every session of the account, including the refresh
+       * token this client is holding, and the answer carries a new pair. The
+       * caller MUST store it straight away with `ApiClient.setTokens(result)`,
+       * exactly as after login: carrying on with the old pair gets
+       * `401 REFRESH_REUSED` at the next refresh and signs the user out of
+       * the device they just changed their password on.
+       *
+       * `403 PASSWORD_INCORRECT` is a wrong current password, not an expired
+       * session. `400 PASSWORD_UNCHANGED` when the new one equals the old.
+       */
+      changePassword: (currentPassword: string, newPassword: string) =>
+        client.post<PasswordChange>('/auth/password/change', { currentPassword, newPassword }),
     },
 
     shops: {
@@ -119,6 +182,13 @@ export function endpoints(client: ApiClient) {
       /** D-08: the live queue. */
       queue: (listingId: string) => client.get<ShopQueue>(`/shops/${listingId}/orders`),
 
+      /** D-10: orders that are over (completed and cancelled by default), a page at a time. */
+      orderHistory: (listingId: string, query: ShopOrderHistoryQuery = {}) =>
+        client.get<ShopOrderHistory>(`/shops/${listingId}/orders/history`, {
+          ...query,
+          status: statusList(query.status),
+        }),
+
       acceptOrder: (listingId: string, orderId: string, prepMinutes?: number) =>
         client.post<{
           orderId: string;
@@ -130,10 +200,13 @@ export function endpoints(client: ApiClient) {
         }>(`/shops/${listingId}/orders/${orderId}/accept`, { prepMinutes }),
 
       rejectOrder: (listingId: string, orderId: string, reason: string) =>
-        client.post<{ orderId: string; status: string; message: string }>(
-          `/shops/${listingId}/orders/${orderId}/reject`,
-          { reason },
-        ),
+        client.post<{
+          orderId: string;
+          status: string;
+          /** What went back to the student's wallet; 0 for a cash order. */
+          refundedMinor: number;
+          message: string;
+        }>(`/shops/${listingId}/orders/${orderId}/reject`, { reason }),
 
       markReady: (listingId: string, orderId: string) =>
         client.post<{ orderId: string; status: string; message: string }>(
@@ -227,19 +300,23 @@ export function endpoints(client: ApiClient) {
         ),
 
       suspendStudent: (studentId: string, reason: string) =>
-        client.post<{
-          studentId: string;
-          status: string;
-          sessionsRevoked: number;
-          taskReleased: string | null;
-          message: string;
-        }>(`/admin/verification/students/${studentId}/suspend`, { reason }),
+        client.post<StudentSuspension>(`/admin/verification/students/${studentId}/suspend`, {
+          reason,
+        }),
 
       reinstateStudent: (studentId: string) =>
-        client.post<{ studentId: string; status: string; message: string }>(
+        client.post<StudentReinstatement>(
           `/admin/verification/students/${studentId}/reinstate`,
           {},
         ),
+
+      /** A-04: find a student of my college. */
+      listStudents: (query: AdminStudentListQuery = {}) =>
+        client.get<Paged<AdminStudentListItem>>('/admin/students', { ...query }),
+
+      /** A-04 */
+      studentDetail: (studentId: string) =>
+        client.get<AdminStudentDetail>(`/admin/students/${studentId}`),
 
       /** A-05 */
       shopQueue: (limit?: number, cursor?: string) =>
@@ -266,12 +343,18 @@ export function endpoints(client: ApiClient) {
         ),
 
       suspendShop: (listingId: string, reason: string) =>
-        client.post<{
-          listingId: string;
-          status: string;
-          inFlightOrders: number;
-          message: string;
-        }>(`/admin/shops/${listingId}/suspend`, { reason }),
+        client.post<ShopSuspension>(`/admin/shops/${listingId}/suspend`, { reason }),
+
+      /** The way back from a suspension. 409 `NOT_SUSPENDED` otherwise. */
+      reinstateShop: (listingId: string) =>
+        client.post<ShopReinstatement>(`/admin/shops/${listingId}/reinstate`, {}),
+
+      /** A-06: every listing of my college, in any state. */
+      listShops: (query: AdminShopListQuery = {}) =>
+        client.get<Paged<AdminShopListItem>>('/admin/shops', { ...query }),
+
+      /** A-06 */
+      shopDetail: (listingId: string) => client.get<AdminShopDetail>(`/admin/shops/${listingId}`),
 
       /** A-09: the radius in force, with the bounds a change must stay within. */
       radius: () => client.get<CollegeRadius>('/admin/college/radius'),
@@ -287,6 +370,142 @@ export function endpoints(client: ApiClient) {
         }>('/admin/college/radius', { serviceableRadiusM }),
 
       flaggedShops: () => client.get<{ items: FlaggedShop[] }>('/admin/college/radius/flagged'),
+
+      /** FR-ADM-05, A-02, A-07: the order report. */
+      orders: {
+        list: (query: AdminOrderListQuery = {}) =>
+          client.get<AdminOrderList>('/admin/orders', {
+            ...query,
+            status: statusList(query.status),
+          }),
+
+        /** Both dates default to today in the college's timezone; at most 366 days. */
+        summary: (query: { from?: string; to?: string; collegeId?: string } = {}) =>
+          client.get<AdminOrderSummary>('/admin/orders/summary', { ...query }),
+
+        detail: (orderId: string) => client.get<AdminOrderDetail>(`/admin/orders/${orderId}`),
+      },
+
+      /** FR-ADM-04, A-08 */
+      escalations: {
+        /** Oldest first: the one that has waited longest is at the top. */
+        list: (limit?: number, cursor?: string) =>
+          client.get<Paged<Escalation>>('/admin/escalations', { limit, cursor }),
+
+        /** Also answers for a task since resolved, so the outcome can be shown after a 409. */
+        detail: (taskId: string) => client.get<Escalation>(`/admin/escalations/${taskId}`),
+
+        /** `note` is mandatory: 10 to 500 characters. */
+        resolve: (taskId: string, outcome: EscalationOutcome, note: string) =>
+          client.post<EscalationResolution>(`/admin/escalations/${taskId}/resolve`, {
+            outcome,
+            note,
+          }),
+      },
+
+      /** FR-ADM-03, A-09. The radius is not here: see `updateRadius`. */
+      config: {
+        get: () => client.get<CollegeConfig>('/admin/college/config'),
+
+        update: (body: CollegeConfigUpdate) =>
+          client.patch<CollegeConfigUpdateResult>('/admin/college/config', body),
+      },
+
+      /** FR-ORD-02, A-10. There is no delete: a point is retired by deactivating it. */
+      deliveryPoints: {
+        /** Active and inactive, by `sortOrder` then name. */
+        list: () => client.get<{ points: AdminDeliveryPoint[] }>('/admin/delivery-points'),
+
+        create: (body: DeliveryPointCreate) =>
+          client.post<AdminDeliveryPoint>('/admin/delivery-points', body),
+
+        update: (pointId: string, body: DeliveryPointUpdate) =>
+          client.patch<AdminDeliveryPoint>(`/admin/delivery-points/${pointId}`, body),
+
+        deactivate: (pointId: string) =>
+          client.post<AdminDeliveryPoint>(`/admin/delivery-points/${pointId}/deactivate`, {}),
+
+        activate: (pointId: string) =>
+          client.post<AdminDeliveryPoint>(`/admin/delivery-points/${pointId}/activate`, {}),
+
+        /** Every point of the college, each once, in the order wanted. */
+        reorder: (pointIds: string[]) =>
+          client.put<{ points: AdminDeliveryPoint[] }>('/admin/delivery-points/order', {
+            pointIds,
+          }),
+      },
+
+      /** FR-ADM-06, A-15. Read-only; "export" is paging to the end. */
+      audit: {
+        list: (query: AuditLogQuery = {}) =>
+          client.get<Paged<AuditLogEntry>>('/admin/audit-log', { ...query }),
+
+        /** The known action names, for the filter control. */
+        actions: () => client.get<{ actions: string[] }>('/admin/audit-log/actions'),
+      },
+    },
+
+    /** FR-TEN-01, FR-ADM-07, A-16, A-18. SUPER_ADMIN only: an ADMIN gets 403. */
+    superAdmin: {
+      colleges: () => client.get<{ colleges: PlatformCollege[] }>('/platform/colleges'),
+
+      createCollege: (body: PlatformCollegeCreate) =>
+        client.post<PlatformCollege>('/platform/colleges', body),
+
+      college: (collegeId: string) =>
+        client.get<PlatformCollege & { admins: PlatformAdmin[] }>(
+          `/platform/colleges/${collegeId}`,
+        ),
+
+      deactivateCollege: (collegeId: string, reason: string) =>
+        client.post<PlatformCollege>(`/platform/colleges/${collegeId}/deactivate`, { reason }),
+
+      activateCollege: (collegeId: string) =>
+        client.post<PlatformCollege>(`/platform/colleges/${collegeId}/activate`, {}),
+
+      /** Creates a new ADMIN account attached to that college. */
+      createAdmin: (collegeId: string, body: PlatformAdminCreate) =>
+        client.post<PlatformAdmin>(`/platform/colleges/${collegeId}/admins`, body),
+
+      deactivateAdmin: (userId: string, reason: string) =>
+        client.post<PlatformAdmin>(`/platform/admins/${userId}/deactivate`, { reason }),
+
+      reactivateAdmin: (userId: string) =>
+        client.post<PlatformAdmin>(`/platform/admins/${userId}/reactivate`, {}),
+
+      /** Set an administrator's password (10 to 128 characters); ends their sessions. */
+      setAdminPassword: (userId: string, password: string) =>
+        client.post<PlatformAdmin & { sessionsRevoked: number }>(
+          `/platform/admins/${userId}/password`,
+          { password },
+        ),
+    },
+
+    /** FR-PRIV-01 */
+    privacy: {
+      /** Public: no session is needed to read it. */
+      notice: () => client.get<PrivacyNotice>('/legal/privacy-notice'),
+
+      /**
+       * Record that the signed-in user accepts `version` (the notice's own
+       * `version`). Accepting again returns the existing acceptance.
+       * `409 PRIVACY_NOTICE_OUTDATED` if it is no longer the current one.
+       */
+      accept: (version: string) =>
+        client.post<PrivacyNoticeAcceptance>('/legal/privacy-notice/accept', { version }),
+    },
+
+    /** FR-PRIV-05, S-55. STUDENT, own account only. */
+    account: {
+      /** Rate-limited to five an hour. */
+      export: () => client.get<AccountExport>('/account/export'),
+
+      /** S-50: name and photo only. Answers with the same body as `auth.me()`. */
+      updateProfile: (body: ProfileUpdate) =>
+        client.patch<{ user: AuthUser }>('/account/profile', body),
+
+      /** Refused while a task is open, the wallet holds money or a withdrawal is pending. */
+      delete: (password: string) => client.post<AccountDeletion>('/account/delete', { password }),
     },
 
     verification: {
@@ -394,20 +613,28 @@ export function endpoints(client: ApiClient) {
 
       /** FR-ORD-05 */
       cancel: (orderId: string, reason?: string) =>
-        client.post<{ orderId: string; status: string; message: string }>(
-          `/orders/${orderId}/cancel`,
-          { reason },
-        ),
+        client.post<{
+          orderId: string;
+          status: string;
+          /** The held total returned to the wallet; 0 for a cash order. */
+          refundedMinor: number;
+          message: string;
+        }>(`/orders/${orderId}/cancel`, { reason }),
 
       /** FR-DLV-07 */
       resolveUnfulfilled: (
         orderId: string,
         choice: 'KEEP_WAITING' | 'COLLECT_IN_PERSON' | 'CANCEL',
       ) =>
-        client.post<{ orderId: string; choice: string; message: string }>(
-          `/orders/${orderId}/unfulfilled`,
-          { choice },
-        ),
+        client.post<{
+          orderId: string;
+          choice: string;
+          /** CANCEL only: the total refunded to the wallet; 0 for a cash order. */
+          refundedMinor?: number;
+          /** COLLECT_IN_PERSON only: the delivery fee refunded; 0 for a cash order. */
+          refundedFeeMinor?: number;
+          message: string;
+        }>(`/orders/${orderId}/unfulfilled`, { choice }),
     },
 
     rider: {

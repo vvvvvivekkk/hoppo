@@ -61,6 +61,88 @@ test('admin.updateRadius is still the PATCH on the same path', async () => {
   ]);
 });
 
+// Every wrapper added for the A1 (admin orders), A2 (escalations) and A5
+// (admin, platform, privacy, account) contracts: where it lives, how it is
+// called, and the request it must issue. `rest` is what follows the path.
+const ID = 'id-1';
+const CONTRACT_ROUTES = [
+  // A1-CONTRACT-admin-orders.md
+  ['admin.orders.list', [], 'GET', '/admin/orders', [{ status: undefined }]],
+  [
+    'admin.orders.list',
+    [{ status: ['PLACED', 'PREPARING'], from: '2026-11-01', q: '7f3k', limit: 10 }],
+    'GET',
+    '/admin/orders',
+    [{ status: 'PLACED,PREPARING', from: '2026-11-01', q: '7f3k', limit: 10 }],
+  ],
+  ['admin.orders.summary', [{ from: '2026-11-01', to: '2026-11-20' }], 'GET', '/admin/orders/summary', [{ from: '2026-11-01', to: '2026-11-20' }]],
+  ['admin.orders.detail', [ID], 'GET', `/admin/orders/${ID}`, []],
+  ['shops.orderHistory', [ID], 'GET', `/shops/${ID}/orders/history`, [{ status: undefined }]],
+  ['shops.orderHistory', [ID, { status: 'CANCELLED', cursor: 'c' }], 'GET', `/shops/${ID}/orders/history`, [{ status: 'CANCELLED', cursor: 'c' }]],
+  // A2-CONTRACT-escalations.md
+  ['admin.escalations.list', [50, 'c'], 'GET', '/admin/escalations', [{ limit: 50, cursor: 'c' }]],
+  ['admin.escalations.detail', [ID], 'GET', `/admin/escalations/${ID}`, []],
+  ['admin.escalations.resolve', [ID, 'DELIVERED', 'Called both of them.'], 'POST', `/admin/escalations/${ID}/resolve`, [{ outcome: 'DELIVERED', note: 'Called both of them.' }]],
+  // A5-CONTRACT-admin.md section 1
+  ['admin.config.get', [], 'GET', '/admin/college/config', []],
+  ['admin.config.update', [{ maxOtpAttempts: 4 }], 'PATCH', '/admin/college/config', [{ maxOtpAttempts: 4 }]],
+  // section 2
+  ['admin.deliveryPoints.list', [], 'GET', '/admin/delivery-points', []],
+  ['admin.deliveryPoints.create', [{ name: 'Library', latitude: 17.3, longitude: 78.6 }], 'POST', '/admin/delivery-points', [{ name: 'Library', latitude: 17.3, longitude: 78.6 }]],
+  ['admin.deliveryPoints.update', [ID, { description: null }], 'PATCH', `/admin/delivery-points/${ID}`, [{ description: null }]],
+  ['admin.deliveryPoints.deactivate', [ID], 'POST', `/admin/delivery-points/${ID}/deactivate`, [{}]],
+  ['admin.deliveryPoints.activate', [ID], 'POST', `/admin/delivery-points/${ID}/activate`, [{}]],
+  ['admin.deliveryPoints.reorder', [['a', 'b']], 'PUT', '/admin/delivery-points/order', [{ pointIds: ['a', 'b'] }]],
+  // section 3
+  ['admin.audit.list', [{ action: 'SHOP_SUSPENDED', limit: 5 }], 'GET', '/admin/audit-log', [{ action: 'SHOP_SUSPENDED', limit: 5 }]],
+  ['admin.audit.actions', [], 'GET', '/admin/audit-log/actions', []],
+  // section 4
+  ['admin.listStudents', [{ q: 'asha' }], 'GET', '/admin/students', [{ q: 'asha' }]],
+  ['admin.studentDetail', [ID], 'GET', `/admin/students/${ID}`, []],
+  ['admin.listShops', [{ status: 'SUSPENDED' }], 'GET', '/admin/shops', [{ status: 'SUSPENDED' }]],
+  ['admin.shopDetail', [ID], 'GET', `/admin/shops/${ID}`, []],
+  ['admin.reinstateShop', [ID], 'POST', `/admin/shops/${ID}/reinstate`, [{}]],
+  // section 5
+  ['privacy.notice', [], 'GET', '/legal/privacy-notice', []],
+  ['account.export', [], 'GET', '/account/export', []],
+  ['account.delete', ['hunter2hunter2'], 'POST', '/account/delete', [{ password: 'hunter2hunter2' }]],
+  // section 6
+  ['superAdmin.colleges', [], 'GET', '/platform/colleges', []],
+  ['superAdmin.createCollege', [{ name: 'X' }], 'POST', '/platform/colleges', [{ name: 'X' }]],
+  ['superAdmin.college', [ID], 'GET', `/platform/colleges/${ID}`, []],
+  ['superAdmin.deactivateCollege', [ID, 'Closed for the term'], 'POST', `/platform/colleges/${ID}/deactivate`, [{ reason: 'Closed for the term' }]],
+  ['superAdmin.activateCollege', [ID], 'POST', `/platform/colleges/${ID}/activate`, [{}]],
+  ['superAdmin.createAdmin', [ID, { name: 'A' }], 'POST', `/platform/colleges/${ID}/admins`, [{ name: 'A' }]],
+  ['superAdmin.deactivateAdmin', [ID, 'Left the college'], 'POST', `/platform/admins/${ID}/deactivate`, [{ reason: 'Left the college' }]],
+  ['superAdmin.reactivateAdmin', [ID], 'POST', `/platform/admins/${ID}/reactivate`, [{}]],
+  // A5-CONTRACT-admin.md section 8 (round 4)
+  ['privacy.accept', ['2026-11-20'], 'POST', '/legal/privacy-notice/accept', [{ version: '2026-11-20' }]],
+  ['account.updateProfile', [{ name: 'Asha K', avatarKey: null }], 'PATCH', '/account/profile', [{ name: 'Asha K', avatarKey: null }]],
+  ['auth.changePassword', ['old-password-1', 'new-password-2'], 'POST', '/auth/password/change', [{ currentPassword: 'old-password-1', newPassword: 'new-password-2' }]],
+  ['superAdmin.setAdminPassword', [ID, 'a-long-password'], 'POST', `/platform/admins/${ID}/password`, [{ password: 'a-long-password' }]],
+];
+
+for (const [name, args, method, path, rest] of CONTRACT_ROUTES) {
+  test(`${name}(${args.length ? '…' : ''}) issues ${method} ${path}`, async () => {
+    const client = recordingClient();
+    const api = loadEndpoints()(client);
+    const wrapper = name.split('.').reduce((node, key) => node?.[key], api);
+
+    assert.equal(typeof wrapper, 'function', `${name} is not a wrapper`);
+    await wrapper(...args);
+
+    assert.deepEqual(client.calls, [{ method, path, rest }]);
+  });
+}
+
+test('registration passes the accepted privacy notice version through', async () => {
+  const client = recordingClient();
+  await loadEndpoints()(client).auth.register({ name: 'A', privacyNoticeVersion: '2026-11-20' });
+
+  assert.equal(client.calls[0].path, '/auth/register');
+  assert.equal(client.calls[0].rest[0].privacyNoticeVersion, '2026-11-20');
+});
+
 test('exported types match what the API sends (types.typetest.ts compiles)', () => {
   const configPath = resolve(here, '../tsconfig.json');
   const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, {

@@ -39,6 +39,11 @@ export interface AuthUser {
     activeTaskId: string | null;
     barredUntil: string | null;
   } | null;
+  /**
+   * FR-PRIV-01: the privacy notice this user accepted, or null if none is on
+   * record. Optional until the auth lane ships it on `/auth/me`.
+   */
+  privacyNotice?: PrivacyNoticeAcceptance | null;
 }
 
 export type OrderStatus =
@@ -579,4 +584,816 @@ export interface CollegeRadius {
 export interface SocketException {
   code: string;
   message: string;
+}
+
+// ===========================================================================
+// Administrator order report and shop order history (A1 contract; FR-ADM-05)
+// ===========================================================================
+
+export type PaymentMethod = 'CASH' | 'WALLET' | 'ONLINE';
+
+export type PaymentStatus =
+  'NOT_REQUIRED' | 'PENDING' | 'HELD' | 'CAPTURED' | 'REFUNDED' | 'FAILED';
+
+export type CancelledBy = 'STUDENT' | 'SHOP' | 'ADMIN' | 'SYSTEM';
+
+/** A name and an id — never a mobile number, email or roll number (FR-PRIV-03). */
+export interface PersonRef {
+  id: string;
+  name: string;
+}
+
+/**
+ * The date range a report applied: calendar dates (`YYYY-MM-DD`), both
+ * inclusive, read in the college's timezone. Null where that end was open.
+ */
+export interface ReportRange {
+  from: string | null;
+  to: string | null;
+  timezone: string;
+}
+
+/** Filters for `GET /admin/orders`. */
+export interface AdminOrderListQuery {
+  /** One status, or several: sent as a comma-separated list. */
+  status?: OrderStatus | OrderStatus[];
+  /** `YYYY-MM-DD`, inclusive, on `placedAt`. */
+  from?: string;
+  to?: string;
+  listingId?: string;
+  /** Order reference, case-insensitive "contains", at most 32 characters. */
+  q?: string;
+  limit?: number;
+  cursor?: string;
+  /** Honoured for a SUPER_ADMIN only; ignored for everyone else. */
+  collegeId?: string;
+}
+
+export interface AdminOrderListItem {
+  id: string;
+  reference: string;
+  status: OrderStatus;
+  placedAt: string;
+  shop: { listingId: string; shopId: string; name: string };
+  student: PersonRef;
+  /** Null until a rider is assigned. */
+  rider: PersonRef | null;
+  itemsSubtotalMinor: number;
+  itemsSubtotalLabel: string;
+  deliveryFeeMinor: number;
+  deliveryFeeLabel: string;
+  platformFeeMinor: number;
+  platformFeeLabel: string;
+  totalMinor: number;
+  totalLabel: string;
+  commissionMinor: number;
+  commissionLabel: string;
+  paymentMethod: PaymentMethod;
+  paymentStatus: PaymentStatus;
+  taskStatus: TaskStatus | null;
+  cancelledBy: CancelledBy | null;
+}
+
+export interface AdminOrderList {
+  items: AdminOrderListItem[];
+  nextCursor: string | null;
+  range: ReportRange;
+}
+
+export interface AdminOrderTimelineStep {
+  event:
+    'PLACED' | 'SHOP_ACCEPTED' | 'READY' | 'PICKED_UP' | 'DELIVERED' | 'COMPLETED' | 'CANCELLED';
+  at: string;
+}
+
+export interface AdminOrderLine {
+  name: string;
+  unitPriceMinor: number;
+  quantity: number;
+  lineTotalMinor: number;
+  note: string | null;
+}
+
+export interface AdminOrderBroadcastRound {
+  round: number;
+  radiusM: number;
+  feeMinor: number;
+  eligibleCount: number;
+  sentAt: string;
+  outcome: 'PENDING' | 'ACCEPTED' | 'EXPIRED' | 'CANCELLED';
+  resolvedAt: string | null;
+}
+
+export interface AdminOrderWalletEntry {
+  id: string;
+  type: string;
+  direction: 'CREDIT' | 'DEBIT';
+  amountMinor: number;
+  amountLabel: string;
+  balanceAfterMinor: number;
+  party: 'STUDENT' | 'RIDER' | 'OTHER';
+  user: PersonRef;
+  note: string | null;
+  createdAt: string;
+}
+
+/** `GET /admin/orders/:orderId`. */
+export interface AdminOrderDetail extends Omit<AdminOrderListItem, 'placedAt' | 'taskStatus'> {
+  /** The campus point's name or the free-text landmark. No coordinates. */
+  dropLabel: string | null;
+  studentNote: string | null;
+  statedPrepMinutes: number | null;
+  expectedReadyAt: string | null;
+  cancelledReason: string | null;
+  /** Only the steps that happened, in time order. */
+  timeline: AdminOrderTimelineStep[];
+  items: AdminOrderLine[];
+  task: {
+    id: string;
+    status: TaskStatus;
+    baseFeeMinor: number;
+    feeMinor: number;
+    broadcastRound: number;
+    distanceM: number;
+    assignedAt: string | null;
+    pickedUpAt: string | null;
+    deliveredAt: string | null;
+    completedAt: string | null;
+    cancelledAt: string | null;
+  } | null;
+  broadcast: {
+    rounds: AdminOrderBroadcastRound[];
+    roundsSent: number;
+    /** First round sent to assigned, in seconds; null if never assigned. */
+    secondsToAcceptance: number | null;
+  };
+  /** Every ledger row for this order, oldest first. */
+  walletEntries: AdminOrderWalletEntry[];
+}
+
+/** `GET /admin/orders/summary` (FR-ADM-05). */
+export interface AdminOrderSummary {
+  range: ReportRange;
+  ordersPlaced: number;
+  /** Always all eight statuses. */
+  byStatus: Record<OrderStatus, number>;
+  /** COMPLETED / ordersPlaced in basis points: 7381 is 73.81%. 0 with no orders. */
+  completionRateBps: number;
+  /** Sums over COMPLETED orders only, as `basis` says. */
+  money: {
+    basis: 'COMPLETED';
+    grossItemsMinor: number;
+    grossItemsLabel: string;
+    deliveryFeesMinor: number;
+    deliveryFeesLabel: string;
+    platformFeesMinor: number;
+    platformFeesLabel: string;
+    commissionMinor: number;
+    commissionLabel: string;
+    totalMinor: number;
+    totalLabel: string;
+  };
+  cancellations: { total: number; byWho: Record<CancelledBy, number> };
+  /** Medians in whole seconds; null when the sample is empty. */
+  timings: {
+    medianPlacedToAcceptedSeconds: number | null;
+    medianReadyToDeliveredSeconds: number | null;
+    placedToAcceptedSampleSize: number;
+    readyToDeliveredSampleSize: number;
+  };
+  unfulfilledBroadcasts: number;
+  /** Completed orders only, largest gross first, at most 50 rows. */
+  revenueByShop: {
+    listingId: string;
+    shopName: string;
+    completedOrders: number;
+    grossItemsMinor: number;
+    grossItemsLabel: string;
+    commissionMinor: number;
+  }[];
+}
+
+/** Filters for `GET /shops/:listingId/orders/history`. */
+export interface ShopOrderHistoryQuery {
+  /** Defaults to COMPLETED and CANCELLED on the server. */
+  status?: OrderStatus | OrderStatus[];
+  from?: string;
+  to?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ShopOrderHistoryItem {
+  id: string;
+  reference: string;
+  status: OrderStatus;
+  placedAt: string;
+  shopAcceptedAt: string | null;
+  readyAt: string | null;
+  pickedUpAt: string | null;
+  deliveredAt: string | null;
+  completedAt: string | null;
+  cancelledAt: string | null;
+  cancelledBy: CancelledBy | null;
+  cancelledReason: string | null;
+  student: PersonRef;
+  rider: PersonRef | null;
+  items: AdminOrderLine[];
+  studentNote: string | null;
+  itemsSubtotalMinor: number;
+  itemsSubtotalLabel: string;
+  commissionMinor: number;
+  commissionLabel: string;
+  /** itemsSubtotalMinor - commissionMinor. */
+  netToShopMinor: number;
+  netToShopLabel: string;
+  paymentMethod: PaymentMethod;
+  taskStatus: TaskStatus | null;
+}
+
+/** D-10. The shop is deliberately not shown delivery fee, platform fee or total. */
+export interface ShopOrderHistory {
+  listingId: string;
+  items: ShopOrderHistoryItem[];
+  nextCursor: string | null;
+  range: ReportRange;
+}
+
+// ===========================================================================
+// Escalated tasks (A2 contract; FR-ADM-04, A-08)
+// ===========================================================================
+
+export type EscalationOutcome = 'DELIVERED' | 'NOT_DELIVERED';
+
+export interface Escalation {
+  taskId: string;
+  type: 'SHOP_ORDER' | 'PARCEL_PICKUP' | 'PEER_ERRAND';
+  /** ESCALATED while open; COMPLETED or CANCELLED once resolved. */
+  status: TaskStatus;
+  escalatedAt: string;
+  /** Why it escalated. Null once resolved: the administrator's note replaces it. */
+  escalationReason: string | null;
+  otpAttempts: number;
+  maxOtpAttempts: number;
+  assignedAt: string | null;
+  pickedUpAt: string | null;
+  createdAt: string;
+  pickupLabel: string;
+  dropLabel: string;
+  feeMinor: number;
+  /** Peer errands only. */
+  reimbursementMinor: number | null;
+  requester: { id: string; name: string; mobile: string };
+  /** Never null: a task cannot escalate without a rider holding it (A2 contract). */
+  rider: { id: string; name: string; mobile: string; status: string };
+  order: {
+    id: string;
+    reference: string;
+    status: OrderStatus;
+    paymentMethod: PaymentMethod;
+    paymentStatus: PaymentStatus;
+    itemsSubtotalMinor: number;
+    deliveryFeeMinor: number;
+    totalMinor: number;
+    shopName: string;
+    items: { name: string; quantity: number }[];
+  } | null;
+  /** The outcomes the server will accept right now: render buttons from this. */
+  canResolveAs: EscalationOutcome[];
+  /** Both present only once the task has been resolved. */
+  resolutionNote?: string | null;
+  resolvedAt?: string | null;
+}
+
+export interface EscalationResolution {
+  taskId: string;
+  outcome: EscalationOutcome;
+  /** COMPLETED for DELIVERED, CANCELLED for NOT_DELIVERED. */
+  status: 'COMPLETED' | 'CANCELLED';
+  orderStatus: 'COMPLETED' | 'CANCELLED' | null;
+  resolvedAt: string;
+  riderFeeMinor: number;
+  settledInCash: boolean;
+  refundedMinor: number;
+  message: string;
+}
+
+// ===========================================================================
+// College configuration, delivery points, audit log (A5 contract)
+// ===========================================================================
+
+/** The fields `PATCH /admin/college/config` accepts. All whole numbers. */
+export interface CollegeConfigEditable {
+  acceptanceWindowSeconds: number;
+  maxBroadcastRounds: number;
+  initialProximityM: number;
+  proximityIncrementM: number;
+  feeIncrementMinor: number;
+  dispatchLeadMinutes: number;
+  workModeIdleTimeoutMinutes: number;
+  riderPingIntervalSeconds: number;
+  shopAcceptWindowSeconds: number;
+  maxOtpAttempts: number;
+  platformFeeMinor: number;
+  commissionBps: number;
+  minWithdrawalMinor: number;
+  maxVerificationSubmissions: number;
+  verificationWindowDays: number;
+  abandonmentBanThreshold: number;
+  abandonmentWindowDays: number;
+  abandonmentBanHours: number;
+  chatRetentionDays: number;
+  reportHideThreshold: number;
+}
+
+/** `maxDistanceM` is exclusive; null on the last band means "and beyond". */
+export interface FeeBand {
+  minDistanceM: number;
+  maxDistanceM: number | null;
+  feeMinor: number;
+}
+
+/** `GET /admin/college/config` (FR-ADM-03, A-09). */
+export interface CollegeConfig {
+  collegeId: string;
+  updatedAt: string;
+  /** `serviceableRadiusM` is read-only here: change it with `admin.updateRadius`. */
+  config: CollegeConfigEditable & { serviceableRadiusM: number };
+  /** Sorted by `minDistanceM`. */
+  feeBands: FeeBand[];
+  limits: Record<keyof CollegeConfigEditable, { min: number; max: number }> & {
+    feeBands: { minBands: number; maxBands: number; maxFeeMinor: number; maxDistanceM: number };
+  };
+}
+
+/** Any subset of the editable fields, and optionally the complete new band list. */
+export type CollegeConfigUpdate = Partial<CollegeConfigEditable> & { feeBands?: FeeBand[] };
+
+/** `PATCH /admin/college/config`: the new state, and the names of what changed. */
+export interface CollegeConfigUpdateResult extends CollegeConfig {
+  changed: (keyof CollegeConfigEditable | 'feeBands')[];
+}
+
+/** A delivery point as an administrator sees it (A-10): inactive ones too. */
+export interface AdminDeliveryPoint {
+  id: string;
+  name: string;
+  description: string | null;
+  latitude: number;
+  longitude: number;
+  isActive: boolean;
+  sortOrder: number;
+  /** Orders that used this point. */
+  orderCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeliveryPointCreate {
+  name: string;
+  description?: string;
+  latitude: number;
+  longitude: number;
+}
+
+export interface DeliveryPointUpdate {
+  name?: string;
+  description?: string | null;
+  latitude?: number;
+  longitude?: number;
+}
+
+/** Filters for `GET /admin/audit-log`. */
+export interface AuditLogQuery {
+  actorId?: string;
+  /** Exact action name, e.g. `SHOP_SUSPENDED`. */
+  action?: string;
+  targetType?: string;
+  targetId?: string;
+  /** ISO date or date-time; `from` inclusive, `to` exclusive. */
+  from?: string;
+  to?: string;
+  limit?: number;
+  cursor?: string;
+  /** SUPER_ADMIN only. */
+  collegeId?: string;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  createdAt: string;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  collegeId: string | null;
+  /** Null for system actions. */
+  actor: { id: string; name: string; role: AuthUser['role'] } | null;
+  detail: Record<string, unknown> | null;
+  ipAddress: string | null;
+  userAgent: string | null;
+}
+
+// ===========================================================================
+// Student and shop administration (A5 contract; A-04, A-06)
+// ===========================================================================
+
+export type VerificationStatus = 'UNSUBMITTED' | 'PENDING' | 'VERIFIED' | 'REJECTED';
+
+export interface AdminStudentListQuery {
+  /** Name, mobile, email or roll number, "contains". */
+  q?: string;
+  status?: AuthUser['status'];
+  verificationStatus?: VerificationStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface AdminStudentListItem {
+  id: string;
+  name: string;
+  mobile: string;
+  email: string;
+  status: AuthUser['status'];
+  verificationStatus: VerificationStatus | null;
+  rollNumber: string | null;
+  department: string | null;
+  createdAt: string;
+}
+
+/** `GET /admin/students/:studentId`. No document URLs: those stay audited. */
+export interface AdminStudentDetail {
+  student: {
+    id: string;
+    name: string;
+    mobile: string;
+    email: string;
+    status: AuthUser['status'];
+    createdAt: string;
+    lastLoginAt: string | null;
+    mobileVerifiedAt: string | null;
+  };
+  /** Null unless the account is SUSPENDED. */
+  suspension: {
+    reason: string | null;
+    suspendedAt: string | null;
+    suspendedBy: PersonRef | null;
+  } | null;
+  profile: {
+    rollNumber: string | null;
+    department: string | null;
+    yearOfStudy: number | null;
+    verificationStatus: VerificationStatus;
+    verifiedAt: string | null;
+    govtIdType: string | null;
+    govtIdLast4: string | null;
+    riderTermsAcceptedAt: string | null;
+  } | null;
+  /** Null if the student never rode. */
+  rider: { workModeOn: boolean; activeTaskId: string | null; barredUntil: string | null } | null;
+  submissions: {
+    id: string;
+    status: string;
+    submittedAt: string;
+    decidedAt: string | null;
+    rejectionReason: string | null;
+    rejectionNote: string | null;
+  }[];
+  counts: { orders: number; tasksRequested: number; tasksDelivered: number };
+  /** Up to ten, newest first. */
+  recentOrders: {
+    id: string;
+    reference: string;
+    status: OrderStatus;
+    totalMinor: number;
+    createdAt: string;
+    shopName: string;
+  }[];
+  recentTasks: {
+    id: string;
+    type: string;
+    status: TaskStatus;
+    role: 'REQUESTER' | 'RIDER';
+    feeMinor: number;
+    createdAt: string;
+  }[];
+}
+
+export interface StudentSuspension {
+  studentId: string;
+  status: 'SUSPENDED';
+  reason: string;
+  suspendedAt: string;
+  suspendedBy: PersonRef | null;
+  sessionsRevoked: number;
+  taskReleased: string | null;
+  message: string;
+}
+
+export interface StudentReinstatement {
+  studentId: string;
+  status: 'ACTIVE';
+  reinstatedAt: string;
+  reinstatedBy: PersonRef | null;
+  message: string;
+}
+
+export type ShopListingStatus = 'PENDING_VERIFICATION' | 'ACTIVE' | 'SUSPENDED' | 'REJECTED';
+
+export interface AdminShopListQuery {
+  status?: ShopListingStatus;
+  /** Shop name, "contains". */
+  q?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface AdminShopListItem {
+  listingId: string;
+  status: ShopListingStatus;
+  distanceM: number;
+  submittedAt: string;
+  flaggedForRadiusReview: boolean;
+  shop: { id: string; name: string; category: string; locationType: string };
+}
+
+/** `GET /admin/shops/:listingId` (A-06). Document bytes stay behind the audited route. */
+export interface AdminShopDetail {
+  listingId: string;
+  collegeId: string;
+  status: ShopListingStatus;
+  distanceM: number;
+  distanceLabel: string;
+  radiusM: number;
+  withinRadius: boolean;
+  flaggedForRadiusReviewAt: string | null;
+  submittedAt: string;
+  approval: { approvedAt: string; approvedBy: PersonRef | null } | null;
+  rejection: { reason: string | null; note: string | null } | null;
+  suspension: {
+    reason: string | null;
+    suspendedAt: string | null;
+    suspendedBy: PersonRef | null;
+  } | null;
+  shop: {
+    id: string;
+    name: string;
+    category: string;
+    ownerName: string;
+    ownerMobile: string;
+    ownerEmail: string | null;
+    address: string;
+    city: string;
+    state: string;
+    pincode: string;
+    latitude: number;
+    longitude: number;
+    pinAdjusted: boolean;
+    locationType: string;
+    fssaiLicenceNumber: string | null;
+    gstin: string | null;
+  };
+  staff: { userId: string; name: string; isOwner: boolean; status: AuthUser['status'] }[];
+  documents: {
+    id: string;
+    docType: string;
+    fileName: string | null;
+    mimeType: string | null;
+    sizeBytes: number | null;
+    uploadedAt: string;
+  }[];
+  counts: { catalogItems: number; orders: number; inFlightOrders: number };
+  /** `average` is null until the shop has a rating. */
+  rating: { average: number | null; count: number };
+}
+
+export interface ShopSuspension {
+  listingId: string;
+  status: 'SUSPENDED';
+  reason: string;
+  suspendedAt: string;
+  suspendedBy: PersonRef | null;
+  inFlightOrders: number;
+  message: string;
+}
+
+export interface ShopReinstatement {
+  listingId: string;
+  status: 'ACTIVE';
+  reinstatedAt: string;
+  reinstatedBy: PersonRef | null;
+  message: string;
+}
+
+// ===========================================================================
+// Privacy notice, data export, account deletion (A5 contract; FR-PRIV-01, -05)
+// ===========================================================================
+
+/** Which notice a user accepted, and when. */
+export interface PrivacyNoticeAcceptance {
+  version: string;
+  acceptedAt: string;
+}
+
+/** `GET /legal/privacy-notice` — public. */
+export interface PrivacyNotice {
+  version: string;
+  effectiveFrom: string;
+  title: string;
+  /** Always these four keys, in this order. */
+  sections: {
+    key: 'dataCollected' | 'purpose' | 'retention' | 'grievance';
+    heading: string;
+    body: string;
+  }[];
+  grievanceContact: { name: string | null; email: string | null };
+  /** When true, a registration without `privacyNoticeVersion` is refused. */
+  acceptanceRequired: boolean;
+}
+
+/**
+ * `GET /account/export` (FR-PRIV-05, S-55): the caller's own data, oldest
+ * first in every list. No document images, and nobody else's name or id.
+ * Shaped from AccountService.exportData, which sends a little more than the
+ * first issue of the contract listed (order and line notes, a requested
+ * task's description and completion time).
+ */
+export interface AccountExport {
+  exportedAt: string;
+  formatVersion: number;
+  account: {
+    id: string;
+    name: string;
+    mobile: string;
+    email: string;
+    role: AuthUser['role'];
+    status: AuthUser['status'];
+    createdAt: string;
+    lastLoginAt: string | null;
+    college: { id: string; name: string } | null;
+    privacyNotice: PrivacyNoticeAcceptance | null;
+  };
+  studentProfile: {
+    rollNumber: string | null;
+    department: string | null;
+    yearOfStudy: number | null;
+    verificationStatus: VerificationStatus;
+    verifiedAt: string | null;
+    govtIdType: string | null;
+    govtIdLast4: string | null;
+    riderTermsVersion: string | null;
+    riderTermsAcceptedAt: string | null;
+  } | null;
+  verificationSubmissions: {
+    id: string;
+    status: string;
+    submittedAt: string;
+    decidedAt: string | null;
+    rejectionReason: string | null;
+    rejectionNote: string | null;
+    rollNumber: string | null;
+    department: string | null;
+    yearOfStudy: number | null;
+    govtIdType: string | null;
+    govtIdLast4: string | null;
+  }[];
+  orders: {
+    id: string;
+    reference: string;
+    status: OrderStatus;
+    createdAt: string;
+    shopName: string;
+    itemsSubtotalMinor: number;
+    deliveryFeeMinor: number;
+    platformFeeMinor: number;
+    totalMinor: number;
+    paymentMethod: PaymentMethod;
+    /** The delivery point's name, else the free-text landmark, else null. */
+    deliveryLabel: string | null;
+    studentNote: string | null;
+    items: { name: string; quantity: number; unitPriceMinor: number; note: string | null }[];
+  }[];
+  tasksRequested: {
+    id: string;
+    type: string;
+    status: TaskStatus;
+    createdAt: string;
+    completedAt: string | null;
+    pickupLabel: string;
+    dropLabel: string;
+    description: string | null;
+    feeMinor: number;
+  }[];
+  tasksDelivered: {
+    id: string;
+    type: string;
+    status: TaskStatus;
+    assignedAt: string | null;
+    completedAt: string | null;
+    pickupLabel: string;
+    dropLabel: string;
+    feeMinor: number;
+  }[];
+  walletEntries: {
+    id: string;
+    createdAt: string;
+    direction: 'CREDIT' | 'DEBIT';
+    type: string;
+    amountMinor: number;
+    balanceAfterMinor: number;
+    taskId: string | null;
+    orderId: string | null;
+    note: string | null;
+  }[];
+  withdrawals: { id: string; status: string; amountMinor: number; requestedAt: string }[];
+}
+
+/**
+ * `POST /auth/password/change`: a fresh token pair, because the change ends
+ * every existing session of the account, the caller's own included.
+ */
+export interface PasswordChange {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: string;
+  sessionsRevoked: number;
+  message: string;
+}
+
+/** `PATCH /account/profile` (S-50). Email, mobile and verified fields are not editable. */
+export interface ProfileUpdate {
+  /** 2 to 100 characters. */
+  name?: string;
+  /** The `key` from `uploads.url` with kind `AVATAR`; null removes the photo. */
+  avatarKey?: string | null;
+}
+
+/** `POST /account/delete`. */
+export interface AccountDeletion {
+  status: 'DEACTIVATED';
+  deletedAt: string;
+  /** Human-readable names of what was scrubbed and what was kept. */
+  erased: string[];
+  retained: string[];
+  message: string;
+}
+
+// ===========================================================================
+// Platform administration (A5 contract; SUPER_ADMIN only; A-16, A-18)
+// ===========================================================================
+
+export interface PlatformCollege {
+  id: string;
+  name: string;
+  shortName: string | null;
+  address: string;
+  city: string;
+  state: string;
+  latitude: number;
+  longitude: number;
+  timezone: string;
+  emailDomain: string | null;
+  contactName: string | null;
+  contactPhone: string | null;
+  contactEmail: string | null;
+  status: 'ACTIVE' | 'INACTIVE';
+  serviceableRadiusM: number;
+  createdAt: string;
+  counts: { admins: number; students: number; shopListings: number };
+}
+
+export interface PlatformAdmin {
+  id: string;
+  name: string;
+  mobile: string;
+  email: string;
+  status: AuthUser['status'];
+  collegeId: string;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export interface PlatformCollegeCreate {
+  name: string;
+  shortName?: string;
+  address: string;
+  city: string;
+  state: string;
+  latitude: number;
+  longitude: number;
+  /** 1000 to 5000; the server defaults to 3000. */
+  serviceableRadiusM?: number;
+  /** IANA name; the server defaults to Asia/Kolkata. */
+  timezone?: string;
+  emailDomain?: string;
+  contactName?: string;
+  contactPhone?: string;
+  contactEmail?: string;
+}
+
+export interface PlatformAdminCreate {
+  name: string;
+  mobile: string;
+  email: string;
+  /** At least ten characters. There are no email invites: this is the first password. */
+  password: string;
 }

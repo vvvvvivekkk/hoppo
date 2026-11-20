@@ -82,6 +82,17 @@ test('STUDENT_ACCOUNT_REQUIRED does not send anyone to student verification', ()
   assert.equal(err('VERIFICATION_REQUIRED', 403).needsVerification, true);
 });
 
+test('401 UNAUTHENTICATED ends the session; 403 PASSWORD_INCORRECT does not', () => {
+  // The API's code for "no valid login" is UNAUTHENTICATED (not UNAUTHORIZED).
+  assert.equal(err('UNAUTHENTICATED', 401).isAuthFailure, true);
+  assert.equal(err('UNAUTHENTICATED', 401).accountBlocked, null);
+  // A wrong current password on change-password or delete-account is a 403
+  // about the form, not the session.
+  const wrong = err('PASSWORD_INCORRECT', 403);
+  assert.equal(wrong.isAuthFailure, false);
+  assert.equal(wrong.isRetryable, false);
+});
+
 test('the getter removed in round two stays removed', () => {
   assert.equal('isAccountBlocked' in err('ACCOUNT_SUSPENDED', 401), false);
 });

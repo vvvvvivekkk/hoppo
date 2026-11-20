@@ -26,7 +26,14 @@ export class ApiError extends Error {
     this.name = 'ApiError';
   }
 
-  /** The session is gone or the account is no longer usable. */
+  /**
+   * The session is gone or the account is no longer usable.
+   *
+   * Any 401 counts. The API's code for "no valid login" is `UNAUTHENTICATED`;
+   * the test here is the status rather than that string, so it does not
+   * depend on the spelling. A 403 such as `PASSWORD_INCORRECT` (a wrong
+   * current password) or `SHOP_NOT_APPROVED` is not an auth failure.
+   */
   get isAuthFailure(): boolean {
     return (
       this.status === 401 ||
