@@ -59,6 +59,25 @@ describe('RolesGuard', () => {
     const guard = new RolesGuard(reflectorReturning({ roles: ['ADMIN'] }));
     expect(() => guard.canActivate(contextWith(undefined))).toThrow(ForbiddenException);
   });
+
+  // A route that lists only STUDENT is a student acting on their own
+  // account. The platform owner is not a student: the blanket pass used to
+  // let a super administrator reach POST /account/delete.
+  it('does not let a super administrator onto a student-only endpoint', () => {
+    const guard = new RolesGuard(reflectorReturning({ roles: ['STUDENT'] }));
+    expect(() => guard.canActivate(contextWith({ ...student, role: 'SUPER_ADMIN' }))).toThrow(
+      ForbiddenException,
+    );
+    // The student it is for still passes.
+    expect(guard.canActivate(contextWith(student))).toBe(true);
+  });
+
+  it('lets a super administrator onto any endpoint that names a staff role', () => {
+    for (const roles of [['ADMIN'], ['SHOP_OWNER', 'SHOP_STAFF'], ['STUDENT', 'ADMIN']]) {
+      const guard = new RolesGuard(reflectorReturning({ roles }));
+      expect(guard.canActivate(contextWith({ ...student, role: 'SUPER_ADMIN' }))).toBe(true);
+    }
+  });
 });
 
 describe('VerifiedGuard', () => {

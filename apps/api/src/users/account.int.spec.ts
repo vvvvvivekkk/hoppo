@@ -69,7 +69,12 @@ async function world(tx: Tx) {
 
   const auth = { revokeAllSessions: jest.fn().mockResolvedValue(1) };
   const redis = { removeRider: jest.fn().mockResolvedValue(undefined) };
-  const storage = { deletePrivateObject: jest.fn().mockResolvedValue(true) };
+  const storage = {
+    deletePrivateObject: jest.fn().mockResolvedValue(true),
+    deletePublicObject: jest.fn().mockResolvedValue(true),
+    publicKeyFromUrl: (url: string | null) =>
+      url ? (url.split('/hoppo-public/')[1] ?? null) : null,
+  };
   const gateway = { disconnectUser: jest.fn() };
   const prisma = prismaOver(tx) as never;
   const service = new AccountService(

@@ -3,11 +3,28 @@ import type { PrismaService } from '../prisma/prisma.service';
 
 type Reader = Pick<PrismaService, 'user' | 'auditLog'> | Prisma.TransactionClient;
 
-/** FR-PRIV-01: which privacy notice this person last accepted, and when. */
+/**
+ * FR-PRIV-01: which privacy notice this person last accepted, and when.
+ *
+ * Read from the account's own columns. An acceptance recorded before those
+ * columns existed lives only in the audit log, so that is consulted when the
+ * columns are empty — once, as a fallback, not as a second source of truth.
+ */
 export async function readPrivacyAcceptance(
   prisma: Reader,
   userId: string,
 ): Promise<{ version: string; acceptedAt: Date } | null> {
+  const account = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { privacyNoticeVersion: true, privacyNoticeAcceptedAt: true },
+  });
+  if (account?.privacyNoticeVersion && account.privacyNoticeAcceptedAt) {
+    return {
+      version: account.privacyNoticeVersion,
+      acceptedAt: account.privacyNoticeAcceptedAt,
+    };
+  }
+
   const acceptance = await prisma.auditLog.findFirst({
     where: { action: 'PRIVACY_NOTICE_ACCEPTED', targetType: 'user', targetId: userId },
     orderBy: { createdAt: 'desc' },

@@ -268,8 +268,28 @@ export class PlatformService {
       });
     }
 
-    const updated = await this.prisma.$transaction(async (tx) => {
+    const { updated, memberIds, sessionsRevoked } = await this.prisma.$transaction(async (tx) => {
       const row = await tx.college.update({ where: { id: collegeId }, data: { status } });
+
+      let members: string[] = [];
+      let revoked = 0;
+      if (status === 'INACTIVE') {
+        // Every account of the tenant, whatever its role or standing: these
+        // are the people whose sessions and sockets have to end now.
+        members = (
+          await tx.user.findMany({ where: { collegeId }, select: { id: true } })
+        ).map((u) => u.id);
+
+        // In the same transaction as the status change, so there is no
+        // moment at which the college is inactive and its refresh tokens live.
+        revoked = (
+          await tx.refreshToken.updateMany({
+            where: { user: { collegeId }, revokedAt: null },
+            data: { revokedAt: new Date() },
+          })
+        ).count;
+      }
+
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
         collegeId,
@@ -277,10 +297,27 @@ export class PlatformService {
           status === 'ACTIVE' ? AuditAction.COLLEGE_ACTIVATED : AuditAction.COLLEGE_DEACTIVATED,
         targetType: 'college',
         targetId: collegeId,
-        detail: reason ? { reason } : undefined,
+        detail:
+          status === 'INACTIVE'
+            ? { ...(reason ? { reason } : {}), sessionsRevoked: revoked, accounts: members.length }
+            : reason
+              ? { reason }
+              : undefined,
       });
-      return row;
+      return { updated: row, memberIds: members, sessionsRevoked: revoked };
     });
+
+    // After the commit, never before: a socket dropped for a deactivation
+    // that then rolled back would be a disconnection for nothing. A socket is
+    // authenticated once, at connect, so without this an open one would keep
+    // receiving offers and chat from a college that is switched off.
+    for (const memberId of memberIds) this.gateway.disconnectUser(memberId);
+
+    if (status === 'INACTIVE') {
+      this.logger.warn(
+        `College ${collegeId} deactivated by ${user.userId}: ${sessionsRevoked} session(s) revoked, ${memberIds.length} account(s) disconnected`,
+      );
+    }
 
     return (await this.shapeColleges([updated]))[0];
   }

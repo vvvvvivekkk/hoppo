@@ -46,19 +46,37 @@ export const OPEN_ORDER_STATUSES: OrderStatus[] = [
   'DELIVERED',
 ];
 
+/** What deletion always erases, in the words the response uses. */
 export const ERASED_ON_DELETION = [
   'name',
-  'mobile',
-  'email',
-  'avatar',
-  'rollNumber',
-  'department',
-  'identity documents',
+  'mobile number',
+  'email address',
+  'password',
+  'roll number and department',
+  'government ID type and last four characters',
+  'identity document references',
+  'profile photo reference',
+  'notes written on your orders',
+  'descriptions written on your tasks',
+  'bank and UPI details on your withdrawal requests',
+  'verification codes sent to your mobile number or email address',
+  'notes an administrator wrote when rejecting a verification submission',
+  'undecided verification submissions',
   'device tokens',
-  'sessions',
+  'sessions, with their IP addresses and device details',
+  'last known rider location',
 ] as const;
 
-export const RETAINED_ON_DELETION = ['orders', 'tasks', 'wallet entries', 'audit log'] as const;
+/** What is kept, and in what form (FR-PRIV-05). */
+export const RETAINED_ON_DELETION = [
+  'orders (items, amounts, delivery point or landmark, times)',
+  'tasks (pickup and drop labels, fees, times)',
+  'wallet entries and withdrawal amounts',
+  'decided verification submissions (the decision only)',
+  'ratings and chat messages you wrote',
+  'community posts, comments and reports you wrote',
+  'audit log entries',
+] as const;
 
 /**
  * FR-PRIV-05: "A student shall be able to request export of their personal
@@ -98,9 +116,10 @@ export class AccountService {
    *    verification submission.
    * Each is refused with its own code so a client can say why.
    *
-   * A name change is audited with the old and new value: the name is what
-   * shops and riders see, and an administrator should be able to tell that
-   * a verified account now shows a different one.
+   * A change is audited as "the name changed", without the old or new
+   * value: an administrator can see that a verified account's display name
+   * was edited and when, and the append-only log holds nothing that account
+   * deletion would later be unable to erase.
    */
   async updateProfile(user: AuthenticatedUser, dto: UpdateProfileDto) {
     if (dto.email !== undefined || dto.mobile !== undefined) {
@@ -142,11 +161,14 @@ export class AccountService {
     if (!current) throw new ForbiddenException('Account not found');
 
     const data: { name?: string; avatarUrl?: string | null } = {};
-    const changed: Record<string, { from: string | null; to: string | null }> = {};
+    // Which fields changed — never their values. The audit log is
+    // append-only: a name written into it could not be erased when the
+    // person later deletes their account.
+    const changed: string[] = [];
 
     if (dto.name !== undefined && dto.name !== current.name) {
       data.name = dto.name;
-      changed.name = { from: current.name, to: dto.name };
+      changed.push('name');
     }
 
     if (dto.avatarKey !== undefined) {
@@ -166,7 +188,7 @@ export class AccountService {
       }
       if (avatarUrl !== current.avatarUrl) {
         data.avatarUrl = avatarUrl;
-        changed.avatar = { from: current.avatarUrl, to: avatarUrl };
+        changed.push('avatar');
       }
     }
 
@@ -179,9 +201,16 @@ export class AccountService {
           action: AuditAction.PROFILE_UPDATED,
           targetType: 'user',
           targetId: userId,
-          detail: changed,
+          detail: { changed },
         });
       });
+    }
+
+    // The photo that was replaced or removed is no longer referenced by
+    // anything: remove the object too, not only the pointer to it.
+    if (data.avatarUrl !== undefined) {
+      const oldKey = this.storage.publicKeyFromUrl(current.avatarUrl);
+      if (oldKey) await this.storage.deletePublicObject(oldKey).catch(() => false);
     }
 
     // Exactly what GET /auth/me now returns.
@@ -412,19 +441,41 @@ export class AccountService {
    * wallet balance (money that would be stranded), or a withdrawal an
    * administrator has yet to pay.
    *
-   * What goes: name, mobile, email, avatar, roll number, department,
-   * identity-document references (and the objects themselves, best effort),
-   * device tokens, sessions. What stays, per FR-PRIV-05: orders, tasks,
-   * wallet entries and the audit log — they still reference this row, which
-   * is why the row is scrubbed and DEACTIVATED rather than removed.
+   * What goes and what stays is ERASED_ON_DELETION and RETAINED_ON_DELETION,
+   * which are also what the response says — the lists are the contract, so
+   * they must stay exactly true. The row itself is scrubbed and DEACTIVATED
+   * rather than removed because orders, tasks, wallet entries and audit
+   * entries still reference it (FR-PRIV-05).
    */
   async deleteAccount(user: AuthenticatedUser, password: string) {
+    // Students only, checked here as well as by @Roles: this erases an
+    // account irreversibly, and an administrator's or the platform owner's
+    // account must never be closable by a route written for students —
+    // whatever a guard upstream does or does not let through.
+    if (user.role !== 'STUDENT') {
+      throw new ForbiddenException({
+        code: 'ACCOUNT_DELETION_NOT_AVAILABLE',
+        message:
+          'Only student accounts can be deleted here. Administrator and shop accounts ' +
+          'are closed by the platform administrator.',
+      });
+    }
+
     const userId = user.userId;
 
     const account = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, collegeId: true, passwordHash: true },
+      select: { id: true, collegeId: true, role: true, passwordHash: true, avatarUrl: true },
     });
+
+    // The role on the token is the role in the database (the JWT strategy
+    // reads it per request), but this is the last line before an erasure.
+    if (account && account.role !== 'STUDENT') {
+      throw new ForbiddenException({
+        code: 'ACCOUNT_DELETION_NOT_AVAILABLE',
+        message: 'Only student accounts can be deleted here.',
+      });
+    }
 
     if (!account || !(await argon2.verify(account.passwordHash, password).catch(() => false))) {
       throw new ForbiddenException({
@@ -504,6 +555,13 @@ export class AccountService {
         ...submissions.flatMap((s) => [s.idCardUrl, s.govtIdImageUrl]),
       ].filter((k): k is string => typeof k === 'string' && k.length > 0);
 
+      // The real number and address, read under the lock taken above, for
+      // the rows elsewhere that are keyed by them rather than by user id.
+      const contact = await tx.user.findUniqueOrThrow({
+        where: { id: userId },
+        select: { mobile: true, email: true },
+      });
+
       // Unique placeholders: `mobile` and `email` are UNIQUE NOT NULL, and
       // replacing them frees the real number and address to register again.
       const marker = `deleted-${userId}`;
@@ -546,17 +604,43 @@ export class AccountService {
           rollNumber: '',
           department: '',
           idCardUrl: '',
+          govtIdType: null,
           govtIdLast4: null,
+          // Free text an administrator wrote about this person's documents.
+          rejectionNote: null,
           govtIdImageUrl: null,
           govtIdImageExpiresAt: null,
         },
       });
 
-      await tx.deviceToken.deleteMany({ where: { userId } });
-      await tx.refreshToken.updateMany({
-        where: { userId, revokedAt: null },
-        data: { revokedAt: deletedAt },
+      // Free text the person typed, on rows that are otherwise kept. These
+      // tables belong to the orders, dispatch and wallet domains; the
+      // statements are plain UPDATEs of the person's own rows, nothing else.
+      await tx.order.updateMany({
+        where: { studentId: userId, studentNote: { not: null } },
+        data: { studentNote: null },
       });
+      await tx.task.updateMany({
+        where: { requesterId: userId, description: { not: null } },
+        data: { description: null },
+      });
+      await tx.withdrawalRequest.updateMany({
+        where: { userId },
+        data: { bankAccountLast4: null, bankIfsc: null, upiId: null },
+      });
+
+      // OTP challenges are keyed by the number or address they were sent to,
+      // not by user: every one of them holds this person's real mobile or
+      // email in `recipient`. They are found by `contact`, which was read
+      // before the account row was scrubbed.
+      await tx.otpChallenge.deleteMany({
+        where: { recipient: { in: [contact.mobile, contact.email] } },
+      });
+
+      await tx.deviceToken.deleteMany({ where: { userId } });
+      // Deleted, not merely revoked: each row carries the IP address and
+      // user agent of a device the person signed in from.
+      await tx.refreshToken.deleteMany({ where: { userId } });
       await tx.riderState.updateMany({
         where: { userId },
         data: { workModeOn: false, lastLatitude: null, lastLongitude: null, lastPingAt: null },
@@ -569,7 +653,7 @@ export class AccountService {
         action: AuditAction.ACCOUNT_DELETED,
         targetType: 'user',
         targetId: userId,
-        detail: { requestedBy: 'SELF', documentsErased: keys.length },
+        detail: { requestedBy: 'SELF', documentReferencesErased: keys.length },
       });
 
       return keys;
@@ -585,16 +669,40 @@ export class AccountService {
     }
     this.gateway.disconnectUser(userId);
 
+    // Stored objects: identity documents in the private bucket, the profile
+    // photo in the public one. Best effort, and reported for what it was.
+    const documentKeySet = new Set(documentKeys);
     let documentsRemoved = 0;
-    for (const key of new Set(documentKeys)) {
+    for (const key of documentKeySet) {
       const removed = await this.storage.deletePrivateObject(key).catch(() => false);
       if (removed) documentsRemoved += 1;
     }
-    if (documentsRemoved < new Set(documentKeys).size) {
-      // The references are gone either way; the objects are now orphans that
-      // the storage retention job has to collect.
+
+    const avatarKey = this.storage.publicKeyFromUrl(account.avatarUrl);
+    const avatarRemoved = avatarKey
+      ? await this.storage.deletePublicObject(avatarKey).catch(() => false)
+      : false;
+
+    const filesExpected = documentKeySet.size + (avatarKey ? 1 : 0);
+    const filesRemoved = documentsRemoved + (avatarRemoved ? 1 : 0);
+
+    const caveats: string[] = [
+      // Always true, and always said: the audit log cannot be edited.
+      'Audit log entries cannot be altered. Entries written before this deletion are kept ' +
+        'as they were and may include details recorded at the time, such as a previous ' +
+        'display name, or the IP address and device of a sign-in.',
+      'Ratings, chat messages, community posts, comments and reports you wrote are kept, ' +
+        'shown as from a deleted user.',
+    ];
+    if (filesRemoved < filesExpected) {
+      // The references are gone either way; the objects are now orphans.
       this.logger.warn(
-        `Account ${userId} deleted; ${new Set(documentKeys).size - documentsRemoved} document object(s) could not be removed from storage`,
+        `Account ${userId} deleted; ${filesExpected - filesRemoved} of ${filesExpected} stored file(s) could not be removed from storage`,
+      );
+      caveats.push(
+        `${filesExpected - filesRemoved} stored file(s) (identity documents or profile photo) ` +
+          'could not be removed from file storage. Nothing in your account points to them ' +
+          'any more, but the files themselves remain until an administrator removes them.',
       );
     }
 
@@ -603,6 +711,8 @@ export class AccountService {
       deletedAt,
       erased: ERASED_ON_DELETION,
       retained: RETAINED_ON_DELETION,
+      storedFiles: { expected: filesExpected, removed: filesRemoved },
+      caveats,
       message:
         'Your account has been deleted. Records of past orders, deliveries and wallet entries ' +
         'are kept without your personal details, as needed for settlement and disputes.',

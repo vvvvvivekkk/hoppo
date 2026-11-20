@@ -190,6 +190,37 @@ export class StorageService {
   }
 
   /**
+   * The object key behind a URL made by `publicUrl`, or null for anything
+   * else. Lets a stored avatar URL be traced back to the object so the
+   * object, not only the reference, can be deleted.
+   */
+  publicKeyFromUrl(url: string | null | undefined): string | null {
+    if (!url) return null;
+    const marker = `/${this.publicBucket}/`;
+    const at = url.indexOf(marker);
+    if (at < 0) return null;
+    const key = url.slice(at + marker.length);
+    return key.length > 0 && !key.includes('..') ? key : null;
+  }
+
+  /** Remove an object from the public bucket (a profile photo, a catalog image). */
+  async deletePublicObject(key: string): Promise<boolean> {
+    if (!this.client) return false;
+
+    try {
+      await this.client.send(new DeleteObjectCommand({ Bucket: this.publicBucket, Key: key }));
+      this.logger.log(`Deleted public object ${key}`);
+      return true;
+    } catch (error) {
+      this.logger.error(
+        `Failed to delete public object ${key}`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return false;
+    }
+  }
+
+  /**
    * FR-ID-03 and FR-PRIV-04: documents are deleted after their retention
    * period, which means something has to actually delete the object and not
    * merely null the column.

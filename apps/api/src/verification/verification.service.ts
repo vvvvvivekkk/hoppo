@@ -384,8 +384,8 @@ export class VerificationService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.verificationSubmission.update({
-        where: { id: submissionId },
+      const moved = await tx.verificationSubmission.updateMany({
+        where: { id: submissionId, status: 'PENDING' },
         data: {
           status: 'VERIFIED',
           decidedByUserId: user.userId,
@@ -394,6 +394,13 @@ export class VerificationService {
           govtIdImageExpiresAt: new Date(Date.now() + 24 * 3_600_000),
         },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'ALREADY_DECIDED', message: 'That submission has already been decided.' });
+      }
 
       await tx.studentProfile.update({
         where: { userId: submission!.userId },
@@ -446,8 +453,8 @@ export class VerificationService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.verificationSubmission.update({
-        where: { id: submissionId },
+      const moved = await tx.verificationSubmission.updateMany({
+        where: { id: submissionId, status: 'PENDING' },
         data: {
           status: 'REJECTED',
           decidedByUserId: user.userId,
@@ -457,6 +464,13 @@ export class VerificationService {
           govtIdImageExpiresAt: new Date(Date.now() + 24 * 3_600_000),
         },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'ALREADY_DECIDED', message: 'That submission has already been decided.' });
+      }
 
       // FR-SVER-06: the student may resubmit, so the profile returns to
       // REJECTED rather than being left PENDING.
@@ -525,16 +539,32 @@ export class VerificationService {
       });
     }
 
+    // A DEACTIVATED account is a closed (deleted) one. Suspending it and then
+    // reinstating it would bring it back to ACTIVE.
+    if (student!.status !== 'ACTIVE') {
+      throw new ConflictException({
+        code: 'NOT_ACTIVE',
+        message: 'Only an active account can be suspended.',
+      });
+    }
+
     const released = await this.prisma.$transaction(async (tx) => {
       const suspendedAt = new Date();
-      await tx.user.update({
-        where: { id: studentId },
+      const moved = await tx.user.updateMany({
+        where: { id: studentId, role: 'STUDENT', status: 'ACTIVE' },
         data: {
           status: 'SUSPENDED',
           suspendedAt,
           suspendedReason: dto.reason,
         },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'NOT_ACTIVE', message: 'Only an active account can be suspended.' });
+      }
 
       /**
        * Cancel the in-flight assignment by returning the task to the pool.
@@ -563,6 +593,7 @@ export class VerificationService {
             status = 'CREATED',
             assigned_at = NULL,
             broadcast_round = 0,
+            broadcast_cycle = broadcast_cycle + 1,
             fee_minor = base_fee_minor,
             current_proximity_m = NULL,
             offer_expires_at = NULL,
@@ -740,10 +771,17 @@ export class VerificationService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.user.update({
-        where: { id: studentId },
+      const moved = await tx.user.updateMany({
+        where: { id: studentId, role: 'STUDENT', status: 'SUSPENDED' },
         data: { status: 'ACTIVE', suspendedAt: null, suspendedReason: null },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'NOT_SUSPENDED', message: 'That account is not suspended.' });
+      }
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,

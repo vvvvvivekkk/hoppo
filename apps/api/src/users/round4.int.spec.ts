@@ -61,7 +61,10 @@ async function accountWorld(tx: Tx) {
   });
   const prisma = prismaOver(tx) as never;
   const storage = {
-    publicUrl: (key: string) => `https://cdn.example.test/${key}`,
+    publicUrl: (key: string) => `https://cdn.example.test/hoppo-public/${key}`,
+    publicKeyFromUrl: (url: string | null) =>
+      url ? (url.split('/hoppo-public/')[1] ?? null) : null,
+    deletePublicObject: jest.fn().mockResolvedValue(true),
     deletePrivateObject: jest.fn(),
   };
   const service = new AccountService(
@@ -78,13 +81,13 @@ async function accountWorld(tx: Tx) {
     role: 'STUDENT',
     isVerified: true,
   };
-  return { service, college, otherCollege, me, user };
+  return { service, college, otherCollege, me, user, storage };
 }
 
 describe('PATCH /account/profile against PostgreSQL (S-50)', () => {
   jest.setTimeout(30_000);
 
-  it('changes the name, audits old and new, and answers like GET /auth/me', async () => {
+  it('changes the name, audits that it changed, and answers like GET /auth/me', async () => {
     await inRolledBackTransaction(db, async (tx) => {
       const w = await accountWorld(tx);
 
@@ -104,7 +107,10 @@ describe('PATCH /account/profile against PostgreSQL (S-50)', () => {
       const audit = await tx.auditLog.findFirstOrThrow({
         where: { action: 'PROFILE_UPDATED', targetId: w.me.id },
       });
-      expect(audit.detail).toEqual({ name: { from: 'Asha Before', to: 'Asha After' } });
+      // That it changed — not from what, nor to what: this row can never be
+      // erased, so it must not hold a name.
+      expect(audit.detail).toEqual({ changed: ['name'] });
+      expect(JSON.stringify(audit)).not.toContain('Asha');
     });
   });
 
@@ -168,10 +174,15 @@ describe('PATCH /account/profile against PostgreSQL (S-50)', () => {
       expect((await tx.user.findUniqueOrThrow({ where: { id: w.me.id } })).avatarUrl).toBeNull();
 
       const set = await w.service.updateProfile(w.user, { avatarKey: mine });
-      expect(set.user).toMatchObject({ avatarUrl: `https://cdn.example.test/${mine}` });
+      expect(set.user).toMatchObject({
+        avatarUrl: `https://cdn.example.test/hoppo-public/${mine}`,
+      });
 
       const cleared = await w.service.updateProfile(w.user, { avatarKey: null });
       expect(cleared.user).toMatchObject({ avatarUrl: null });
+      // The photo itself is removed, not only the pointer to it.
+      expect(w.storage.deletePublicObject).toHaveBeenCalledTimes(1);
+      expect(w.storage.deletePublicObject).toHaveBeenCalledWith(mine);
     });
   });
 

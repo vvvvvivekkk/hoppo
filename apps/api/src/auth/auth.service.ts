@@ -172,6 +172,10 @@ export class AuthService {
           email: dto.email,
           passwordHash,
           mobileVerifiedAt: new Date(),
+          // FR-PRIV-01: version and timestamp, on the account itself.
+          ...(privacyVersion
+            ? { privacyNoticeVersion: privacyVersion, privacyNoticeAcceptedAt: new Date() }
+            : {}),
         },
       });
 
@@ -188,10 +192,9 @@ export class AuthService {
 
       await tx.riderReliability.create({ data: { userId: created.id } });
 
-      // FR-PRIV-01: version and timestamp of the acceptance. Held in the
-      // append-only audit log (the row's createdAt is the timestamp) until
-      // the user table has columns for it; in the same transaction, so an
-      // account cannot exist with its acceptance lost.
+      // FR-PRIV-01: the acceptance is also an entry in the append-only audit
+      // log — the columns say what the account's current state is, the log
+      // says that it happened. Same transaction, so neither exists alone.
       if (privacyVersion) {
         await this.audit.recordInTransaction(tx, {
           actorId: created.id,
@@ -504,6 +507,7 @@ export class AuthService {
         role: true,
         status: true,
         studentProfile: { select: { verificationStatus: true } },
+        college: { select: { status: true } },
       },
     });
 
@@ -515,11 +519,41 @@ export class AuthService {
       });
     }
 
+    // FR-ADM-07: a deactivated tenant's users get no new tokens. Without this
+    // a session opened before the deactivation could be refreshed for thirty
+    // days, each new access token refused by the JWT strategy one request
+    // later — locked out in effect, but still being issued credentials.
+    if (user.college?.status === 'INACTIVE') {
+      await this.revokeFamily(stored.familyId);
+      throw new ForbiddenException({
+        code: 'COLLEGE_INACTIVE',
+        message: 'This college is not currently active on Hoppo.',
+      });
+    }
+
     // Mark the presented token used, then issue a new one in the same family.
-    await this.prisma.refreshToken.update({
-      where: { id: stored.id },
+    //
+    // One conditional statement: the token must still be unused, and its
+    // owner's college (if it has one) must still be ACTIVE, at the moment of
+    // the write. The checks above read that state earlier; a college
+    // deactivated, or the same token presented twice, in between would
+    // otherwise still be handed a new pair. If the deactivation holds the
+    // row, this waits for it and then matches nothing.
+    const rotated = await this.prisma.refreshToken.updateMany({
+      where: {
+        id: stored.id,
+        revokedAt: null,
+        user: { OR: [{ collegeId: null }, { college: { status: 'ACTIVE' } }] },
+      },
       data: { revokedAt: new Date() },
     });
+
+    if (rotated.count === 0) {
+      throw new UnauthorizedException({
+        code: 'REFRESH_INVALID',
+        message: 'Your session has expired. Please log in again.',
+      });
+    }
 
     return this.issueTokens(
       {
@@ -772,8 +806,8 @@ export class AuthService {
   /**
    * Record that a signed-in user accepts the current notice.
    *
-   * Recorded exactly as registration records it — a PRIVACY_NOTICE_ACCEPTED
-   * audit row whose timestamp is the acceptance time — so /auth/me and the
+   * Recorded exactly as registration records it — the two columns on the
+   * account plus a PRIVACY_NOTICE_ACCEPTED audit row — so /auth/me and the
    * data export read one kind of record. Accepting a version already
    * accepted returns the existing acceptance and writes nothing.
    */
@@ -793,10 +827,18 @@ export class AuthService {
     const existing = await readPrivacyAcceptance(this.prisma, user.userId);
     if (existing?.version === version) return existing;
 
-    // recordInTransaction rather than record(): record() swallows a failed
-    // write, and "accepted" must not be reported unless it was stored.
-    await this.prisma.$transaction((tx) =>
-      this.audit.recordInTransaction(tx, {
+    const acceptedAt = new Date();
+
+    // One transaction: the columns on the account (its current state) and
+    // the audit entry (the record that it happened) land together or not at
+    // all. recordInTransaction rather than record(), which swallows a failed
+    // write — "accepted" must not be reported unless it was stored.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.userId },
+        data: { privacyNoticeVersion: version, privacyNoticeAcceptedAt: acceptedAt },
+      });
+      await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
         collegeId: user.collegeId,
         action: AuditAction.PRIVACY_NOTICE_ACCEPTED,
@@ -805,11 +847,10 @@ export class AuthService {
         detail: { version, at: 'IN_APP' },
         ipAddress: ctx.ipAddress,
         userAgent: ctx.userAgent,
-      }),
-    );
+      });
+    });
 
-    const stored = await readPrivacyAcceptance(this.prisma, user.userId);
-    return stored ?? { version, acceptedAt: new Date() };
+    return { version, acceptedAt };
   }
 
   // =======================================================================

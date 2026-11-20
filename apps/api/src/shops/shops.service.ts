@@ -242,6 +242,10 @@ export class ShopsService {
           mobile: dto.ownerMobile,
           email: dto.ownerEmail,
           passwordHash,
+          // FR-PRIV-01: on the account itself, as for a student.
+          ...(privacyVersion
+            ? { privacyNoticeVersion: privacyVersion, privacyNoticeAcceptedAt: new Date() }
+            : {}),
         },
       });
 
@@ -544,8 +548,8 @@ export class ShopsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.shopListing.update({
-        where: { id: listingId },
+      const moved = await tx.shopListing.updateMany({
+        where: { id: listingId, status: 'PENDING_VERIFICATION' },
         data: {
           status: 'ACTIVE',
           approvedByUserId: user.userId,
@@ -553,6 +557,13 @@ export class ShopsService {
           flaggedForRadiusReviewAt: null,
         },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'ALREADY_DECIDED', message: 'That shop has already been decided.' });
+      }
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
@@ -588,14 +599,21 @@ export class ShopsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.shopListing.update({
-        where: { id: listingId },
+      const moved = await tx.shopListing.updateMany({
+        where: { id: listingId, status: 'PENDING_VERIFICATION' },
         data: {
           status: 'REJECTED',
           rejectionReason: dto.reason,
           rejectionNote: dto.note ?? null,
         },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'ALREADY_DECIDED', message: 'That shop has already been decided.' });
+      }
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
@@ -641,10 +659,17 @@ export class ShopsService {
     });
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.shopListing.update({
-        where: { id: listingId },
+      const moved = await tx.shopListing.updateMany({
+        where: { id: listingId, status: 'ACTIVE' },
         data: { status: 'SUSPENDED', closureNote: dto.reason },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'NOT_ACTIVE', message: 'Only an active shop can be suspended.' });
+      }
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,
@@ -698,10 +723,17 @@ export class ShopsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.shopListing.update({
-        where: { id: listingId },
+      const moved = await tx.shopListing.updateMany({
+        where: { id: listingId, status: 'SUSPENDED' },
         data: { status: 'ACTIVE', closureNote: null },
       });
+
+      // The status is part of the UPDATE's own WHERE (ADR-001): two
+      // administrators acting at once cannot both succeed, and the loser's
+      // transaction — audit entry included — rolls back.
+      if (moved.count === 0) {
+        throw new ConflictException({ code: 'NOT_SUSPENDED', message: 'Only a suspended shop can be reinstated.' });
+      }
 
       await this.audit.recordInTransaction(tx, {
         actorId: user.userId,

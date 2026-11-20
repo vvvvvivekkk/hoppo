@@ -18,7 +18,10 @@ const admin: AuthenticatedUser = {
 
 function build(target: Record<string, unknown> | null) {
   const tx = {
-    user: { update: jest.fn().mockResolvedValue({}) },
+    user: {
+      update: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
     riderState: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     chatRoom: { findMany: jest.fn().mockResolvedValue([]), updateMany: jest.fn() },
     chatMember: { updateMany: jest.fn() },
@@ -55,9 +58,10 @@ describe('VerificationService.suspend', () => {
 
     const result = await service.suspend(admin, 'student-1', { reason: 'Fraudulent ID card' });
 
-    expect(tx.user.update).toHaveBeenCalledWith(
+    // Conditional on the account still being an ACTIVE student.
+    expect(tx.user.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'student-1' },
+        where: { id: 'student-1', role: 'STUDENT', status: 'ACTIVE' },
         data: expect.objectContaining({ status: 'SUSPENDED' }),
       }),
     );
@@ -107,8 +111,11 @@ describe('VerificationService.reinstate', () => {
     await expect(service.reinstate(admin, 'student-1')).resolves.toMatchObject({
       status: 'ACTIVE',
     });
-    expect(tx.user.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: 'ACTIVE' }) }),
+    expect(tx.user.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'student-1', role: 'STUDENT', status: 'SUSPENDED' },
+        data: expect.objectContaining({ status: 'ACTIVE' }),
+      }),
     );
   });
 
