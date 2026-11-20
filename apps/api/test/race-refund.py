@@ -78,9 +78,7 @@ def run() -> int:
                                   {"prepMinutes": 60})   # an hour: the dispatcher will not touch it
             if status != 200:
                 raise RuntimeError(f"shop accept failed: {status} {body.get('code')} {body.get('message')}")
-            moved = h.psql(f"UPDATE task SET status='UNFULFILLED', offer_expires_at=NULL, updated_at=now() "
-                           f"WHERE id={h.q(task_id)} AND status='CREATED' RETURNING 1")
-            if moved != "1":
+            if not h.retire_unfulfilled(task_id):
                 raise RuntimeError(f"could not put task {task_id} into UNFULFILLED for the fixture")
             if variant == "D":
                 # "Collect it myself" is only offered once the food is ready.

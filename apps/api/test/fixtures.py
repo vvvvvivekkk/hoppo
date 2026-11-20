@@ -163,6 +163,11 @@ def run() -> int:
                             f"{body.get('code')} {body.get('message')}")
         say(f"account {second} (ADMIN, via the platform API as the super admin)", "created")
 
+    # ---- nobody is left online to pick up a harness's deliveries ------------
+    # (each harness that uses riders does this again for itself on the way in)
+    for line in h.quiet_other_riders(keep=()):
+        say("rider taken offline - " + line, "created")
+
     # ---- the rest through the API -----------------------------------------
     for email in h.RACERS + [WALK_RIDER]:
         accept_rider_terms(email)

@@ -32,6 +32,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PASSWORD = "Hoppo@dev123"
 RACERS = [f"racer{i}@anurag.edu.in" for i in range(1, 6)]
 SHOP_OWNER = "cafe@example.com"
+# Student accounts whose password is the seed's (the seed's own, and the ones fixtures.py makes).
+SEED_PASSWORD_ACCOUNTS = set(RACERS) | {"vivek@anurag.edu.in", "srichandana@anurag.edu.in",
+                                        "fresher@anurag.edu.in", "dropme@anurag.edu.in"}
 RUN = os.urandom(3).hex()
 
 
@@ -676,6 +679,49 @@ def rows(sql_where: str) -> int:
 
 # --- riders ---------------------------------------------------------------
 
+def quiet_other_riders(keep=()) -> list:
+    """
+    Take every rider who is not one of this harness's own offline.
+
+    A broadcast goes to whoever is online and in range. A rider account left
+    online by something else - the browser walk's rider, a person trying the
+    app - is offered the harness's tasks, can accept one, and the harness's own
+    rider is then told ALREADY_TAKEN. So before any harness puts its riders
+    online, everyone else goes offline:
+
+      - through the API (POST /rider/work-mode {enabled:false}, as that rider)
+        for accounts that use the seed password;
+      - for any other account, which the harness cannot sign in as, directly:
+            UPDATE rider_state SET work_mode_on=false WHERE user_id=<id>
+        plus ZREM riders:geo:<college> <id> and SREM riders:busy:<college> <id>
+        in Redis, which is what the route does.
+
+    Returns what it did, for the log. Riders carrying a task keep it: going
+    offline only stops new offers.
+    """
+    keep_ids = {user_id(e) for e in keep}
+    done = []
+    online = psql('SELECT u.id || \'|\' || u.email || \'|\' || COALESCE(u.college_id, \'\') FROM rider_state r '
+                  'JOIN "user" u ON u.id=r.user_id WHERE r.work_mode_on')
+    for line in online.splitlines():
+        uid, email, college = line.split("|")
+        if uid in keep_ids:
+            continue
+        if email in SEED_PASSWORD_ACCOUNTS:      # never guess at anybody else's password
+            off, _ = http("POST", "/rider/work-mode", login(email), {"enabled": False})
+            if off == 200:
+                done.append(f"{email}: offline through the API")
+                continue
+        psql(f"UPDATE rider_state SET work_mode_on=false WHERE user_id={q(uid)}")
+        if college:
+            redis("ZREM", f"riders:geo:{college}", uid)
+            redis("SREM", f"riders:busy:{college}", uid)
+        done.append(f"{email}: offline by SQL (cannot sign in as this account)")
+    for d in done:
+        print(f"  [riders] {d}")
+    return done
+
+
 class Riders:
     """Keeps a set of riders online, free and in range for as long as a harness runs."""
 
@@ -687,6 +733,7 @@ class Riders:
         self.lat, self.lng = c["shop_lat"] + 0.0002, c["shop_lng"] + 0.0002
 
     def __enter__(self):
+        quiet_other_riders(keep=self.emails)
         for e in self.emails:
             status, body = http("POST", "/rider/work-mode", login(e),
                                 {"enabled": True, "latitude": self.lat, "longitude": self.lng})
@@ -790,16 +837,37 @@ def close_open_order(student: str, order_id: str, task_id: str) -> bool:
     the proper way.
     """
     for _ in range(2):
-        moved = psql(f"UPDATE task SET status='UNFULFILLED', offer_expires_at=NULL, updated_at=now() "
-                     f"WHERE id={q(task_id)} AND rider_id IS NULL AND status IN ('CREATED','BROADCASTING','UNFULFILLED') "
-                     "RETURNING 1")
-        if moved != "1":
+        if not retire_unfulfilled(task_id):
             return False
         status, _ = http("POST", f"/orders/{order_id}/unfulfilled", login(student), {"choice": "CANCEL"})
         if status == 200:
             return True
         time.sleep(1.0)
     return False
+
+
+def retire_unfulfilled(task_id: str) -> bool:
+    """
+    Put an unassigned task into UNFULFILLED the way the product does.
+
+    DispatchService.retireUnfulfilled does two things in one transaction: the
+    task goes to UNFULFILLED with no offer deadline, and every PENDING
+    broadcast_log row of that task is resolved as EXPIRED. The harnesses take
+    this shortcut because the real route is three expired sixty-second rounds;
+    a shortcut that moved only the task left "a cancelled task with an offer
+    still pending", a state the product can never produce. Both halves, one
+    transaction, here too.
+    """
+    moved = psql(f"""BEGIN;
+        UPDATE broadcast_log SET outcome='EXPIRED', resolved_at=now()
+          WHERE task_id={q(task_id)} AND outcome='PENDING'
+            AND EXISTS (SELECT 1 FROM task WHERE id={q(task_id)} AND rider_id IS NULL
+                        AND status IN ('CREATED','BROADCASTING','UNFULFILLED'));
+        UPDATE task SET status='UNFULFILLED', offer_expires_at=NULL, updated_at=now()
+          WHERE id={q(task_id)} AND rider_id IS NULL AND status IN ('CREATED','BROADCASTING','UNFULFILLED')
+          RETURNING 1;
+        COMMIT;""")
+    return moved.strip().splitlines()[-1:] == ["1"] or "1" in moved.split()
 
 
 def reissue_code(student: str, task_id: str) -> str:
