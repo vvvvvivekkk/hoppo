@@ -41,7 +41,7 @@ function offeredToThree() {
   const ctx = buildDispatch();
   const { task, order } = seedTask(ctx.prisma, onOffer(1));
   for (const id of ['rider-win', 'rider-lose-1', 'rider-lose-2']) seedRider(ctx.prisma, id);
-  ctx.redis.offer('task-1', ['rider-win', 'rider-lose-1', 'rider-lose-2']);
+  ctx.redis.offer('task-1', ['rider-win', 'rider-lose-1', 'rider-lose-2'], task.firstBroadcastAt);
   return { ctx, task, order: order! };
 }
 
@@ -88,7 +88,12 @@ describe('accept: the conditions in the UPDATE, one at a time', () => {
     const { ctx, task } = offeredToThree();
     Object.assign(task, { status: 'ASSIGNED', riderId: 'rider-lose-1', offerExpiresAt: null });
     // The rider's screen is a moment behind: their read still says on offer.
-    ctx.prisma.$staleRead('task', { ...task, ...onOffer(1), riderId: null });
+    ctx.prisma.$staleRead('task', {
+      ...task,
+      status: 'BROADCASTING',
+      riderId: null,
+      offerExpiresAt: new Date(Date.now() + 60_000),
+    });
 
     expect(await codeOf(ctx.service.accept('rider-win', 'task-1'))).toBe('ALREADY_TAKEN');
     expect(task.riderId).toBe('rider-lose-1');
@@ -159,7 +164,7 @@ describe('accept: the conditions in the UPDATE, one at a time', () => {
 
   it('refuses a rider with no rider-state row at all', async () => {
     const { ctx, task } = offeredToThree();
-    ctx.redis.offer('task-1', ['rider-ghost']);
+    ctx.redis.offer('task-1', ['rider-ghost'], task.firstBroadcastAt);
 
     expect(await codeOf(ctx.service.accept('rider-ghost', 'task-1'))).toBe('ALREADY_HOLDING_TASK');
     expect(task.riderId).toBeNull();
@@ -261,7 +266,7 @@ describe('accept when there is no offer list for the task (M8)', () => {
 
   it('refuses when the list exists but is empty of riders', async () => {
     const { ctx, task } = onOfferWithNoList();
-    ctx.redis.offer('task-1', []);
+    ctx.redis.offer('task-1', [], task.firstBroadcastAt);
 
     expect(await codeOf(ctx.service.accept('rider-1', 'task-1'))).toBe('NOT_OFFERED_TO_YOU');
     expect(task.riderId).toBeNull();
@@ -335,29 +340,271 @@ describe('how long the offer list lives (M8)', () => {
 
     expect(task.broadcastRound).toBe(2);
     expect(ctx.redis.ttls.get(key)).toBeGreaterThanOrEqual(3_600);
-    expect(ctx.redis.offeredTo('task-1')).toEqual(['rider-1', 'rider-2']);
+    expect(ctx.redis.offeredTo('task-1', task.firstBroadcastAt)).toEqual(['rider-1', 'rider-2']);
   });
 
   it('starts afresh when a task returns to the pool', async () => {
     // R-08: a new search. The rider who abandoned it does not keep a standing
-    // right to take it back.
+    // right to take it back — their entry belongs to a search that is over.
     const ctx = buildDispatch();
-    seedTask(ctx.prisma);
-    ctx.redis.offer('task-1', ['rider-abandoned']);
+    const { task } = seedTask(ctx.prisma, { firstBroadcastAt: new Date(Date.now() - 600_000) });
+    ctx.redis.offer('task-1', ['rider-abandoned'], task.firstBroadcastAt);
+    const previousSearch = task.firstBroadcastAt;
     nearby(ctx, 'rider-1');
+    seedRider(ctx.prisma, 'rider-abandoned');
 
     await ctx.service.broadcast('task-1', { round: 0 });
 
-    expect(ctx.redis.offeredTo('task-1')).toEqual(['rider-1']);
+    expect(task.firstBroadcastAt.getTime()).toBeGreaterThan(previousSearch.getTime());
+    expect(ctx.redis.offeredTo('task-1', task.firstBroadcastAt)).toEqual(['rider-1']);
+    expect(await codeOf(ctx.service.accept('rider-abandoned', 'task-1'))).toBe(
+      'NOT_OFFERED_TO_YOU',
+    );
+  });
+
+  it('gives two searches different stamps even in the same millisecond', async () => {
+    const ctx = buildDispatch();
+    const farFuture = new Date(Date.now() + 86_400_000);
+    const { task } = seedTask(ctx.prisma, { firstBroadcastAt: farFuture });
+
+    await ctx.service.broadcast('task-1', { round: 0 });
+
+    expect(task.firstBroadcastAt).toEqual(new Date(farFuture.getTime() + 1));
   });
 
   it('records a round that found nobody, so the task is not left without a list', async () => {
     const ctx = buildDispatch();
-    seedTask(ctx.prisma);
+    const { task } = seedTask(ctx.prisma);
 
     await ctx.service.broadcast('task-1', { round: 0 });
 
-    expect(ctx.redis.offeredTo('task-1')).toEqual([]);
+    expect(ctx.redis.offeredTo('task-1', task.firstBroadcastAt)).toEqual([]);
+  });
+
+  it('reads a plain, unstamped list for a task the dispatcher never broadcast', async () => {
+    // A row put straight into BROADCASTING — which is how the live race
+    // harnesses in apps/api/test set up a task — has no first_broadcast_at,
+    // and its hand-written list has no stamps. It must keep working.
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, { ...onOffer(1), firstBroadcastAt: null });
+    seedRider(ctx.prisma, 'rider-1');
+    seedRider(ctx.prisma, 'rider-outsider');
+    ctx.redis.offer('task-1', ['rider-1']);
+
+    expect(await codeOf(ctx.service.accept('rider-outsider', 'task-1'))).toBe('NOT_OFFERED_TO_YOU');
+    await ctx.service.accept('rider-1', 'task-1');
+    expect(task.riderId).toBe('rider-1');
+  });
+});
+
+describe('when the offer list cannot be written (M8)', () => {
+  /**
+   * The list is written to Redis; the round is written to PostgreSQL. They
+   * can fail separately. The invariant that must survive a failed write:
+   *
+   *     a rider who was sent an offer can accept it,
+   *     and a rider who was not, cannot.
+   *
+   * The first cut of the fail-closed rule broke it three ways, each
+   * reproduced below: it sent offers it had not managed to record, and a
+   * task on offer with no record refuses everybody.
+   *
+   * `failWrite` is the realistic failure: the pipeline's `exec` resolves and
+   * the error sits in the command's own slot, where it is easy not to look.
+   */
+  const failWrite = (ctx: Ctx) => ctx.redis.failCommand('sadd');
+  const heal = (ctx: Ctx) => ctx.redis.failCommand('sadd', 0);
+
+  /** Riders the gateway actually pushed a TASK_OFFER to. */
+  const sentOffers = (ctx: Ctx) =>
+    ctx.server.roomsFor(wsEvents.TASK_OFFER).map((r) => r.slice('user:'.length));
+
+  it('S1: never sends an offer that the rider would then be refused', async () => {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, { dispatchDueAt: new Date(Date.now() - 1_000) });
+    nearby(ctx, 'rider-1');
+    failWrite(ctx);
+
+    await ctx.service.broadcast('task-1', { round: 0 });
+    heal(ctx);
+
+    // Whoever was told about the task must be able to take it. (Nobody being
+    // told is fine — the round is simply tried again.)
+    for (const riderId of sentOffers(ctx)) {
+      await expect(ctx.service.accept(riderId, 'task-1')).resolves.toMatchObject({
+        status: 'ASSIGNED',
+      });
+    }
+
+    // And the search has not been used up: the next tick offers it for real.
+    if (task.status !== 'ASSIGNED') {
+      await ctx.service.dispatchDueTasks();
+      expect(sentOffers(ctx)).toEqual(['rider-1']);
+      await expect(ctx.service.accept('rider-1', 'task-1')).resolves.toMatchObject({
+        status: 'ASSIGNED',
+      });
+    }
+    expect(task).toMatchObject({ status: 'ASSIGNED', riderId: 'rider-1' });
+  });
+
+  it('S1: a round that could not be recorded is not sent, and does not spend a round', async () => {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma);
+    nearby(ctx, 'rider-1');
+    failWrite(ctx);
+
+    const result = await ctx.service.broadcast('task-1', { round: 0 });
+
+    expect(result).toBeNull();
+    expect(ctx.server.emissions).toEqual([]);
+    expect(task).toMatchObject({ status: 'CREATED', broadcastRound: 0, feeMinor: 2000 });
+    expect(ctx.prisma.$rows('broadcastLog')).toEqual([]);
+    expect(ctx.prisma.$rows('riderReliability')).toEqual([]);
+  });
+
+  it('S2: a failed write on the final round does not retire a task a rider wants', async () => {
+    // Round 2 of 3 has expired. The sweep sends round 3 — the last — while
+    // the write is failing. Before: the offer went out unrecorded, the rider
+    // who tapped it was refused, and the next sweep marked the task
+    // UNFULFILLED with a willing rider standing by.
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, {
+      status: 'BROADCASTING',
+      broadcastRound: 2,
+      firstBroadcastAt: new Date(Date.now() - 120_000),
+      offerExpiresAt: new Date(Date.now() - 1_000),
+    });
+    nearby(ctx, 'rider-1');
+    failWrite(ctx);
+
+    await ctx.service.sweepExpiredOffers();
+
+    for (const riderId of sentOffers(ctx)) {
+      await expect(ctx.service.accept(riderId, 'task-1')).resolves.toMatchObject({
+        status: 'ASSIGNED',
+      });
+    }
+
+    heal(ctx);
+    if (task.status !== 'ASSIGNED') {
+      // The final round is still to come: nothing was spent on the failure.
+      expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 2 });
+      await ctx.service.sweepExpiredOffers();
+      expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 3 });
+      expect(sentOffers(ctx)).toEqual(['rider-1']);
+      await ctx.service.accept('rider-1', 'task-1');
+    }
+
+    expect(task).toMatchObject({ status: 'ASSIGNED', riderId: 'rider-1' });
+    expect(ctx.server.of(wsEvents.TASK_STATUS_CHANGED).map((e) => e.payload.status)).not.toContain(
+      'UNFULFILLED',
+    );
+  });
+
+  describe('S3: a task that returned to the pool', () => {
+    /**
+     * rider-old was offered the task and abandoned it. The new search is
+     * offered to rider-new — and its first write to Redis fails.
+     *
+     * Before: the list was one set per task, cleared by a DEL in the same
+     * failed pipeline. So rider-old's entry survived for a day: the rider who
+     * walked away could take the task back without being offered it, and the
+     * rider it was now offered to could not take it at all.
+     */
+    type Failure = 'the write command fails' | 'the connection drops';
+
+    async function secondSearchAfterAFailedWrite(failure: Failure) {
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma);
+
+      // The first search: offered to rider-old, who takes it and abandons it.
+      nearby(ctx, 'rider-old');
+      await ctx.service.broadcast('task-1', { round: 0 });
+      Object.assign(task, {
+        status: 'CREATED',
+        broadcastRound: 0,
+        riderId: null,
+        offerExpiresAt: null,
+        dispatchDueAt: new Date(),
+      });
+      ctx.server.emissions.length = 0;
+
+      // The second search, with rider-old out of range.
+      ctx.redis.findRidersNear.mockResolvedValue([{ userId: 'rider-new', distanceM: 150 }]);
+      seedRider(ctx.prisma, 'rider-new');
+
+      // Either way the new search's list is not written. When the connection
+      // drops, the whole pipeline is lost — including whatever in it was
+      // meant to clear the previous search's list.
+      if (failure === 'the write command fails') failWrite(ctx);
+      else ctx.redis.down();
+      await ctx.service.dispatchDueTasks();
+      heal(ctx);
+      ctx.redis.down(false);
+
+      return { ctx, task };
+    }
+
+    const FAILURES: Failure[] = ['the write command fails', 'the connection drops'];
+
+    it.each(FAILURES)('does not let the previous rider take it back, when %s', async (failure) => {
+      const { ctx, task } = await secondSearchAfterAFailedWrite(failure);
+
+      // Straight after the failure, and again once the round has gone out.
+      if (task.status === 'BROADCASTING') {
+        expect(await codeOf(ctx.service.accept('rider-old', 'task-1'))).toBe('NOT_OFFERED_TO_YOU');
+      }
+      await ctx.service.dispatchDueTasks();
+
+      expect(task.status).toBe('BROADCASTING');
+      expect(await codeOf(ctx.service.accept('rider-old', 'task-1'))).toBe('NOT_OFFERED_TO_YOU');
+      expect(task.riderId).toBeNull();
+    });
+
+    it.each(FAILURES)('lets the rider it is now offered to accept it, when %s', async (failure) => {
+      const { ctx, task } = await secondSearchAfterAFailedWrite(failure);
+      await ctx.service.dispatchDueTasks();
+
+      expect(sentOffers(ctx)).toContain('rider-new');
+      await ctx.service.accept('rider-new', 'task-1');
+
+      expect(task).toMatchObject({ status: 'ASSIGNED', riderId: 'rider-new' });
+    });
+
+    it('keeps the two searches apart even when nothing fails', async () => {
+      // The same separation, without the failure: a new search is a new list.
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma);
+      nearby(ctx, 'rider-old');
+      await ctx.service.broadcast('task-1', { round: 0 });
+      Object.assign(task, {
+        status: 'CREATED',
+        broadcastRound: 0,
+        riderId: null,
+        offerExpiresAt: null,
+      });
+
+      ctx.redis.findRidersNear.mockResolvedValue([{ userId: 'rider-new', distanceM: 150 }]);
+      seedRider(ctx.prisma, 'rider-new');
+      await ctx.service.broadcast('task-1', { round: 0 });
+
+      expect(await codeOf(ctx.service.accept('rider-old', 'task-1'))).toBe('NOT_OFFERED_TO_YOU');
+      await ctx.service.accept('rider-new', 'task-1');
+      expect(task.riderId).toBe('rider-new');
+    });
+  });
+
+  it('treats an unreachable Redis the same way: no record, no offer', async () => {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma);
+    nearby(ctx, 'rider-1');
+    ctx.redis.down();
+
+    const result = await ctx.service.broadcast('task-1', { round: 0 });
+
+    expect(result).toBeNull();
+    expect(ctx.server.emissions).toEqual([]);
+    expect(task.status).toBe('CREATED');
   });
 });
 
@@ -447,7 +694,11 @@ describe('sweepUnacceptedOrders', () => {
 
     const events = ctx.server.of(wsEvents.ORDER_STATUS_CHANGED);
     expect(events).toHaveLength(1);
-    expect([...events[0]!.rooms].sort()).toEqual(['user:owner-1', 'user:staff-1', 'user:student-1']);
+    expect([...events[0]!.rooms].sort()).toEqual([
+      'user:owner-1',
+      'user:staff-1',
+      'user:student-1',
+    ]);
     expect(events[0]!.payload).toEqual({
       orderId: 'order-1',
       status: 'CANCELLED',
@@ -655,6 +906,30 @@ describe('findEligibleRiders', () => {
     expect(await ctx.service.findEligibleRiders({ ...near, pingIntervalSeconds: 5 })).toEqual([]);
   });
 
+  it('has the database exclude stale riders, rather than filtering them afterwards (L4)', async () => {
+    // The cutoff is part of the query that decides who is entitled to an
+    // offer — one statement, one answer. Fetching everyone and dropping the
+    // stale ones in code would pass the tests above and still be a second
+    // implementation of eligibility, free to drift from the first.
+    const ctx = withRiders({ 'rider-fresh': { lastPingAt: seconds(1) } });
+    const before = Date.now();
+
+    await ctx.service.findEligibleRiders(near);
+
+    expect(ctx.prisma.user.findMany).toHaveBeenCalledTimes(1);
+    const cutoff: Date = ctx.prisma.user.findMany.mock.calls[0]![0].where.riderState.lastPingAt.gte;
+    expect(cutoff).toBeInstanceOf(Date);
+    // now - 3 x 15 s, give or take the time the call took.
+    expect(before - cutoff.getTime()).toBeGreaterThanOrEqual(45_000 - 50);
+    expect(before - cutoff.getTime()).toBeLessThanOrEqual(45_000 + 1_000);
+
+    // And with the college's own interval: 3 x 5 s.
+    await ctx.service.findEligibleRiders({ ...near, pingIntervalSeconds: 5 });
+    const strict: Date = ctx.prisma.user.findMany.mock.calls[1]![0].where.riderState.lastPingAt.gte;
+    expect(Date.now() - strict.getTime()).toBeLessThanOrEqual(15_000 + 1_000);
+    expect(Date.now() - strict.getTime()).toBeGreaterThanOrEqual(15_000 - 50);
+  });
+
   it('excludes a rider who is offline, holding a task, or barred', async () => {
     const ctx = withRiders({
       'rider-ok': {},
@@ -693,7 +968,8 @@ describe('broadcast()', () => {
 
     expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1, currentProximityM: 1500 });
     expect(ctx.server.roomsFor(wsEvents.TASK_OFFER)).toEqual(['user:rider-1']);
-    expect(ctx.redis.offeredTo('task-1')).toEqual(['rider-1']);
+    expect(task.firstBroadcastAt).toBeInstanceOf(Date);
+    expect(ctx.redis.offeredTo('task-1', task.firstBroadcastAt)).toEqual(['rider-1']);
     expect(ctx.prisma.$rows('riderReliability')).toEqual([
       expect.objectContaining({ userId: 'rider-1', tasksOffered: 1 }),
     ]);
@@ -735,7 +1011,9 @@ describe('broadcast()', () => {
       expect(result).toBeNull();
       expect(task).toEqual(before);
       expect(ctx.server.emissions).toEqual([]);
-      expect(ctx.redis.offeredTo('task-1')).toBeNull();
+      // (The offer list is written before the round is committed, so one may
+      // exist for a round that was never sent. It grants nothing the search
+      // would not have, and the task row above is what `accept` obeys.)
       expect(ctx.prisma.$rows('riderReliability')).toEqual([]);
       expect(ctx.prisma.$rows('broadcastLog')).toEqual([]);
     }
@@ -792,7 +1070,11 @@ describe('sweepExpiredOffers', () => {
 
     const events = ctx.server.of(wsEvents.TASK_STATUS_CHANGED);
     expect(events).toHaveLength(1);
-    expect([...events[0]!.rooms].sort()).toEqual(['user:owner-1', 'user:staff-1', 'user:student-1']);
+    expect([...events[0]!.rooms].sort()).toEqual([
+      'user:owner-1',
+      'user:staff-1',
+      'user:student-1',
+    ]);
     expect(events[0]!.payload).toEqual({
       taskId: 'task-1',
       status: 'UNFULFILLED',
@@ -894,6 +1176,26 @@ describe('the append-only broadcast log (M5)', () => {
 
     expect(task).toMatchObject({ status: 'ASSIGNED', riderId: 'rider-9', broadcastRound: 2 });
     expect(ctx.server.emissions).toEqual([]);
+  });
+
+  it('resolves only rounds *before* the one going out — `round: { lt: newRound }`', async () => {
+    // A row is resolved when its own round is superseded. A PENDING row for a
+    // *later* round is a leftover from an earlier search that got further
+    // (a suspension returns a task to the pool without tidying the log); it
+    // will be re-opened when this search reaches that round. Stamping it
+    // EXPIRED now would record an expiry, with a time, that never happened.
+    const ctx = buildDispatch();
+    seedTask(ctx.prisma, onOffer(1));
+    ctx.prisma.$seed('broadcastLog', [
+      { id: 'log-1', taskId: 'task-1', round: 1, outcome: 'PENDING', resolvedAt: null },
+      { id: 'log-3', taskId: 'task-1', round: 3, outcome: 'PENDING', resolvedAt: null },
+    ]);
+
+    await ctx.service.broadcast('task-1', { round: 1 });
+
+    const row = (id: string) => ctx.prisma.$rows('broadcastLog').find((l: any) => l.id === id);
+    expect(row('log-1')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+    expect(row('log-3')).toMatchObject({ outcome: 'PENDING', resolvedAt: null });
   });
 
   it('expires the previous round\'s pending row when the next round goes out', async () => {

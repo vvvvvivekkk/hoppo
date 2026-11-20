@@ -386,6 +386,86 @@ describe('submitHandoverCode: wrong codes (M1, M2)', () => {
   });
 });
 
+describe('submitHandoverCode: the conditions in the UPDATE that counts an attempt (M1)', () => {
+  /**
+   * The attempt counter is one raw UPDATE ... RETURNING, and its WHERE is the
+   * whole of the guard: this rider, still carrying, a code to check, under
+   * the cap. Each test lets the rider's read say everything is in order and
+   * seeds the one row a single missing condition would let through — with
+   * the *correct* code, so that anything getting past the UPDATE delivers.
+   */
+  const correct = { code: HANDOVER_CODE } as never;
+
+  /** Refused before the code is looked at: nothing counted, nothing settled. */
+  async function refused(world: World) {
+    const attemptsBefore = world.task.otpAttempts;
+
+    expect(await codeOf(world.rider.submitHandoverCode(rider, 'task-1', correct))).toBe(
+      'NOT_AWAITING_HANDOVER',
+    );
+
+    expect(world.task.otpAttempts).toBe(attemptsBefore);
+    expect(world.task.status).not.toBe('COMPLETED');
+    expect(world.prisma.$rows('walletEntry')).toEqual([]);
+    expect(world.server.emissions).toEqual([]);
+  }
+
+  it("does not count or settle for a task that is now another rider's — `rider_id`", async () => {
+    const world = carrying();
+    movedOn(world, { riderId: 'rider-2' });
+
+    await refused(world);
+    expect(world.task).toMatchObject({ status: 'PICKED_UP', riderId: 'rider-2' });
+  });
+
+  it('does not count or settle for a task that is no longer being carried — `status`', async () => {
+    // An administrator cancelled it. The code is still on the row and the
+    // attempts are under the cap: only the status says this is over.
+    const world = carrying();
+    movedOn(world, { status: 'CANCELLED' }, { status: 'CANCELLED' });
+
+    await refused(world);
+    expect(world.task.status).toBe('CANCELLED');
+  });
+
+  it('does not check a code that is no longer there — `otp_hash IS NOT NULL`', async () => {
+    // Still PICKED_UP, but the hash has gone. Without the condition the
+    // UPDATE hands back a null hash and the verification that follows throws
+    // — a 500, with an attempt spent — instead of a refusal.
+    const world = carrying();
+    movedOn(world, { otpHash: null });
+
+    await refused(world);
+  });
+});
+
+describe('escalation when the delivery completed at the same moment (M2)', () => {
+  it('leaves a completed task completed — `status: PICKED_UP`', async () => {
+    /**
+     * The fifth wrong code is on its way to escalating. Between its attempt
+     * being counted and the escalation UPDATE, a request with the correct
+     * code settles the delivery. Same task, same rider: only the status can
+     * stop a paid, finished delivery being flipped to ESCALATED.
+     */
+    const world = carrying({ otpAttempts: 4 });
+
+    const countAttempt = world.prisma.$queryRaw.getMockImplementation()!;
+    world.prisma.$queryRaw.mockImplementationOnce(async (...args: unknown[]) => {
+      const counted = await countAttempt(...args);
+      Object.assign(world.task, { status: 'COMPLETED', otpHash: null });
+      world.state.activeTaskId = null;
+      return counted;
+    });
+
+    await codeOf(world.rider.submitHandoverCode(rider, 'task-1', { code: '000000' } as never));
+
+    expect(world.task).toMatchObject({ status: 'COMPLETED' });
+    expect(world.task.escalatedAt).toBeUndefined();
+    expect(world.prisma.$rows('auditLog')).toEqual([]);
+    expect(world.server.emissions).toEqual([]);
+  });
+});
+
 // ===========================================================================
 // Handover: completion and settlement
 // ===========================================================================

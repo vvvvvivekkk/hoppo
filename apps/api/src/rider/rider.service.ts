@@ -5,6 +5,7 @@ import {
   Injectable,
   Logger,
 } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomInt } from 'node:crypto';
 import {
@@ -34,6 +35,51 @@ import type {
   SetWorkModeDto,
   SubmitHandoverOtpDto,
 } from './dto/rider.dto';
+
+/**
+ * How a delivery comes to be settled. There are exactly two ways, and they
+ * share one implementation (`RiderService.settleDelivery`):
+ *
+ *  - the rider enters the correct handover code — the task is PICKED_UP;
+ *  - an administrator resolves an escalated task as delivered (FR-ADM-04) —
+ *    the task is ESCALATED.
+ *
+ * Everything else about settlement — the wallet locks, the ledger entries,
+ * the order, the reliability counters — is identical, and must stay
+ * identical: an administrator's "this was delivered" has to pay the rider
+ * exactly what the handover code would have.
+ */
+export interface SettlementOptions {
+  /** The state the task must be in. The conditional UPDATE is on this. */
+  from: 'PICKED_UP' | 'ESCALATED';
+  /**
+   * The student whose wallet holds the order's money, or null. Known before
+   * the transaction starts because it decides which wallets to lock.
+   */
+  walletStudentId: string | null;
+  /** Further columns set by the same conditional UPDATE — a resolution note. */
+  taskData?: Pick<Prisma.TaskUpdateManyMutationInput, 'resolutionNote'>;
+  /** The refusal to throw when the conditional UPDATE matches no row. */
+  whenAlreadySettled: () => Error;
+  /**
+   * More work for the same transaction, after the money has been written and
+   * before it commits — an audit row that must not exist without the
+   * settlement, nor the settlement without it.
+   */
+  alsoInTransaction?: (tx: Prisma.TransactionClient, settled: SettledDelivery) => Promise<void>;
+  /** Extra fields for the `task:status` event. */
+  notifyExtra?: Record<string, unknown>;
+}
+
+export interface SettledDelivery {
+  settledAt: Date;
+  feeMinor: number;
+  /** True when the fee was taken in cash at the door rather than credited (ADR-006). */
+  isCash: boolean;
+  orderId: string | null;
+  orderReference: string | null;
+  reimbursementMinor: number;
+}
 
 @Injectable()
 export class RiderService {
@@ -1024,12 +1070,38 @@ export class RiderService {
     }
 
     // --- correct code: deliver and settle --------------------------------
-    return this.completeDelivery(user.userId, taskId, collegeId, {
+    const settled = await this.settleDelivery(user.userId, taskId, collegeId, {
+      from: 'PICKED_UP',
       // Immutable facts about the order, read above; used only to know whose
       // wallet to lock before the transaction touches a row.
       walletStudentId:
         task!.order?.paymentMethod === 'WALLET' ? task!.order.studentId : null,
+      whenAlreadySettled: () =>
+        new ConflictException({
+          code: 'NOT_AWAITING_HANDOVER',
+          message: 'This task is no longer awaiting handover.',
+        }),
     });
+
+    this.logger.log(
+      `Task ${taskId} completed by ${user.userId}, fee ${settled.feeMinor} (${
+        settled.isCash ? 'cash' : 'wallet'
+      })`,
+    );
+
+    return {
+      taskId,
+      status: 'COMPLETED',
+      deliveredAt: settled.settledAt,
+      feeMinor: settled.feeMinor,
+      feeLabel: formatMinor(settled.feeMinor),
+      settledInCash: settled.isCash,
+      message: settled.isCash
+        ? `Delivered. You keep ${formatMinor(settled.feeMinor)} from the cash you collected.`
+        : `Delivered. ${formatMinor(settled.feeMinor)} added to your wallet.`,
+      // FR-DLV-16: both parties are prompted to rate, and it is skippable.
+      ratingPrompt: { taskId, optional: true },
+    };
   }
 
   /**
@@ -1039,13 +1111,19 @@ export class RiderService {
    * shall be written within the same transaction as the task completion that
    * causes them." A rider marked as having completed a delivery with no
    * corresponding ledger entry would be owed money the books do not show.
+   *
+   * The one place a delivery is settled. Called by the handover-code path
+   * above and by EscalationsService when an administrator resolves an
+   * escalated task as delivered — see SettlementOptions. It is public for
+   * that second caller only; it does no authorisation of its own, so whoever
+   * calls it must already have established that this settlement is allowed.
    */
-  private async completeDelivery(
+  async settleDelivery(
     riderId: string,
     taskId: string,
     collegeId: string,
-    opts: { walletStudentId: string | null },
-  ) {
+    opts: SettlementOptions,
+  ): Promise<SettledDelivery> {
     const now = new Date();
 
     const result = await this.prisma.$transaction(async (tx) => {
@@ -1073,8 +1151,13 @@ export class RiderService {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${walletUserId}))`;
       }
 
-      // DELIVERED then COMPLETED, both legal moves in the state machine.
-      assertTaskTransition(TaskStatus.PICKED_UP, TaskEvent.OTP_VALID);
+      // DELIVERED then COMPLETED, both legal moves in the state machine —
+      // reached by the handover code, or by an administrator's resolution.
+      if (opts.from === 'PICKED_UP') {
+        assertTaskTransition(TaskStatus.PICKED_UP, TaskEvent.OTP_VALID);
+      } else {
+        assertTaskTransition(TaskStatus.ESCALATED, TaskEvent.ADMIN_RESOLVED_DELIVERED);
+      }
       assertTaskTransition(TaskStatus.DELIVERED, TaskEvent.SETTLEMENT_WRITTEN);
 
       /**
@@ -1088,12 +1171,16 @@ export class RiderService {
        * edited afterwards.
        *
        * One conditional UPDATE decides instead. Exactly one request can move
-       * the row out of PICKED_UP; every other changes zero rows and stops
-       * here, before a single ledger entry is written.
+       * the row out of the state it is being settled from (PICKED_UP for a
+       * handover code, ESCALATED for an administrator); every other changes
+       * zero rows and stops here, before a single ledger entry is written.
+       * That is also what makes two administrators resolving the same task at
+       * once safe: one settles, the other is told it is already resolved.
        */
       const settled = await tx.task.updateMany({
-        where: { id: taskId, status: 'PICKED_UP', riderId },
+        where: { id: taskId, status: opts.from, riderId },
         data: {
+          ...opts.taskData,
           status: 'COMPLETED',
           deliveredAt: now,
           completedAt: now,
@@ -1103,12 +1190,7 @@ export class RiderService {
         },
       });
 
-      if (settled.count !== 1) {
-        throw new ConflictException({
-          code: 'NOT_AWAITING_HANDOVER',
-          message: 'This task is no longer awaiting handover.',
-        });
-      }
+      if (settled.count !== 1) throw opts.whenAlreadySettled();
 
       // Read after the UPDATE, inside the transaction that now holds the row:
       // these are the values being settled, and nobody else can change them
@@ -1296,38 +1378,26 @@ export class RiderService {
         });
       }
 
-      return {
+      const settledDelivery: SettledDelivery = {
+        settledAt: now,
         feeMinor: task.feeMinor,
         isCash,
+        orderId: task.order?.id ?? null,
         orderReference: task.order?.reference ?? null,
         reimbursementMinor: task.reimbursementMinor ?? 0,
       };
+
+      await opts.alsoInTransaction?.(tx, settledDelivery);
+
+      return settledDelivery;
     });
 
     await this.freeRiderInRedis(collegeId, riderId);
 
     // M7: to the requester, the rider and the shop — not the college.
-    await this.dispatch.notifyTaskParties(taskId, 'COMPLETED');
+    await this.dispatch.notifyTaskParties(taskId, 'COMPLETED', opts.notifyExtra);
 
-    this.logger.log(
-      `Task ${taskId} completed by ${riderId}, fee ${result.feeMinor} (${
-        result.isCash ? 'cash' : 'wallet'
-      })`,
-    );
-
-    return {
-      taskId,
-      status: 'COMPLETED',
-      deliveredAt: now,
-      feeMinor: result.feeMinor,
-      feeLabel: formatMinor(result.feeMinor),
-      settledInCash: result.isCash,
-      message: result.isCash
-        ? `Delivered. You keep ${formatMinor(result.feeMinor)} from the cash you collected.`
-        : `Delivered. ${formatMinor(result.feeMinor)} added to your wallet.`,
-      // FR-DLV-16: both parties are prompted to rate, and it is skippable.
-      ratingPrompt: { taskId, optional: true },
-    };
+    return result;
   }
 
   /**
@@ -1340,13 +1410,13 @@ export class RiderService {
    * offer from then on, with no way out short of someone editing the
    * database.
    *
-   * The administrator resolution endpoint (FR-ADM-04: resolve as delivered or
-   * cancelled, settling or refunding accordingly) is STILL UNBUILT. Until it
-   * exists an ESCALATED task has no route to a terminal state through the
-   * API. Releasing the rider here is the minimum that keeps a person able to
-   * work; the task keeps its `rider_id` — the CHECK constraint requires one
-   * while ESCALATED, and whoever resolves it needs to know who was carrying
-   * the goods.
+   * An escalated task waits for an administrator (FR-ADM-04 —
+   * EscalationsService, `/admin/escalations`), which can take hours. The
+   * rider is released here rather than then, so a person is not kept from
+   * working for as long as a queue takes to be read. The task keeps its
+   * `rider_id` — the CHECK constraint requires one while ESCALATED, and
+   * whoever resolves it needs to know who was carrying the goods and whom to
+   * pay if it turns out to have been delivered.
    */
   private async escalate(
     taskId: string,
@@ -1400,7 +1470,7 @@ export class RiderService {
    * this runs the transaction has committed, so a Redis hiccup must not turn
    * a completed delivery into an error response.
    */
-  private async freeRiderInRedis(collegeId: string, riderId: string): Promise<void> {
+  async freeRiderInRedis(collegeId: string, riderId: string): Promise<void> {
     try {
       await this.redis.markRiderFree(collegeId, riderId);
     } catch (error) {

@@ -84,6 +84,7 @@ export function seedTask(
     description: null,
     reimbursementMinor: null,
     offerExpiresAt: null,
+    firstBroadcastAt: null,
     dispatchDueAt: null,
     assignedAt: null,
     otpHash: null,
@@ -104,6 +105,9 @@ export function seedTask(
 export const onOffer = (round = 1): Row => ({
   status: 'BROADCASTING',
   broadcastRound: round,
+  // When this search began — which is also what its offer-list entries are
+  // stamped with (see `offerEntry` in dispatch.service.ts).
+  firstBroadcastAt: new Date(Date.now() - 30_000),
   offerExpiresAt: new Date(Date.now() + 60_000),
 });
 

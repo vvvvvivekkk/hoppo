@@ -455,10 +455,19 @@ export function fakePrisma(): any {
         const [row] = sortRows(find(where), orderBy);
         return row ? { ...row } : null;
       },
-      findMany: ({ where, orderBy, take } = {}) =>
-        sortRows(find(where), orderBy)
+      findMany: ({ where, orderBy, take, cursor, skip } = {}) => {
+        let rows = sortRows(find(where), orderBy);
+        // Cursor pagination as Prisma does it: start at the row the cursor
+        // names (which must be in the result), then skip.
+        if (cursor) {
+          const at = rows.findIndex((row) => matchesWhere(row, cursor));
+          rows = at === -1 ? [] : rows.slice(at);
+        }
+        return rows
+          .slice(skip ?? 0)
           .slice(0, take ?? undefined)
-          .map((row) => ({ ...row })),
+          .map((row) => ({ ...row }));
+      },
       count: ({ where } = {}) => find(where).length,
       create: ({ data }) => ({ ...insert(data) }),
       createMany: ({ data, skipDuplicates }) => {
@@ -654,31 +663,42 @@ export function fakeRedis() {
   const sets = new Map<string, Set<string>>();
   const ttls = new Map<string, number>();
   let failing = false;
+  /** Commands that currently fail *inside* a pipeline, and for how many more calls. */
+  const failingCommands = new Map<string, number>();
 
   const guard = () => {
     if (failing) throw new Error('connect ECONNREFUSED 127.0.0.1:6379');
   };
 
   const pipeline = () => {
-    const queued: (() => unknown)[] = [];
+    const queued: { command: string; run: () => unknown }[] = [];
+    const queue = (command: string, run: () => unknown) => (queued.push({ command, run }), chain);
     const chain: any = {
-      del: (key: string) => (queued.push(() => (ttls.delete(key), sets.delete(key) ? 1 : 0)), chain),
-      sadd: (key: string, ...members: string[]) => {
-        queued.push(() => {
+      del: (key: string) => queue('del', () => (ttls.delete(key), sets.delete(key) ? 1 : 0)),
+      sadd: (key: string, ...members: string[]) =>
+        queue('sadd', () => {
           if (!sets.has(key)) sets.set(key, new Set());
           for (const member of members) sets.get(key)!.add(member);
           return members.length;
-        });
-        return chain;
-      },
+        }),
       expire: (key: string, seconds: number) =>
-        (queued.push(() => (sets.has(key) ? (ttls.set(key, seconds), 1) : 0)), chain),
-      exists: (key: string) => (queued.push(() => (sets.has(key) ? 1 : 0)), chain),
+        queue('expire', () => (sets.has(key) ? (ttls.set(key, seconds), 1) : 0)),
+      exists: (key: string) => queue('exists', () => (sets.has(key) ? 1 : 0)),
       sismember: (key: string, member: string) =>
-        (queued.push(() => (sets.get(key)?.has(member) ? 1 : 0)), chain),
+        queue('sismember', () => (sets.get(key)?.has(member) ? 1 : 0)),
+      // As ioredis does: `exec` rejects only when the connection is gone. A
+      // command that fails on the server does not reject — it comes back as
+      // `[error, null]` in its own slot, and the commands around it still ran.
       exec: async () => {
         guard();
-        return queued.map((run) => [null, run()]);
+        return queued.map(({ command, run }) => {
+          const left = failingCommands.get(command) ?? 0;
+          if (left > 0) {
+            failingCommands.set(command, left - 1);
+            return [new Error(`READONLY You can't write against a read only replica. (${command})`), null];
+          }
+          return [null, run()];
+        });
       },
     };
     return chain;
@@ -691,15 +711,40 @@ export function fakeRedis() {
     down: (isDown = true) => {
       failing = isDown;
     },
-    /** Record `riderIds` as having been offered `taskId`, as a broadcast would. */
-    offer: (taskId: string, riderIds: string[], ttlSeconds = 86_400) => {
-      sets.set(redisKeys.offeredRiders(taskId), new Set(['-', ...riderIds]));
-      ttls.set(redisKeys.offeredRiders(taskId), ttlSeconds);
+    /**
+     * Make one command fail *inside* pipelines — reported per entry, with
+     * `exec` itself resolving — for the next `times` uses. `times = 0` heals.
+     */
+    failCommand: (command: string, times = Number.POSITIVE_INFINITY) => {
+      failingCommands.set(command, times);
     },
-    /** Who a task is recorded as offered to, without the sentinel; null if no record. */
-    offeredTo: (taskId: string): string[] | null => {
+    /**
+     * Record `riderIds` as having been offered `taskId` in the search that
+     * began at `search` (the task's `firstBroadcastAt`), as a broadcast
+     * would. Without `search` the entries are plain — a list written by hand
+     * for a task the dispatcher never broadcast.
+     */
+    offer: (taskId: string, riderIds: string[], search?: Date | null) => {
+      const key = redisKeys.offeredRiders(taskId);
+      const prefix = search ? `${search.getTime()}:` : '';
+      if (!sets.has(key)) sets.set(key, new Set());
+      for (const member of ['-', ...riderIds]) sets.get(key)!.add(`${prefix}${member}`);
+      ttls.set(key, 86_400);
+    },
+    /**
+     * Who one search of a task is recorded as offered to, without the
+     * sentinel; null if that search has no record. `search` is the task's
+     * `firstBroadcastAt` — omit it for a plain, unstamped list.
+     */
+    offeredTo: (taskId: string, search?: Date | null): string[] | null => {
+      const prefix = search ? `${search.getTime()}:` : '';
       const members = sets.get(redisKeys.offeredRiders(taskId));
-      return members ? [...members].filter((m) => m !== '-').sort() : null;
+      if (!members?.has(`${prefix}-`)) return null;
+      return [...members]
+        .filter((m) => m.startsWith(prefix))
+        .map((m) => m.slice(prefix.length))
+        .filter((m) => m !== '-' && !m.includes(':'))
+        .sort();
     },
     client: {
       smembers: jest.fn(async (key: string) => {

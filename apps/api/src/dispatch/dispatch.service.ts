@@ -83,11 +83,39 @@ export function describeUnacceptable(
 
 /**
  * Redis cannot store an empty set, so a round that found nobody would leave
- * no key — indistinguishable from "Redis lost the record", which fails open.
- * The sentinel makes "recorded, and it was nobody" a state that exists. It is
- * not a UUID, so it can never collide with a user id.
+ * nothing behind — indistinguishable from a list that was never written. The
+ * sentinel makes "recorded, and it was nobody" a state that exists. It is not
+ * a UUID, so it can never collide with a user id.
  */
 const OFFERED_SET_SENTINEL = '-';
+
+/**
+ * M8: one entry in a task's offer list.
+ *
+ * A task can be searched for more than once: it returns to the pool when a
+ * rider abandons it, and R-08 makes that a fresh search. The list must not
+ * carry over — the rider who walked away has no standing right to take the
+ * task back — so every entry is stamped with the search it belongs to, and
+ * `accept` only ever looks at entries for the task's current search.
+ *
+ * A search is identified by the moment its first round went out
+ * (`task.first_broadcast_at`, rewritten each time the task leaves CREATED):
+ * a fact about the task that lives in PostgreSQL, not in Redis. That is the
+ * point. The list used to be one plain set per task, cleared by a DEL in the
+ * same Redis pipeline that wrote the new one — so when that pipeline failed,
+ * the old search's list was simply still there, for a day, saying the wrong
+ * riders were entitled to the task. Now nothing has to be cleared: an entry
+ * from another search is not wrong, merely not asked about.
+ *
+ * `search` is null only for a task that is BROADCASTING without the
+ * dispatcher having put it there (first_broadcast_at never set). Such a task
+ * gets plain entries, which is also what a hand-seeded list looks like.
+ */
+const offerEntry = (search: Date | null, member: string): string =>
+  search === null ? member : `${search.getTime()}:${member}`;
+
+/** How many times the offer list write is tried before the round is given up. */
+const OFFER_LIST_WRITE_ATTEMPTS = 2;
 
 /**
  * L4: how many ping intervals may pass before a rider is treated as gone.
@@ -408,6 +436,7 @@ export class DispatchService {
         collegeId: true,
         type: true,
         status: true,
+        firstBroadcastAt: true,
         requesterId: true,
         pickupLabel: true,
         pickupLatitude: true,
@@ -497,6 +526,46 @@ export class DispatchService {
     });
 
     const offerExpiresAt = new Date(Date.now() + acceptanceWindowSeconds * 1000);
+    const eligibleIds = eligible.map((r) => r.userId);
+
+    // Which search this round belongs to. Round 0 starts a new one, and its
+    // start time is fixed here so the same instant goes into Redis (as the
+    // stamp on each offer-list entry) and into the task row (below). It is
+    // nudged past the previous search's start so two searches of one task
+    // can never share a stamp, however quickly one follows the other.
+    const search =
+      opts.round === 0
+        ? new Date(Math.max(Date.now(), (task.firstBroadcastAt?.getTime() ?? 0) + 1))
+        : (task.firstBroadcastAt ?? null);
+
+    // M8: the offer list is written FIRST — before the round is committed and
+    // long before any offer leaves.
+    //
+    // It used to be written after the commit, with a failure logged and the
+    // offers sent regardless. But `accept` refuses a task that is on offer
+    // with no list, so a failed write meant every rider who was sent that
+    // offer was told NOT_OFFERED_TO_YOU when they tapped it; on the final
+    // round the task then went UNFULFILLED with a willing rider standing by.
+    //
+    // An offer that cannot be honoured must not be made. If the list cannot
+    // be recorded the round is not sent at all: the task is left exactly as
+    // it was — still due, or still showing an expired window — so the next
+    // tick, five seconds on, tries again. No round, fee step or radius step
+    // is spent on a Redis hiccup.
+    //
+    // Writing before the commit means a list can exist for a round that then
+    // turns out to be a no-op (another instance sent it, or a rider accepted
+    // first). That is harmless: entries only ever grant what this search
+    // would have offered anyway, and the conditional UPDATE in `accept` still
+    // decides who gets the task.
+    const newlyOffered = await this.recordOfferedRiders(taskId, search, eligibleIds);
+    if (newlyOffered === null) {
+      this.logger.warn(
+        `Task ${taskId} round ${newRound} not sent: the offer list could not be recorded. ` +
+          'It will be retried on the next dispatch tick.',
+      );
+      return null;
+    }
 
     // The status this round moves the task *from*. Round 0 is a first
     // broadcast and starts from CREATED; any later round is a re-broadcast of
@@ -533,7 +602,9 @@ export class DispatchService {
           feeMinor: offeredFeeMinor,
           offerExpiresAt,
           dispatchDueAt: null,
-          firstBroadcastAt: fromStatus === TaskStatus.CREATED ? new Date() : undefined,
+          // The start of this search — the same instant stamped on its
+          // offer-list entries above.
+          firstBroadcastAt: fromStatus === TaskStatus.CREATED ? (search ?? undefined) : undefined,
         },
       });
       if (moved.count !== 1) return false;
@@ -585,12 +656,6 @@ export class DispatchService {
       return null;
     }
 
-    const eligibleIds = eligible.map((r) => r.userId);
-
-    // M8: record who is being offered this task *before* the offer leaves, so
-    // the fastest possible accept still finds its own name on the list.
-    const newlyOffered = await this.recordOfferedRiders(taskId, eligibleIds, newRound);
-
     // ADR-006: on a cash order the rider pays the shop out of their own
     // pocket at pickup and collects the full total at the door. That is
     // something to know *before* accepting — a rider with no cash on them
@@ -641,78 +706,90 @@ export class DispatchService {
   }
 
   /**
-   * M8: remember who this round is offered to — a Redis set per task, under
-   * `redisKeys.offeredRiders` — and report which of them had
-   * not already been offered this task in an earlier round of the same search.
+   * M8: record who this round of this search is offered to, and report which
+   * of them had not already been offered it in an earlier round.
    *
-   * Round 1 starts the set afresh — R-08 makes a task returning to the pool a
-   * new search, and the rider who abandoned it should not be able to quietly
-   * take it back without being offered it. Later rounds add to the set: a
-   * rider shown round 1 who taps a moment after round 2 goes out was offered
-   * the task, and refusing them would be pedantry.
+   * Entries accumulate across the rounds of one search: a rider shown round
+   * 1 who taps a moment after round 2 goes out was offered the task, and
+   * refusing them would be pedantry. Entries of *other* searches are left
+   * alone and never consulted (see `offerEntry`).
    *
-   * The key outlives the whole search (OFFERED_SET_TTL_SECONDS) and every
-   * round renews it, because `accept` treats a task that is on offer with no
-   * list as offered to nobody. A round that found no riders still writes the
-   * sentinel, so "nobody" is a record rather than an absence.
+   * The key outlives any search (OFFERED_SET_TTL_SECONDS) and every round
+   * renews it. A round that found no riders still writes the sentinel, so
+   * "nobody" is a record rather than an absence.
    *
-   * Redis failing here must not stop dispatch (ADR-002) — but it does have a
-   * cost now, and it is the safe one: if this write fails and Redis then
-   * comes back, the task is on offer with no list, and accepts for it are
-   * refused until the next round re-records it (at most one acceptance
-   * window). While Redis is actually down, `accept` cannot ask at all and
-   * fails open.
+   * Returns null when the list could not be written, and the caller must
+   * then not send the round. "Could not be written" includes the case that
+   * is easy to miss: a pipeline's `exec` resolves even when a command inside
+   * it failed, reporting the error in that command's own slot. Every slot is
+   * checked. The write is tried twice, because the commonest failure is a
+   * connection that has just been re-established.
    */
   private async recordOfferedRiders(
     taskId: string,
+    search: Date | null,
     riderIds: string[],
-    round: number,
-  ): Promise<string[]> {
+  ): Promise<string[] | null> {
     const key = redisKeys.offeredRiders(taskId);
+    const entries = [OFFERED_SET_SENTINEL, ...riderIds].map((member) => offerEntry(search, member));
 
-    try {
-      const already =
-        round > 1 ? new Set(await this.redis.client.smembers(key)) : new Set<string>();
+    let lastError: unknown;
 
-      const pipeline = this.redis.client.multi();
-      if (round <= 1) pipeline.del(key);
-      pipeline.sadd(key, OFFERED_SET_SENTINEL, ...riderIds);
-      pipeline.expire(key, OFFERED_SET_TTL_SECONDS);
-      await pipeline.exec();
+    for (let attempt = 1; attempt <= OFFER_LIST_WRITE_ATTEMPTS; attempt++) {
+      try {
+        // Read first: once this round's entries are in, "already offered"
+        // cannot be told from "offered just now".
+        const already = new Set(await this.redis.client.smembers(key));
 
-      return riderIds.filter((id) => !already.has(id));
-    } catch (error) {
-      this.logger.warn(
-        `Could not record offered riders for task ${taskId}; once Redis answers again, ` +
-          `accepts are refused until the next round re-records them: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-      );
-      return riderIds;
+        const results = await this.redis.client
+          .multi()
+          .sadd(key, ...entries)
+          .expire(key, OFFERED_SET_TTL_SECONDS)
+          .exec();
+
+        const failed = results?.find(([error]) => error !== null);
+        if (!results || failed) throw failed?.[0] ?? new Error('Redis returned no result');
+
+        return riderIds.filter((id) => !already.has(offerEntry(search, id)));
+      } catch (error) {
+        lastError = error;
+      }
     }
+
+    this.logger.warn(
+      `Could not record the offer list for task ${taskId} after ${OFFER_LIST_WRITE_ATTEMPTS} attempts: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+    );
+    return null;
   }
 
   /**
-   * M8: what does the offer list say about this rider and this task?
+   * M8: what does the offer list say about this rider and this search?
    *
    * Three answers that the caller must not blur together:
    *
-   *  - the list exists, and the rider is or is not on it;
-   *  - there is no list (`no-list`) — which for a task that is on offer means
-   *    nobody was offered it, and is for `accept` to judge;
+   *  - the search has a list, and the rider is or is not on it;
+   *  - the search has no list (`no-list`) — which for a task that is on offer
+   *    means nobody was offered it, since a round is never sent without its
+   *    list having been written first;
    *  - Redis could not be asked (`unavailable`) — the only case that fails
    *    open, the same policy as the dispatch lock: Redis being down is never
    *    the reason a delivery cannot happen.
-   *
-   * "No list" and "could not ask" used to be one answer, and both failed
-   * open. That made an expired or flushed key indistinguishable from an
-   * outage, and the offer check silently optional.
    */
-  private async checkOffer(taskId: string, userId: string): Promise<OfferCheck> {
+  private async checkOffer(
+    taskId: string,
+    search: Date | null,
+    userId: string,
+  ): Promise<OfferCheck> {
     const key = redisKeys.offeredRiders(taskId);
 
     try {
-      const results = await this.redis.client.multi().exists(key).sismember(key, userId).exec();
+      const results = await this.redis.client
+        .multi()
+        .sismember(key, offerEntry(search, OFFERED_SET_SENTINEL))
+        .sismember(key, offerEntry(search, userId))
+        .exec();
 
       // A pipeline reports a failed command per entry rather than rejecting.
       const failed = results?.find(([error]) => error !== null);
@@ -730,12 +807,22 @@ export class DispatchService {
     }
   }
 
-  /** The riders a task was offered to, or null when that cannot be known. */
-  private async offeredRiders(taskId: string): Promise<string[] | null> {
+  /**
+   * The riders this search of a task was offered to, or null when that
+   * cannot be known (Redis unreachable, or no list for this search).
+   */
+  private async offeredRiders(taskId: string, search: Date | null): Promise<string[] | null> {
     try {
-      const members = await this.redis.client.smembers(redisKeys.offeredRiders(taskId));
-      if (members.length === 0) return null;
-      return members.filter((id) => id !== OFFERED_SET_SENTINEL);
+      const members = new Set(await this.redis.client.smembers(redisKeys.offeredRiders(taskId)));
+      if (!members.has(offerEntry(search, OFFERED_SET_SENTINEL))) return null;
+
+      const prefix = offerEntry(search, '');
+      return [...members]
+        .filter((entry) => entry.startsWith(prefix))
+        .map((entry) => entry.slice(prefix.length))
+        // A plain (unstamped) list shares its key with stamped entries of
+        // real searches; those contain a colon and are not rider ids.
+        .filter((id) => id !== OFFERED_SET_SENTINEL && !id.includes(':'));
     } catch {
       return null;
     }
@@ -982,6 +1069,7 @@ export class DispatchService {
         pickupLabel: true,
         dropLabel: true,
         offerExpiresAt: true,
+        firstBroadcastAt: true,
         orderId: true,
         order: { select: { shopListing: { select: { shop: { select: { staff: { select: { userId: true } } } } } } } },
       },
@@ -1015,13 +1103,16 @@ export class DispatchService {
     // tried one somebody already held was told ALREADY_TAKEN — "you were too
     // slow" — about a race they were never in, and whether they heard that or
     // NOT_OFFERED_TO_YOU depended on how quickly the real winner had tapped.
-    const offer = await this.checkOffer(taskId, userId);
+    const offer = await this.checkOffer(taskId, task.firstBroadcastAt ?? null, userId);
 
-    // A task that is on offer always has a list: `broadcast` writes one for
-    // every round, sentinel and all, with a TTL far longer than any search.
-    // So on offer and no list means nobody was offered it — the key was
-    // flushed, or the row was put into BROADCASTING by something other than
-    // the dispatcher — and that is refused, not waved through.
+    // A task that is on offer always has a list for its current search:
+    // `broadcast` writes it — sentinel and all, with a TTL far longer than
+    // any search — *before* it commits the round, and sends no round whose
+    // list it could not write. So on offer and no list means nobody was
+    // offered it — the key was flushed, or the row was put into BROADCASTING
+    // by something other than the dispatcher — and that is refused, not
+    // waved through. A list left over from an earlier search of the same task
+    // is not this search's list, and does not count.
     //
     // For a task that is *not* on offer a missing list protects nothing (the
     // UPDATE below refuses it whoever asks), so it falls through to the
@@ -1208,7 +1299,12 @@ export class DispatchService {
 
     // FR-DLV-05: withdraw the offer from every other rider's device.
     // NFR-P-03: within 2 seconds. M7: only the riders it was offered to.
-    this.gateway.withdrawOffer(task.collegeId, taskId, userId, await this.offeredRiders(taskId));
+    this.gateway.withdrawOffer(
+      task.collegeId,
+      taskId,
+      userId,
+      await this.offeredRiders(taskId, task.firstBroadcastAt ?? null),
+    );
 
     // M7: the requester, the shop and the rider — built from what this
     // method already read, so the winner's response does not wait on a query.
