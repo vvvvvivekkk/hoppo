@@ -3,10 +3,11 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
-import type { College } from '@hoppo/api-client';
+import { ApiError, type College } from '@hoppo/api-client';
 import { AuthShell } from '@/components/shell';
 import { Banner, Button, Field, Select } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { PrivacyNoticeBody, usePrivacyNotice } from '@/components/privacy-notice';
 
 type Step = 'mobile' | 'code' | 'details';
 
@@ -22,6 +23,12 @@ type Step = 'mobile' | 'code' | 'details';
  * The dev-mode OTP is shown on screen when the API returns it. That only
  * happens when no SMS provider is configured, which is exactly when a
  * developer would otherwise be reading it out of the server log.
+ *
+ * FR-PRIV-01: the privacy notice is shown on the last step, in full, with a
+ * tick box the student has to tick themselves. The version they ticked is
+ * sent with the registration, so the server's record is of the notice that
+ * was actually on screen. If the notice cannot be loaded the account cannot
+ * be created — agreeing to something that was never shown is not agreeing.
  */
 export default function Signup() {
   const { api, adoptSession } = useApi();
@@ -41,6 +48,12 @@ export default function Signup() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+
+  // Fetched for the step that shows it, like the college list.
+  const privacy = usePrivacyNotice(step === 'details');
+  /** The version the student ticked, so a newer notice un-ticks itself. */
+  const [acceptedVersion, setAcceptedVersion] = useState<string | null>(null);
+  const noticeAccepted = privacy.notice !== null && acceptedVersion === privacy.notice.version;
 
   // Fetch the college list once the student reaches the step that needs it,
   // not on mount: most people who open this screen are on step one, and the
@@ -108,11 +121,23 @@ export default function Signup() {
         password,
         collegeId,
         mobileOtpChallengeId: challengeId,
+        // The version that was on screen when the box was ticked.
+        privacyNoticeVersion: acceptedVersion ?? undefined,
       });
       // Registration returns a token pair, so there is no second sign-in.
       await adoptSession(tokens);
       router.replace('/');
     } catch (e) {
+      // The notice was revised between showing it and submitting. Fetch the
+      // new one and make them read and tick again: the acceptance has to be
+      // of the current text, not of the one it replaced.
+      if (
+        e instanceof ApiError &&
+        (e.code === 'PRIVACY_NOTICE_OUTDATED' || e.code === 'PRIVACY_NOTICE_NOT_ACCEPTED')
+      ) {
+        setAcceptedVersion(null);
+        privacy.reload();
+      }
       setError(describeError(e));
     } finally {
       setBusy(false);
@@ -254,11 +279,68 @@ export default function Signup() {
               required
             />
 
+            <section aria-labelledby="privacy-heading">
+              <h2 id="privacy-heading" className="font-bold">
+                {privacy.notice?.title ?? 'Privacy notice'}
+              </h2>
+              <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
+                What Hoppo keeps about you, why, for how long, and who to complain to.
+              </p>
+
+              {privacy.loading && !privacy.notice && (
+                <p className="mt-3 text-sm text-[var(--color-ink-faint)]">Loading the notice…</p>
+              )}
+
+              {privacy.error && !privacy.notice && (
+                <div className="mt-3 space-y-2">
+                  <Banner tone="error">
+                    The privacy notice could not be loaded, so the account cannot be created yet.{' '}
+                    {privacy.error}
+                  </Banner>
+                  <Button
+                    type="button"
+                    tone="secondary"
+                    className="w-full"
+                    onClick={privacy.reload}
+                  >
+                    Load it again
+                  </Button>
+                </div>
+              )}
+
+              {privacy.notice && (
+                <>
+                  {/* Scrolls inside its own box so the form stays one screen,
+                      but nothing is hidden behind a link. */}
+                  <div
+                    tabIndex={0}
+                    aria-label="Privacy notice text"
+                    className="mt-3 max-h-64 overflow-y-auto rounded-xl border-2 border-[var(--color-line)] bg-white p-4"
+                  >
+                    <PrivacyNoticeBody notice={privacy.notice} />
+                  </div>
+                  <label className="mt-3 flex cursor-pointer items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={noticeAccepted}
+                      onChange={(e) =>
+                        setAcceptedVersion(e.target.checked ? privacy.notice!.version : null)
+                      }
+                      className="mt-1 h-5 w-5 shrink-0"
+                    />
+                    <span className="font-semibold">
+                      I have read the privacy notice and accept it
+                    </span>
+                  </label>
+                </>
+              )}
+            </section>
+
             <Button
               type="submit"
               large
               loading={busy}
-              disabled={!collegeId || password.length < 10}
+              disabled={!collegeId || password.length < 10 || !noticeAccepted}
               className="w-full"
             >
               Create my account

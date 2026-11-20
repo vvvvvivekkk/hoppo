@@ -51,12 +51,10 @@ const STAGE_INDEX: Record<string, number> = {
  * shop started preparing as the student tapped cancel, a rider took it as they
  * chose to collect it themselves. The API's message says what happened; the
  * screen then has to catch up, or the same dead button is still there to tap.
+ * Which codes count is the client's `isStaleState`, shared with the dashboard.
  */
 function isStaleOrder(error: unknown): boolean {
-  return (
-    error instanceof ApiError &&
-    (error.code === 'ORDER_STATE_CHANGED' || error.code === 'ORDER_NOT_READY')
-  );
+  return error instanceof ApiError && error.isStaleState;
 }
 
 /**
@@ -97,6 +95,14 @@ export default function Order() {
 
   const [handoverCode, setHandoverCode] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  /**
+   * What the last action did, in the API's words. Cancelling and collecting
+   * in person both move money or pointedly do not, and the response says
+   * which: "₹120 has been returned to your wallet" or, for a cash order,
+   * "you have not been charged". Discarding it left a student who had paid
+   * from their wallet to work out for themselves whether it came back.
+   */
+  const [outcome, setOutcome] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   // Live updates. `refresh` rather than patching state from the payload: the
@@ -139,9 +145,11 @@ export default function Order() {
   async function cancel() {
     setBusy(true);
     setActionError(null);
+    setOutcome(null);
 
     try {
-      await api.orders.cancel(orderId, 'Changed my mind');
+      const res = await api.orders.cancel(orderId, 'Changed my mind');
+      setOutcome(res.message);
       await refresh();
     } catch (e) {
       setActionError(describeError(e));
@@ -154,9 +162,11 @@ export default function Order() {
   async function resolveUnfulfilled(choice: 'KEEP_WAITING' | 'COLLECT_IN_PERSON' | 'CANCEL') {
     setBusy(true);
     setActionError(null);
+    setOutcome(null);
 
     try {
-      await api.orders.resolveUnfulfilled(orderId, choice);
+      const res = await api.orders.resolveUnfulfilled(orderId, choice);
+      setOutcome(res.message);
       await refresh();
     } catch (e) {
       setActionError(describeError(e));
@@ -210,6 +220,12 @@ export default function Order() {
       {actionError && (
         <div className="mt-3">
           <Banner tone="error">{actionError}</Banner>
+        </div>
+      )}
+
+      {outcome && !actionError && (
+        <div className="mt-3">
+          <Banner tone="success">{outcome}</Banner>
         </div>
       )}
 
@@ -446,7 +462,10 @@ export default function Order() {
       )}
 
       {data.status === 'COMPLETED' && (
-        <div className="mt-6 pb-safe">
+        <div className="mt-6 space-y-2 pb-safe">
+          <Button className="w-full" onClick={() => router.push(`/orders/${orderId}/receipt`)}>
+            View the receipt
+          </Button>
           <Button tone="secondary" className="w-full" onClick={() => router.push('/shops')}>
             Order again
           </Button>

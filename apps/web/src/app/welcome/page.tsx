@@ -14,8 +14,8 @@ export default function Welcome() {
         </p>
         <h1 className="mt-4 text-3xl font-bold">Hoppo</h1>
         <p className="mt-3 text-[var(--color-ink-soft)]">
-          Order from shops near your college. Delivered by students on campus, for a fee you can
-          see before you order.
+          Order from shops near your college. Delivered by students on campus, for a fee you can see
+          before you order.
         </p>
       </div>
 
@@ -34,6 +34,11 @@ export default function Welcome() {
 
       <p className="mt-8 text-center text-sm text-[var(--color-ink-faint)]">
         You will need a student ID card from a college Hoppo covers.
+      </p>
+      <p className="mt-3 text-center text-sm">
+        <Link href="/legal" className="text-[var(--color-ink-soft)] underline">
+          Privacy notice
+        </Link>
       </p>
     </AuthShell>
   );

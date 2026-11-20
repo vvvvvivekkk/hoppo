@@ -61,7 +61,9 @@ export function Shell({
 
   return (
     <div className="mx-auto min-h-dvh max-w-2xl bg-[var(--color-surface-sunken)]">
-      <header className="sticky top-0 z-10 border-b border-[var(--color-line)] bg-white/95 backdrop-blur">
+      {/* Header and tab bar are navigation, not content: left out of a
+          printed or saved page (the receipt) so the paper holds only the page. */}
+      <header className="sticky top-0 z-10 border-b border-[var(--color-line)] bg-white/95 backdrop-blur print:hidden">
         <div className="flex items-center gap-2 px-3 py-2">
           {back !== undefined && (
             <button
@@ -90,7 +92,7 @@ export function Shell({
 
       <nav
         aria-label="Main"
-        className="fixed inset-x-0 bottom-0 z-10 mx-auto max-w-2xl border-t border-[var(--color-line)] bg-white"
+        className="fixed inset-x-0 bottom-0 z-10 mx-auto max-w-2xl border-t border-[var(--color-line)] bg-white print:hidden"
         style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
       >
         <ul className="flex">

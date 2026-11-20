@@ -14,19 +14,31 @@ import { isWorkModeDisabled, sendPing, useSocket } from '@/lib/socket';
 import { useCanOrder } from '@/components/verify-prompt';
 
 /**
- * The accept refusals that are not failures (FR-DLV-03/04): the window
- * closed, or the offer was never (or is no longer) this rider's. Each means
- * "this card is stale", so the card goes and the API's sentence is shown as
- * information, the same way losing the race is.
+ * The accept refusals that are not failures (FR-DLV-03/04).
+ *
+ * Two kinds, and each means "this card is stale", so the card goes and the
+ * API's sentence is shown as information, the same way losing the race is:
+ *
+ *  - the offer itself is gone — expired, closed, cancelled, finished, or
+ *    never this rider's. Which codes those are is the client's `isOfferGone`,
+ *    so the list is kept in one place for every app.
+ *  - `ALREADY_HOLDING_TASK`, which is about the rider rather than the offer
+ *    (accepted on another tab or device), and so is deliberately not part of
+ *    that getter. The reload that follows puts the task they do hold on screen.
  */
-const STALE_OFFER_CODES = new Set([
-  'OFFER_EXPIRED',
-  'NOT_OFFERED_TO_YOU',
-  'NOT_YET_OFFERED',
-  // Already carrying one (accepted on another tab or device). The card goes,
-  // and the reload that follows puts the task they do hold on screen.
-  'ALREADY_HOLDING_TASK',
-]);
+function isStaleOffer(e: unknown): e is ApiError {
+  return e instanceof ApiError && (e.isOfferGone || e.code === 'ALREADY_HOLDING_TASK');
+}
+
+/**
+ * FR-DLV-14: the wrong handover code was entered too many times. The API
+ * marks the task ESCALATED and, in the same step, releases the rider — so
+ * there is no active task left to show a message on. The notice has to be
+ * raised here, from the refusal or from the task event, or the panel simply
+ * vanishes and the rider is left wondering what became of the delivery.
+ */
+const ESCALATED_NOTICE =
+  'The handover code was entered wrongly too many times, so this delivery has been passed to a campus administrator, who will contact you and the student. You do not need to do anything more for it, and you are free to take other deliveries.';
 
 /** How often to re-read rider status while it can change without an event. */
 const STATUS_POLL_MS = 10_000;
@@ -192,7 +204,10 @@ function RiderHome() {
       // one being carried is this screen's business; refetching on all of
       // them meant every online rider hit the API each time anybody's
       // delivery moved.
-      if (activeTask && payload.taskId === activeTask.id) void load();
+      if (activeTask && payload.taskId === activeTask.id) {
+        if (payload.status === 'ESCALATED') setNotice(ESCALATED_NOTICE);
+        void load();
+      }
     },
   });
 
@@ -352,7 +367,7 @@ function RiderHome() {
         // one rider. Not an error.
         setOffer(null);
         setLostOffer(true);
-      } else if (e instanceof ApiError && STALE_OFFER_CODES.has(e.code)) {
+      } else if (isStaleOffer(e)) {
         // The card was out of date — the window closed a moment before the
         // tap, or the offer moved on. Nothing the rider did wrong, so the
         // card goes and the API's own sentence is shown as information.
@@ -438,7 +453,16 @@ function RiderHome() {
           the order in their bag for a wall of text — somebody is waiting for
           it. The terms are asked for again once the delivery is done. */}
       {activeTask ? (
-        <ActiveTaskPanel task={activeTask} onChanged={() => void load()} />
+        <ActiveTaskPanel
+          task={activeTask}
+          onChanged={(failure) => {
+            if (failure instanceof ApiError && failure.code === 'OTP_ATTEMPTS_EXHAUSTED') {
+              setError(null);
+              setNotice(ESCALATED_NOTICE);
+            }
+            void load();
+          }}
+        />
       ) : !status.canEnable.termsAccepted || !status.canEnable.termsVersionCurrent ? (
         // FR-WM-02
         <RiderTerms
@@ -763,7 +787,14 @@ function OfferCard({
   );
 }
 
-function ActiveTaskPanel({ task, onChanged }: { task: ActiveTask; onChanged: () => void }) {
+function ActiveTaskPanel({
+  task,
+  onChanged,
+}: {
+  task: ActiveTask;
+  /** Called after every action; handed the error when the action failed. */
+  onChanged: (failure?: unknown) => void;
+}) {
   const { api } = useApi();
 
   const [code, setCode] = useState('');
@@ -774,20 +805,35 @@ function ActiveTaskPanel({ task, onChanged }: { task: ActiveTask; onChanged: () 
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
     setError(null);
+    let failure: unknown;
     try {
       await action();
     } catch (e) {
+      failure = e;
       setError(describeError(e));
     } finally {
       setBusy(false);
       // On failure too. A wrong handover code changes the task (the attempt
       // counter, and after enough of them the task itself is escalated), and
       // refreshing only on success left the rider reading a stale count.
-      onChanged();
+      onChanged(failure);
     }
   }
 
   const order = task.order;
+
+  // The API releases the rider when it escalates, so an escalated task should
+  // never arrive here as the active one. If it ever does, it gets the plain
+  // statement and none of the buttons below — pickup, the code box and
+  // "I cannot finish" are all refused for an escalated task.
+  if (task.status === 'ESCALATED') {
+    return (
+      <Card tone="waiting" className="p-5">
+        <p className="text-lg font-bold">With an administrator</p>
+        <p className="mt-2 text-[var(--color-ink-soft)]">{ESCALATED_NOTICE}</p>
+      </Card>
+    );
+  }
 
   return (
     <Card tone="preparing" className="p-5">

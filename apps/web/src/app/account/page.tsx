@@ -1,13 +1,68 @@
 'use client';
 
 import Link from 'next/link';
-import { Shell, SignOutButton } from '@/components/shell';
-import { Banner, Card, Spinner } from '@/components/ui';
+import { useState } from 'react';
+import type { AccountDeletion } from '@hoppo/api-client';
+import { AuthShell, Shell, SignOutButton } from '@/components/shell';
+import { Banner, Button, Card, Spinner } from '@/components/ui';
 import { useApi } from '@/lib/api';
+import { useCart } from '@/lib/cart';
+import { AccountData } from '@/components/account-data';
+import { PrivacyAcceptance, usePrivacyNotice } from '@/components/privacy-notice';
+import { NameForm, PasswordForm } from '@/components/profile-forms';
 
-/** S-28: who you are, and the little that can be changed in Phase 1. */
+/**
+ * S-49, S-50, S-54, S-55: who you are, what you can change, the legal notice,
+ * and your data.
+ *
+ * What can be changed is short on purpose: the name, and the password. The
+ * mobile number and email are fixed in Phase 1 (the API refuses a change to
+ * either), and the roll number, department and year belong to verification.
+ * Those are shown read-only with the reason beside them, rather than behind
+ * an edit button that would only produce a refusal.
+ *
+ * There is no photo upload here. A profile photo goes through file storage,
+ * and a deployment without storage configured cannot take one; rather than
+ * show a control that fails, the screen shows a photo when the account has
+ * one and otherwise does not mention it.
+ */
 export default function Account() {
-  const { user, loading } = useApi();
+  const { user, loading, client } = useApi();
+  const cart = useCart();
+  /** Set once the account has been deleted; from then on there is no user. */
+  const [deleted, setDeleted] = useState<AccountDeletion | null>(null);
+  /** Which of the two small forms is open. One at a time, on a phone. */
+  const [editing, setEditing] = useState<'name' | 'password' | null>(null);
+  /** The API's confirmation after a password change. */
+  const [passwordChanged, setPasswordChanged] = useState<string | null>(null);
+  // The current notice, to tell whether this account has accepted *it* and
+  // not merely some earlier version. A public route; quiet if it fails.
+  const privacy = usePrivacyNotice();
+
+  // Checked before anything that needs a user. After deletion the session is
+  // gone, and the Shell would otherwise whisk the student to the welcome
+  // screen before they had read what was erased and what was kept.
+  if (deleted) {
+    return (
+      <AuthShell>
+        <h1 className="text-2xl font-bold">Your account has been deleted</h1>
+        <div className="mt-4">
+          <Banner tone="success">{deleted.message}</Banner>
+        </div>
+        <Card className="mt-4 p-4 text-sm">
+          <p className="font-semibold">Erased</p>
+          <p className="mt-0.5 text-[var(--color-ink-soft)]">{deleted.erased.join(', ')}</p>
+          <p className="mt-3 font-semibold">Kept, without your personal details</p>
+          <p className="mt-0.5 text-[var(--color-ink-soft)]">{deleted.retained.join(', ')}</p>
+        </Card>
+        <Link href="/welcome" className="mt-8 block">
+          <Button large tone="secondary" className="w-full">
+            Close
+          </Button>
+        </Link>
+      </AuthShell>
+    );
+  }
 
   // The Shell holds the content back while the session loads and sends a
   // signed-out visitor to /welcome, so by the time anything below is on
@@ -31,11 +86,78 @@ export default function Account() {
   return (
     <Shell title="Account">
       <Card className="p-5">
-        <p className="text-xl font-bold">{user.name}</p>
+        <div className="flex items-start gap-3">
+          {/* Shown when the account has one; there is no upload here (see
+              the note at the top of this file). */}
+          {user.avatarUrl && (
+            // eslint-disable-next-line @next/next/no-img-element -- a signed bucket URL, not a static asset next/image could optimise
+            <img
+              src={user.avatarUrl}
+              alt=""
+              className="h-12 w-12 shrink-0 rounded-full object-cover"
+            />
+          )}
+          <p className="min-w-0 flex-1 text-xl font-bold">{user.name}</p>
+          {profile?.verificationStatus === 'VERIFIED' && (
+            <span className="shrink-0 rounded-full bg-[var(--color-ready-bg)] px-3 py-1 text-xs font-bold text-[var(--color-ready)]">
+              Verified student
+            </span>
+          )}
+        </div>
         <p className="mt-1 text-[var(--color-ink-soft)]">{user.mobile}</p>
         <p className="text-[var(--color-ink-soft)]">{user.email}</p>
         {user.college && (
           <p className="mt-2 text-sm text-[var(--color-ink-faint)]">{user.college.name}</p>
+        )}
+        <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
+          Your mobile number and email are fixed for now: Hoppo does not yet have a way to confirm a
+          new one.
+        </p>
+
+        {passwordChanged && editing === null && (
+          <div className="mt-3">
+            <Banner tone="success">{passwordChanged}</Banner>
+          </div>
+        )}
+
+        {editing === 'name' && <NameForm user={user} onDone={() => setEditing(null)} />}
+
+        {editing === 'password' && (
+          <PasswordForm
+            onDone={(message) => {
+              setPasswordChanged(message || null);
+              setEditing(null);
+            }}
+          />
+        )}
+
+        {editing === null && (
+          <div className="mt-3 flex gap-2">
+            {/* The profile route is for student accounts; the password route
+                is for everyone. */}
+            {user.role === 'STUDENT' && (
+              <Button
+                tone="secondary"
+                className="flex-1"
+                onClick={() => {
+                  setPasswordChanged(null);
+                  setEditing('name');
+                }}
+              >
+                Edit name
+              </Button>
+            )}
+            <Button
+              tone="secondary"
+              className="flex-1"
+              onClick={() => {
+                setPasswordChanged(null);
+                setEditing('password');
+              }}
+            >
+              Change password
+            </Button>
+          </div>
         )}
       </Card>
 
@@ -93,9 +215,10 @@ export default function Account() {
           </dl>
           {hasDetails ? (
             <p className="mt-3 text-sm text-[var(--color-ink-faint)]">
-              These came from your verification
-              {profile.verificationStatus === 'VERIFIED' ? '' : ' submission'}. Changing them means
-              resubmitting, which an administrator has to approve.
+              These cannot be edited here: they came from your verification
+              {profile.verificationStatus === 'VERIFIED' ? '' : ' submission'}, which an
+              administrator checks against your ID card. Changing them means submitting your
+              verification again.
             </p>
           ) : (
             <Link
@@ -106,6 +229,40 @@ export default function Account() {
             </Link>
           )}
         </Card>
+      )}
+
+      <Card className="mt-3 p-5">
+        <p className="font-bold">Privacy</p>
+        <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
+          What Hoppo keeps about you, why, and for how long.
+        </p>
+        <Link
+          href="/legal"
+          className="mt-2 block text-sm font-semibold text-[var(--color-accent)] underline"
+        >
+          Read the privacy notice
+        </Link>
+        {/* Says which version was accepted, or invites accepting the current
+            one. Not a gate: nothing is refused for lack of it. */}
+        {privacy.notice && (
+          <div className="mt-3">
+            <PrivacyAcceptance notice={privacy.notice} onOutdated={privacy.reload} />
+          </div>
+        )}
+      </Card>
+
+      {/* The export and delete routes are for student accounts only. */}
+      {user.role === 'STUDENT' && (
+        <AccountData
+          onDeleted={(result) => {
+            setDeleted(result);
+            // The server has already ended every session, so there is nothing
+            // to tell it — a sign-out request would only be refused. This
+            // drops what the phone still holds: the tokens and the cart.
+            cart.clear();
+            void client.clearTokens();
+          }}
+        />
       )}
 
       <Card className="mt-3 p-5">

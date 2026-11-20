@@ -42,6 +42,16 @@ interface ApiContextValue {
   adoptSession(tokens: TokenPair): Promise<void>;
   logout(): Promise<void>;
   refreshUser(): Promise<void>;
+  /**
+   * Take a user the API has just returned as the signed-in one.
+   *
+   * For the routes that answer with the `/auth/me` body (a profile edit) or
+   * with one field of it (accepting the privacy notice). The server has
+   * already said what the account now looks like; asking again would be a
+   * second request for the same answer, with a window in between where the
+   * screen shows the old name.
+   */
+  adoptUser(user: AuthUser): void;
 }
 
 export type AccountBlocked = 'SUSPENDED' | 'DEACTIVATED';
@@ -189,6 +199,8 @@ export function ApiProvider({ children }: { children: ReactNode }) {
     setAccountBlocked(null);
   }, [api]);
 
+  const adoptUser = useCallback((next: AuthUser) => setUser(next), []);
+
   const value = useMemo<ApiContextValue>(
     () => ({
       api,
@@ -201,8 +213,9 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       adoptSession,
       logout,
       refreshUser,
+      adoptUser,
     }),
-    [api, user, loading, accountBlocked, login, adoptSession, logout, refreshUser],
+    [api, user, loading, accountBlocked, login, adoptSession, logout, refreshUser, adoptUser],
   );
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>;

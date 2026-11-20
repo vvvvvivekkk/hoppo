@@ -1,8 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { BrowseShop, ItemSearchResult } from '@hoppo/api-client';
 import { formatMinor } from '@hoppo/shared';
 import { Shell } from '@/components/shell';
@@ -12,6 +11,32 @@ import { VerifyPrompt } from '@/components/verify-prompt';
 import { useCart } from '@/lib/cart';
 
 type Sort = 'distance' | 'rating' | 'prepTime';
+
+/** How many recent searches to keep. A phone-width row holds about this many. */
+const MAX_RECENT_SEARCHES = 5;
+
+/**
+ * Recent searches (S-11), kept on this device and per account.
+ *
+ * In `localStorage` because the API has no search history, and does not need
+ * one: this is a convenience for the person holding the phone, not a record
+ * anyone else should have. Keyed by user id for the same reason the cart is —
+ * a shared phone should not show one student what another looked for.
+ */
+function recentSearchesKey(userId: string): string {
+  return `hoppo.student.recentSearches.${userId}`;
+}
+
+function readRecentSearches(userId: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(recentSearchesKey(userId));
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+  } catch {
+    // Unreadable or corrupt storage is "no history", not a crash.
+    return [];
+  }
+}
 
 /**
  * S-10 and S-11: browse and search.
@@ -47,6 +72,48 @@ export default function Shops() {
    */
   const [knownCategories, setKnownCategories] = useState<string[]>([]);
   const [items, setItems] = useState<ItemSearchResult[] | null>(null);
+  /** Shops whose own name matches the search, shown above the matching items. */
+  const [shopMatches, setShopMatches] = useState<BrowseShop[] | null>(null);
+  const [recent, setRecent] = useState<string[]>([]);
+  const userId = user?.id ?? null;
+
+  // Read after mount, like the cart: the server has no localStorage.
+  useEffect(() => {
+    setRecent(userId ? readRecentSearches(userId) : []);
+  }, [userId]);
+
+  // A search is remembered when it was *used* — Enter pressed, or a result
+  // opened — not on every pause in typing. Saving on the debounce would fill
+  // the list with "sa", "sam", "samo" on the way to "samosa".
+  const rememberSearch = useCallback(
+    (term: string) => {
+      const value = term.trim();
+      if (!userId || value.length < 2) return;
+      setRecent((current) => {
+        const next = [
+          value,
+          ...current.filter((r) => r.toLowerCase() !== value.toLowerCase()),
+        ].slice(0, MAX_RECENT_SEARCHES);
+        try {
+          window.localStorage.setItem(recentSearchesKey(userId), JSON.stringify(next));
+        } catch {
+          /* in-memory only */
+        }
+        return next;
+      });
+    },
+    [userId],
+  );
+
+  function clearRecent() {
+    setRecent([]);
+    if (!userId) return;
+    try {
+      window.localStorage.removeItem(recentSearchesKey(userId));
+    } catch {
+      /* nothing to do */
+    }
+  }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   /** Where the next page of shops starts, or null when there are no more. */
@@ -74,13 +141,18 @@ export default function Shops() {
     setError(null);
     setNextCursor(null);
 
+    // S-11: a search answers with shops and items. "Who sells samosas" is an
+    // item question and "where is the juice shop" is a shop question, and the
+    // student should not have to know which kind they are asking.
     const request = searching
-      ? api.browse.items(debounced).then((res) => {
-          if (!cancelled) {
-            setItems(res.items);
+      ? Promise.all([api.browse.items(debounced), api.browse.shops({ q: debounced })]).then(
+          ([itemRes, shopRes]) => {
+            if (cancelled) return;
+            setItems(itemRes.items);
+            setShopMatches(shopRes.items);
             setShops(null);
-          }
-        })
+          },
+        )
       : api.browse
           .shops({
             category: category || undefined,
@@ -91,6 +163,7 @@ export default function Shops() {
             if (cancelled) return;
             setShops(res.items);
             setItems(null);
+            setShopMatches(null);
             setNextCursor(res.nextCursor);
 
             // Only an unfiltered list is a complete picture of the
@@ -157,14 +230,48 @@ export default function Shops() {
       <VerifyPrompt compact />
 
       <div className="space-y-3">
-        <input
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search for an item or a shop"
-          aria-label="Search for an item or a shop"
-          className="tap w-full rounded-xl border-2 border-[var(--color-line)] bg-white px-4"
-        />
+        {/* A form so that Enter (the "search" key on a phone keyboard) is an
+            event to hang "remember this search" on. Results already appear as
+            you type; submitting only records the term. */}
+        <form
+          role="search"
+          onSubmit={(e) => {
+            e.preventDefault();
+            rememberSearch(query);
+          }}
+        >
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search for an item or a shop"
+            aria-label="Search for an item or a shop"
+            className="tap w-full rounded-xl border-2 border-[var(--color-line)] bg-white px-4"
+          />
+        </form>
+
+        {query === '' && recent.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="text-[var(--color-ink-faint)]">Recent</span>
+            {recent.map((term) => (
+              <button
+                key={term}
+                type="button"
+                onClick={() => setQuery(term)}
+                className="rounded-full border-2 border-[var(--color-line)] bg-white px-3 py-1 font-semibold text-[var(--color-ink-soft)]"
+              >
+                {term}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={clearRecent}
+              className="ml-auto text-[var(--color-ink-faint)] underline"
+            >
+              Clear
+            </button>
+          </div>
+        )}
 
         {!searching && (
           <>
@@ -262,23 +369,49 @@ export default function Shops() {
         </Button>
       )}
 
-      {!loading && items && items.length === 0 && (
+      {!loading && items && items.length === 0 && (shopMatches ?? []).length === 0 && (
         <div className="mt-4">
           <EmptyState
             title={`Nothing matching "${debounced}"`}
-            body="Try a shorter word — search looks at item names across every shop at your college."
+            body="Try a shorter word — search looks at shop names and item names across every shop at your college."
           />
         </div>
       )}
 
-      {!loading && items && items.length > 0 && (
-        <ul className="mt-4 space-y-3">
-          {items.map((item) => (
-            <li key={item.id}>
-              <ItemRow item={item} />
-            </li>
-          ))}
-        </ul>
+      {/* Opening a result is what makes a search worth remembering. Caught
+          here, on the way down to the link or button, rather than in each row. */}
+      {!loading && items && (
+        <div onClickCapture={() => rememberSearch(debounced)}>
+          {shopMatches && shopMatches.length > 0 && (
+            <section className="mt-4" aria-labelledby="search-shops">
+              <h2 id="search-shops" className="mb-2 font-bold text-[var(--color-ink-soft)]">
+                Shops
+              </h2>
+              <ul className="space-y-3">
+                {shopMatches.map((shop) => (
+                  <li key={shop.listingId}>
+                    <ShopRow shop={shop} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {items.length > 0 && (
+            <section className="mt-4" aria-labelledby="search-items">
+              <h2 id="search-items" className="mb-2 font-bold text-[var(--color-ink-soft)]">
+                Items
+              </h2>
+              <ul className="space-y-3">
+                {items.map((item) => (
+                  <li key={item.id}>
+                    <ItemRow item={item} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
       )}
 
       {/* The cart bar floats above the tab bar so it is visible from anywhere
@@ -347,36 +480,49 @@ function ShopRow({ shop }: { shop: BrowseShop }) {
   );
 }
 
+/**
+ * One search result: the item, the shop selling it, its price, and whether it
+ * can be ordered right now.
+ *
+ * The whole row is the link to the shop, and stays one when the shop is
+ * closed or the item is sold out. It used to be a button that was disabled in
+ * those cases, which left a student unable even to look at the shop — and
+ * looking at a closed shop is allowed everywhere else (FR-CAT-05).
+ */
 function ItemRow({ item }: { item: ItemSearchResult }) {
-  const router = useRouter();
+  const orderable = item.shopIsOpen && item.isAvailable;
 
   return (
-    <Card className={`p-4 ${item.shopIsOpen && item.isAvailable ? '' : 'opacity-70'}`}>
-      <div className="flex items-start gap-3">
-        <div className="min-w-0 flex-1">
-          <p className="truncate font-bold">{item.name}</p>
-          <p className="truncate text-sm text-[var(--color-ink-faint)]">
-            {item.shop.name} · {item.distanceLabel}
-          </p>
-          {item.description && (
-            <p className="mt-1 line-clamp-2 text-sm text-[var(--color-ink-soft)]">
-              {item.description}
+    <Link href={`/shops/${item.listingId}`} className="block">
+      <Card className={`p-4 ${orderable ? '' : 'opacity-70'}`}>
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <p className="truncate font-bold">{item.name}</p>
+            <p className="truncate text-sm text-[var(--color-ink-faint)]">
+              {item.shop.name} · {item.distanceLabel}
             </p>
-          )}
+            {item.description && (
+              <p className="mt-1 line-clamp-2 text-sm text-[var(--color-ink-soft)]">
+                {item.description}
+              </p>
+            )}
+          </div>
+          <div className="shrink-0 text-right">
+            <p className="font-bold">{formatMinor(item.priceMinor)}</p>
+            {/* A word, not a tint — the same rule as the shop list. */}
+            <span
+              className={`mt-2 inline-block rounded-full px-3 py-1 text-xs font-bold ${
+                orderable
+                  ? 'bg-[var(--color-ready-bg)] text-[var(--color-ready)]'
+                  : 'bg-[var(--color-surface-sunken)] text-[var(--color-ink-soft)]'
+              }`}
+            >
+              {!item.shopIsOpen ? 'Shop closed' : !item.isAvailable ? 'Sold out' : 'Open'}
+            </span>
+          </div>
         </div>
-        <div className="shrink-0 text-right">
-          <p className="font-bold">{formatMinor(item.priceMinor)}</p>
-          <Button
-            tone="secondary"
-            className="mt-2 px-3 text-sm"
-            disabled={!item.shopIsOpen || !item.isAvailable}
-            onClick={() => router.push(`/shops/${item.listingId}`)}
-          >
-            {!item.isAvailable ? 'Sold out' : !item.shopIsOpen ? 'Closed' : 'View shop'}
-          </Button>
-        </div>
-      </div>
-    </Card>
+      </Card>
+    </Link>
   );
 }
 
