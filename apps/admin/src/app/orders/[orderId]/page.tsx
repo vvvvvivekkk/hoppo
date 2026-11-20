@@ -1,6 +1,6 @@
 'use client';
 
-import type { AdminOrderDetail } from '@hoppo/api-client';
+import type { AdminOrderBroadcastRound, AdminOrderDetail } from '@hoppo/api-client';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
@@ -169,10 +169,14 @@ export default function OrderDetailPage() {
             subtitle={
               order.broadcast.roundsSent === 0
                 ? 'No round has been sent'
-                : `${order.broadcast.roundsSent} round${order.broadcast.roundsSent === 1 ? '' : 's'} sent · ${
+                : `${order.broadcast.roundsSent} round${order.broadcast.roundsSent === 1 ? '' : 's'} sent` +
+                  (order.broadcast.searches > 1
+                    ? ` across ${order.broadcast.searches} searches`
+                    : '') +
+                  ` · ${
                     order.broadcast.secondsToAcceptance === null
                       ? 'not accepted'
-                      : `accepted after ${span(order.broadcast.secondsToAcceptance)}`
+                      : `accepted after ${span(order.broadcast.secondsToAcceptance)} (from latest search)`
                   }`
             }
           >
@@ -181,24 +185,35 @@ export default function OrderDetailPage() {
                 title="No rounds"
                 body="The order was never offered to riders — it was cancelled first, or the shop has not accepted it yet."
               />
+            ) : order.broadcast.searches > 1 ? (
+              // Group rounds by search (cycle) so the operator can see each
+              // attempt separately. cycle=1 is the first search, 2 after the
+              // task went back into the pool, and so on.
+              <div className="divide-y divide-[var(--color-line)]">
+                {Array.from(new Set(order.broadcast.rounds.map((r) => r.cycle)))
+                  .sort((a, b) => a - b)
+                  .map((cycle) => {
+                    const cycleRounds = order.broadcast.rounds.filter((r) => r.cycle === cycle);
+                    return (
+                      <div key={cycle}>
+                        <p className="bg-[var(--color-surface-sunken)] px-4 py-1.5 text-xs font-bold uppercase tracking-wide text-[var(--color-ink-faint)]">
+                          Search {cycle} of {order.broadcast.searches}
+                          {' · '}
+                          {cycleRounds.length} round{cycleRounds.length === 1 ? '' : 's'}
+                        </p>
+                        <ul className="divide-y divide-[var(--color-line)] text-sm">
+                          {cycleRounds.map((round) => (
+                            <BroadcastRoundRow key={`${round.cycle}-${round.round}-${round.sentAt}`} round={round} />
+                          ))}
+                        </ul>
+                      </div>
+                    );
+                  })}
+              </div>
             ) : (
               <ul className="divide-y divide-[var(--color-line)] text-sm">
                 {order.broadcast.rounds.map((round) => (
-                  // Keyed on when it was sent, not the round number: a delivery
-                  // that went back into the pool is searched for again from
-                  // round 1, so round numbers repeat within one order.
-                  <li key={`${round.round}-${round.sentAt}`} className="flex flex-wrap items-baseline gap-3 px-4 py-2">
-                    <span className="w-20 font-bold">Round {round.round}</span>
-                    <span className="nums">within {round.radiusM} m</span>
-                    <span className="nums">fee {money(round.feeMinor)}</span>
-                    <span className="nums">
-                      {round.eligibleCount} rider{round.eligibleCount === 1 ? '' : 's'} offered it
-                    </span>
-                    <Pill tone={round.outcome === 'ACCEPTED' ? 'ok' : round.outcome === 'PENDING' ? 'pending' : 'plain'}>
-                      {label(ROUND_OUTCOME, round.outcome)}
-                    </Pill>
-                    <span className="nums text-[var(--color-ink-faint)]">sent {when(round.sentAt)}</span>
-                  </li>
+                  <BroadcastRoundRow key={`${round.cycle}-${round.round}-${round.sentAt}`} round={round} />
                 ))}
               </ul>
             )}
@@ -235,5 +250,22 @@ export default function OrderDetailPage() {
         </>
       )}
     </div>
+  );
+}
+
+function BroadcastRoundRow({ round }: { round: AdminOrderBroadcastRound }) {
+  return (
+    <li className="flex flex-wrap items-baseline gap-3 px-4 py-2">
+      <span className="w-20 font-bold">Round {round.round}</span>
+      <span className="nums">within {round.radiusM} m</span>
+      <span className="nums">fee {money(round.feeMinor)}</span>
+      <span className="nums">
+        {round.eligibleCount} rider{round.eligibleCount === 1 ? '' : 's'} offered it
+      </span>
+      <Pill tone={round.outcome === 'ACCEPTED' ? 'ok' : round.outcome === 'PENDING' ? 'pending' : 'plain'}>
+        {label(ROUND_OUTCOME, round.outcome)}
+      </Pill>
+      <span className="nums text-[var(--color-ink-faint)]">sent {when(round.sentAt)}</span>
+    </li>
   );
 }

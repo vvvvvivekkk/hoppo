@@ -8,6 +8,7 @@ import { useApi } from '@/lib/api';
 const NAV = [
   { href: '/orders', label: 'Orders' },
   { href: '/history', label: 'History' },
+  { href: '/settlements', label: 'Settlements' },
   { href: '/catalog', label: 'Menu' },
   { href: '/hours', label: 'Hours' },
 ];

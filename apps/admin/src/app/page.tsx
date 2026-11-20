@@ -1,6 +1,6 @@
 'use client';
 
-import type { AdminOrderSummary } from '@hoppo/api-client';
+import type { AdminOrderSummary, RiderPresence } from '@hoppo/api-client';
 import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { Banner, Panel, Pill } from '@/components/ui';
@@ -25,6 +25,8 @@ export default function OverviewPage() {
   const [today, setToday] = useState<AdminOrderSummary | null>(null);
   const [todayError, setTodayError] = useState<string | null>(null);
   const [health, setHealth] = useState<Awaited<ReturnType<typeof api.health.ready>> | null>(null);
+  const [presence, setPresence] = useState<RiderPresence | null>(null);
+  const [presenceError, setPresenceError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -36,6 +38,21 @@ export default function OverviewPage() {
         setTodayError(null);
       } catch (e) {
         setTodayError(describeError(e));
+      }
+    })();
+
+    // Rider presence for today, also independent.
+    void (async () => {
+      try {
+        const now = new Date();
+        const startOfDay = new Date(now);
+        startOfDay.setHours(0, 0, 0, 0);
+        setPresence(
+          await api.admin.riderPresence(startOfDay.toISOString(), now.toISOString()),
+        );
+        setPresenceError(null);
+      } catch (e) {
+        setPresenceError(describeError(e));
       }
     })();
 
@@ -163,11 +180,78 @@ export default function OverviewPage() {
         )}
       </Panel>
 
+      <Panel
+        title="Rider presence today"
+        subtitle={
+          presence
+            ? `${presence.distinctRiders} distinct rider${presence.distinctRiders === 1 ? '' : 's'} seen` +
+              (presence.peak
+                ? ` · peak ${presence.peak.activeRiders} at ${new Date(presence.peak.hourStart).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
+                : '')
+            : 'Loading…'
+        }
+      >
+        {presenceError && (
+          <div className="p-4">
+            <Banner tone="warn">Could not load rider presence: {presenceError}</Banner>
+          </div>
+        )}
+        {presence && presence.hours.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-[var(--color-line)] text-xs uppercase tracking-wide text-[var(--color-ink-faint)]">
+                  <th className="px-4 py-2 text-left">Hour</th>
+                  <th className="px-4 py-2 text-right">Active riders</th>
+                  <th className="px-4 py-2 text-left">Bar</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--color-line)]">
+                {presence.hours.map((h) => {
+                  const maxCount = presence.peak?.activeRiders ?? 1;
+                  const pct = maxCount > 0 ? (h.activeRiders / maxCount) * 100 : 0;
+                  const beforeRecording =
+                    presence.recordedSince !== null &&
+                    new Date(h.hourStart) < new Date(presence.recordedSince);
+                  return (
+                    <tr key={h.hourStart} className={beforeRecording ? 'opacity-40' : ''}>
+                      <td className="nums whitespace-nowrap px-4 py-1">
+                        {new Date(h.hourStart).toLocaleTimeString('en-IN', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </td>
+                      <td className="nums px-4 py-1 text-right font-semibold">
+                        {beforeRecording ? '—' : h.activeRiders}
+                      </td>
+                      <td className="px-4 py-1">
+                        {!beforeRecording && h.activeRiders > 0 && (
+                          <div
+                            className="h-4 rounded bg-[var(--color-accent)]"
+                            style={{ width: `${Math.max(pct, 4)}%` }}
+                          />
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          presence && !presenceError && (
+            <div className="p-4">
+              <p className="text-sm text-[var(--color-ink-faint)]">
+                No rider presence data for today yet.
+              </p>
+            </div>
+          )
+        )}
+      </Panel>
+
       <Panel title="Not in this build" subtitle="So the gaps are visible rather than implied">
         <ul className="divide-y divide-[var(--color-line)] text-sm">
           {[
-            ['Riders online', 'The API keeps no history of rider presence yet, so there is no count to show'],
-            ['Analytics (A-14)', 'Rider supply by hour and funnels; the order report has the figures that exist'],
             ['Withdrawal requests (A-13)', 'Marking payouts as paid'],
             ['Reported users and content (A-11, A-12)', 'Community moderation queues'],
           ].map(([title, body]) => (

@@ -90,6 +90,9 @@ export function ApiProvider({ children }: { children: ReactNode }) {
         // idea why, and signs in again only to be refused.
         const blocked = error?.accountBlocked ?? null;
         if (blocked) setNotice(blockedMessage(blocked));
+        // ACCOUNT_UNAVAILABLE: the account is no longer active but was not
+        // explicitly suspended or deactivated. The API's own message says why.
+        else if (error?.isAccountUnavailable) setNotice(error.message);
         // The college itself was switched off (403 COLLEGE_INACTIVE). The
         // client ends the session on it; the API's sentence says why, and
         // "your session has ended" would send them straight back to sign in
