@@ -1,7 +1,7 @@
 'use client';
 
-import type { College } from '@hoppo/api-client';
-import { useEffect, useRef, useState } from 'react';
+import { ApiError, type College, type PrivacyNotice } from '@hoppo/api-client';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Card, Field } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
 
@@ -86,6 +86,36 @@ export default function RegisterPage() {
   const college = colleges.find((c) => c.id === collegeId);
 
   /**
+   * FR-PRIV-01: the privacy notice, shown in full on the last step, with an
+   * explicit acceptance of the version that was on screen.
+   *
+   * Registering creates an account holding the owner's name, number and
+   * email, so it is the same obligation as a student signing up. What is
+   * recorded is the *version* accepted: a notice that changed while the form
+   * was open is refused by the API (PRIVACY_NOTICE_OUTDATED), and the owner is
+   * shown the new one and asked again rather than being recorded as agreeing
+   * to words they never saw.
+   */
+  const [notice, setNotice] = useState<PrivacyNotice | null>(null);
+  const [noticeError, setNoticeError] = useState<string | null>(null);
+  const [acceptedVersion, setAcceptedVersion] = useState<string | null>(null);
+
+  const loadNotice = useCallback(async () => {
+    setNoticeError(null);
+    try {
+      setNotice(await api.privacy.notice());
+    } catch (e) {
+      setNoticeError(describeError(e));
+    }
+  }, [api]);
+
+  useEffect(() => {
+    if (step === 'documents' && !notice) void loadNotice();
+  }, [step, notice, loadNotice]);
+
+  const noticeAccepted = notice !== null && acceptedVersion === notice.version;
+
+  /**
    * The browser's own geolocation is the most accurate thing available here,
    * and far better than geocoding a road name — FR-SHOP-04 exists because a
    * geocoded "Main Road" lands in the middle of a road that may be two
@@ -157,6 +187,7 @@ export default function RegisterPage() {
         collegeId,
         fssaiLicenceNumber: fssai || undefined,
         gstin: gstin || undefined,
+        privacyNoticeVersion: acceptedVersion ?? undefined,
         /**
          * FR-SHOP-08. These are object keys from a presigned upload, which
          * needs an authenticated session the owner does not have yet —
@@ -179,7 +210,18 @@ export default function RegisterPage() {
       setResult({ distanceLabel: res.distanceLabel, message: res.message });
       setStep('done');
     } catch (e) {
-      setError(describeError(e));
+      if (e instanceof ApiError && e.code === 'PRIVACY_NOTICE_OUTDATED') {
+        // The notice changed while this form was open. Show the new one and
+        // ask again; nothing was registered.
+        setAcceptedVersion(null);
+        setNotice(null);
+        setError('The privacy notice was updated while you were filling this in. Read the new version below and accept it, then submit again.');
+        void loadNotice();
+      } else if (e instanceof ApiError && e.code === 'PRIVACY_NOTICE_NOT_ACCEPTED') {
+        setError('Read the privacy notice below and tick the box to accept it, then submit again.');
+      } else {
+        setError(describeError(e));
+      }
     } finally {
       submitting.current = false;
       setBusy(false);
@@ -475,6 +517,69 @@ export default function RegisterPage() {
             </ul>
           </div>
 
+          <section aria-labelledby="privacy-heading" className="space-y-3">
+            <h2 id="privacy-heading" className="text-xl font-bold">
+              {notice?.title ?? 'Privacy notice'}
+            </h2>
+
+            {!notice && !noticeError && (
+              <p className="text-[var(--color-ink-faint)]">Loading the privacy notice…</p>
+            )}
+
+            {noticeError && !notice && (
+              <div className="space-y-3">
+                <Banner tone="error">
+                  The privacy notice could not be loaded, so the shop cannot be registered yet.{' '}
+                  {noticeError}
+                </Banner>
+                <Button tone="secondary" onClick={() => void loadNotice()}>
+                  Try again
+                </Button>
+              </div>
+            )}
+
+            {notice && (
+              <>
+                <div
+                  tabIndex={0}
+                  aria-label="Privacy notice text"
+                  className="max-h-72 space-y-3 overflow-y-auto rounded-xl border-2 border-[var(--color-line)] bg-white p-4"
+                >
+                  {notice.sections.map((section) => (
+                    <div key={section.key}>
+                      <h3 className="font-bold">{section.heading}</h3>
+                      <p className="mt-1 text-[var(--color-ink-soft)]">{section.body}</p>
+                    </div>
+                  ))}
+                  {/* Only when one is configured; inventing a contact would be
+                      worse than showing none. */}
+                  {(notice.grievanceContact.name || notice.grievanceContact.email) && (
+                    <p className="text-[var(--color-ink-soft)]">
+                      Grievance contact:{' '}
+                      {[notice.grievanceContact.name, notice.grievanceContact.email]
+                        .filter(Boolean)
+                        .join(', ')}
+                    </p>
+                  )}
+                  <p className="text-sm text-[var(--color-ink-faint)]">
+                    Version {notice.version}, in effect from{' '}
+                    {new Date(notice.effectiveFrom).toLocaleDateString('en-IN', { dateStyle: 'medium' })}.
+                  </p>
+                </div>
+
+                <label className="tap flex items-center gap-3 text-lg font-semibold">
+                  <input
+                    type="checkbox"
+                    className="h-6 w-6"
+                    checked={noticeAccepted}
+                    onChange={(e) => setAcceptedVersion(e.target.checked ? notice.version : null)}
+                  />
+                  I have read the privacy notice and accept it
+                </label>
+              </>
+            )}
+          </section>
+
           <div className="flex gap-3">
             <Button tone="quiet" onClick={() => setStep('location')}>
               Back
@@ -483,7 +588,7 @@ export default function RegisterPage() {
               className="flex-1"
               large
               loading={busy}
-              disabled={category === 'FOOD' && fssai.length !== 14}
+              disabled={(category === 'FOOD' && fssai.length !== 14) || !noticeAccepted}
               onClick={() => void submit()}
             >
               Submit for approval

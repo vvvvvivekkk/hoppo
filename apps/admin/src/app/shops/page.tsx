@@ -82,10 +82,14 @@ export default function ShopsPage() {
       // say so, and either way reload so the row shows where it stands now.
       // (Reload first: a successful load clears the banner.)
       await load();
+      // Any other 409 is the same kind of thing — the row changed under
+      // this click — and the API's sentence for it says how.
       setError(
         e instanceof ApiError && e.code === 'ALREADY_DECIDED'
           ? 'Someone else has already decided that one. The queue below is up to date.'
-          : describeError(e),
+          : e instanceof ApiError && e.status === 409
+            ? `${e.message} The queue below is up to date.`
+            : describeError(e),
       );
     } finally {
       pending.current.delete(id);

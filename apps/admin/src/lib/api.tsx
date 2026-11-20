@@ -90,6 +90,11 @@ export function ApiProvider({ children }: { children: ReactNode }) {
         // idea why, and signs in again only to be refused.
         const blocked = error?.accountBlocked ?? null;
         if (blocked) setNotice(blockedMessage(blocked));
+        // The college itself was switched off (403 COLLEGE_INACTIVE). The
+        // client ends the session on it; the API's sentence says why, and
+        // "your session has ended" would send them straight back to sign in
+        // and be refused again.
+        else if (error?.code === 'COLLEGE_INACTIVE') setNotice(error.message);
         // `leaving`: a refused revoke on the way out is not news to anyone.
         else if (signedInRef.current && !leaving.current) {
           setNotice('Your session has ended. Sign in again to carry on.');

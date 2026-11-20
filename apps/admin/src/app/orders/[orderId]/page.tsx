@@ -184,7 +184,10 @@ export default function OrderDetailPage() {
             ) : (
               <ul className="divide-y divide-[var(--color-line)] text-sm">
                 {order.broadcast.rounds.map((round) => (
-                  <li key={round.round} className="flex flex-wrap items-baseline gap-3 px-4 py-2">
+                  // Keyed on when it was sent, not the round number: a delivery
+                  // that went back into the pool is searched for again from
+                  // round 1, so round numbers repeat within one order.
+                  <li key={`${round.round}-${round.sentAt}`} className="flex flex-wrap items-baseline gap-3 px-4 py-2">
                     <span className="w-20 font-bold">Round {round.round}</span>
                     <span className="nums">within {round.radiusM} m</span>
                     <span className="nums">fee {money(round.feeMinor)}</span>

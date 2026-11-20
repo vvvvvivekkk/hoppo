@@ -26,8 +26,9 @@ import {
  * choose the outcome, read exactly what it does and say why, then confirm.
  *
  * The outcomes offered for each task are the ones the API lists in
- * `canResolveAs`, not a fixed pair: "not delivered" is not offered for an
- * order paid from the wallet while there is no refund path for it.
+ * `canResolveAs` — both for an open escalation, none once it is resolved.
+ * "Not delivered" on an order paid from the wallet refunds the student in
+ * full, and the amount is stated before the decision and again in its result.
  */
 const NOTE_MIN = 10;
 const NOTE_MAX = 500;
@@ -36,10 +37,8 @@ const REFUSALS = {
   ALREADY_RESOLVED:
     'Somebody else resolved this one first. It is shown below as it now stands.',
   NOT_ESCALATED: 'That delivery is not escalated, so there is nothing to resolve.',
-  WALLET_REFUND_UNAVAILABLE:
-    'This order was paid from the wallet, and "not delivered" cannot be recorded for it yet because the refund cannot be made from here. Nothing was changed.',
   ORDER_NOT_AWAITING_HANDOVER:
-    'The order is no longer waiting to be handed over — it has been cancelled or completed some other way — so it cannot be marked delivered. Nothing was changed.',
+    'The order is no longer waiting to be handed over — it has been cancelled or completed some other way — so this decision cannot be recorded. Nothing was changed.',
   CROSS_TENANT_ACCESS: 'That delivery belongs to another college.',
 };
 
@@ -77,14 +76,25 @@ function consequences(item: Escalation, outcome: EscalationOutcome): string[] {
   if (order) {
     lines.push(
       `Order ${order.reference} is cancelled, recorded as cancelled by an administrator.`,
-      order.paymentMethod === 'CASH'
-        ? 'It was cash on delivery, so Hoppo holds none of the student’s money and there is nothing to refund.'
-        : 'No refund is made from this screen.',
+      order.paymentMethod === 'WALLET'
+        ? `The student is refunded ${money(order.totalMinor)} — the whole order, back to their Hoppo wallet.`
+        : 'It was cash on delivery, so Hoppo holds none of the student\u2019s money and there is nothing to refund.',
     );
   } else {
     lines.push('The delivery is cancelled. No money is held for it, so there is nothing to refund.');
   }
   return lines;
+}
+
+/** The two amounts a decision moves, for the confirm step. */
+function amounts(item: Escalation, outcome: EscalationOutcome): { riderMinor: number; refundMinor: number } {
+  if (outcome === 'DELIVERED') {
+    return { riderMinor: item.feeMinor + (item.reimbursementMinor ?? 0), refundMinor: 0 };
+  }
+  return {
+    riderMinor: 0,
+    refundMinor: item.order?.paymentMethod === 'WALLET' ? item.order.totalMinor : 0,
+  };
 }
 
 export default function EscalationsPage() {
@@ -134,10 +144,13 @@ export default function EscalationsPage() {
       setNotice(null);
       try {
         const result = await api.admin.escalations.resolve(item.taskId, outcome, note);
+        // The server's own figures, not the page's forecast of them.
         setNotice(
-          `${result.message} Rider paid ${money(result.riderFeeMinor)}; refunded to the student ${money(
-            result.refundedMinor,
-          )}.`,
+          `${result.message} Rider paid ${money(result.riderFeeMinor)}. ${
+            result.refundedMinor > 0
+              ? `${money(result.refundedMinor)} refunded to the student.`
+              : 'Nothing was refunded to the student.'
+          }`,
         );
         setItems((prev) => (prev ?? []).filter((i) => i.taskId !== item.taskId));
       } catch (e) {
@@ -227,8 +240,6 @@ function Row({
         : null;
 
   const open = item.status === 'ESCALATED';
-  const walletOnly =
-    open && item.order?.paymentMethod === 'WALLET' && !item.canResolveAs.includes('NOT_DELIVERED');
 
   function cancel() {
     setOutcome(null);
@@ -311,12 +322,6 @@ function Row({
               The server is not accepting a decision on this one right now.
             </span>
           )}
-          {walletOnly && (
-            <span className="text-sm text-[var(--color-ink-faint)]">
-              “Not delivered” is not available: this order was paid from the wallet, and the refund
-              cannot be made from here yet.
-            </span>
-          )}
         </div>
       )}
 
@@ -364,6 +369,10 @@ function Row({
             </>
           ) : (
             <>
+              <p className="rounded-md bg-white px-3 py-2 text-sm font-semibold">
+                Rider is paid {money(amounts(item, outcome).riderMinor)} · student is refunded{' '}
+                {money(amounts(item, outcome).refundMinor)}
+              </p>
               <p className="rounded-md bg-white px-3 py-2 text-sm">
                 <span className="font-semibold">Your reason:</span> {trimmed}
               </p>

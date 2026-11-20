@@ -30,6 +30,7 @@ const REFUSALS = {
   NOT_FOUND: 'There is no student with that id.',
   CROSS_TENANT_ACCESS: 'That student belongs to another college.',
   ALREADY_SUSPENDED: 'This student is already suspended. The page below is up to date.',
+  NOT_ACTIVE: 'This account is no longer active — it was suspended or closed while you were looking at it — so it cannot be suspended. The page below is up to date.',
   NOT_SUSPENDED: 'This student is not suspended any more. The page below is up to date.',
 };
 
