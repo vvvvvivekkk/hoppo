@@ -39,6 +39,43 @@ export const WALLET_HEAD_ORDER = [
   { seq: 'desc' },
 ] as const satisfies readonly Prisma.WalletEntryOrderByWithRelationInput[];
 
+/**
+ * Take the per-user wallet lock for every wallet a transaction will write to.
+ *
+ * THE LOCK ORDER, which every wallet-writing transaction in the API follows
+ * (orders, the rider's settlement in rider.service.ts `settleDelivery`, the
+ * accept-window sweep in dispatch, an administrator's resolution):
+ *
+ *   1. wallet locks first, before the transaction writes any row;
+ *   2. when more than one wallet is involved, in ascending order of user id.
+ *
+ * Two transactions that both need wallets A and B then both ask for A first,
+ * so neither can end up holding one while waiting for the other — which is
+ * what a deadlock is. Row locks (taken by UPDATE) always come after, so a
+ * transaction never waits for a wallet while holding a row another
+ * wallet-holder needs.
+ *
+ * The lock is an advisory lock: a lock on a number rather than on a row,
+ * which is what is needed when the thing protected is "the next ledger row"
+ * and does not exist yet. The `_xact_` kind is released automatically when
+ * the transaction commits or rolls back. Asking again for a lock the same
+ * transaction already holds returns at once, so a helper may safely take a
+ * lock its caller has already taken.
+ *
+ * The key expression must be byte-for-byte the same everywhere; a different
+ * prefix would be a different lock and protect nothing. $executeRaw rather
+ * than $queryRaw because the function returns `void`, which Prisma cannot
+ * read back as a result column.
+ */
+export async function lockWallets(
+  tx: Prisma.TransactionClient,
+  userIds: readonly string[],
+): Promise<void> {
+  for (const userId of [...new Set(userIds)].sort()) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${userId}))`;
+  }
+}
+
 export interface WalletHead {
   /** The balance the next entry must be computed from. */
   balanceMinor: number;

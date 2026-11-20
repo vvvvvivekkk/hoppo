@@ -68,6 +68,9 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
     paymentStatus: 'HELD',
     totalMinor: 3500,
     deliveryFeeMinor: 1000,
+    statedPrepMinutes: 15,
+    placedAt: new Date(),
+    shopListing: { college: { config: null } },
     ...seed.order,
   };
   const task: Row = { id: 'task-1', status: 'CREATED', baseFeeMinor: 1000, ...seed.task };
@@ -88,6 +91,8 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
   // Things "someone else" does to the rows straight after this request's
   // n-th read of the order, keyed by n.
   const afterOrderRead = new Map<number, () => void>();
+  let taskReads = 0;
+  const afterTaskRead = new Map<number, () => void>();
 
   const prisma: Row = {
     $transaction: (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
@@ -113,7 +118,12 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
       }),
     },
     task: {
-      findUnique: jest.fn(async () => ({ ...task })),
+      findUnique: jest.fn(async () => {
+        const snapshot = { ...task };
+        taskReads += 1;
+        afterTaskRead.get(taskReads)?.();
+        return snapshot;
+      }),
       updateMany: jest.fn(async ({ where, data }: { where: Row; data: Row }) => {
         if (!matches(task, where)) return { count: 0 };
         apply(task, data);
@@ -160,11 +170,13 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
     },
   };
 
-  const service = new OrdersService(prisma as never, new TenantService(), {} as never);
+  const audit = { recordInTransaction: jest.fn().mockResolvedValue(undefined) };
+  const service = new OrdersService(prisma as never, new TenantService(), audit as never);
 
   return {
     service,
     prisma,
+    audit,
     order,
     task,
     entries,
@@ -184,6 +196,10 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
      */
     afterOrderRead(n: number, change: (rows: { order: Row; task: Row }) => void) {
       afterOrderRead.set(n, () => change({ order, task }));
+    },
+    /** The same, for the n-th direct read of the task row. */
+    afterTaskRead(n: number, change: (rows: { order: Row; task: Row }) => void) {
+      afterTaskRead.set(n, () => change({ order, task }));
     },
   };
 }
@@ -513,6 +529,119 @@ describe('a write based on a stale read is refused by the conditional UPDATE', (
     expect(ctx.order.status).toBe('READY');
     expect(ctx.entries).toHaveLength(1);
   });
+
+  it('keep waiting: the task is cancelled after it was read as UNFULFILLED', async () => {
+    const ctx = build({
+      order: { status: 'PREPARING', paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      task: { status: 'UNFULFILLED' },
+      entries: [],
+    });
+    ctx.afterOrderRead(1, ({ task }) => {
+      task.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING')),
+      'NOT_UNFULFILLED',
+    );
+
+    // A cancelled task was not put back into the dispatch pool.
+    expect(ctx.task.status).toBe('CANCELLED');
+    expect(ctx.task.dispatchDueAt).toBeUndefined();
+  });
+
+  it('unfulfilled cancel: the task went back to the pool after it was read', async () => {
+    const ctx = build({ order: { status: 'PREPARING' }, task: { status: 'UNFULFILLED' } });
+    // A parallel "keep waiting" won.
+    ctx.afterOrderRead(1, ({ task }) => {
+      task.status = 'CREATED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL')),
+      'NOT_UNFULFILLED',
+    );
+
+    // The task now being offered to riders was not cancelled, and nothing was refunded.
+    expect(ctx.task.status).toBe('CREATED');
+    expect(ctx.order).toMatchObject({ status: 'PREPARING', paymentStatus: 'HELD' });
+    expect(ctx.entries.filter((e) => e.type === 'ORDER_RELEASE')).toHaveLength(0);
+  });
+
+  it('unfulfilled cancel: the order is completed after it was read', async () => {
+    const ctx = build({ order: { status: 'READY' }, task: { status: 'UNFULFILLED' } });
+    ctx.afterOrderRead(1, ({ order }) => {
+      order.status = 'COMPLETED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL')),
+      'ORDER_STATE_CHANGED',
+    );
+
+    // A completed order was not turned into a cancelled, refunded one.
+    expect(ctx.order).toMatchObject({ status: 'COMPLETED', paymentStatus: 'HELD' });
+    expect(ctx.order.cancelledBy).toBeUndefined();
+    expect(ctx.entries.filter((e) => e.type === 'ORDER_RELEASE')).toHaveLength(0);
+  });
+
+  it('shop accept: the student cancels after the order was read as PLACED', async () => {
+    const ctx = build();
+    ctx.afterOrderRead(1, ({ order, task }) => {
+      order.status = 'CANCELLED';
+      task.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.acceptOrder(SHOP, 'order-1', {})),
+      'ORDER_STATE_CHANGED',
+    );
+
+    // The cancelled order was not resurrected as PREPARING.
+    expect(ctx.order.status).toBe('CANCELLED');
+    expect(ctx.order.shopAcceptedAt).toBeUndefined();
+    expect(ctx.task.dispatchDueAt).toBeUndefined();
+  });
+
+  it('cancel: a rider accepts the task after the in-transaction read of it', async () => {
+    const ctx = build({
+      order: { paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      entries: [],
+    });
+    ctx.afterTaskRead(1, ({ task }) => {
+      task.status = 'ASSIGNED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.cancelByStudent(STUDENT, 'order-1', {})),
+      'ORDER_STATE_CHANGED',
+    );
+
+    // The task a rider is now carrying was not cancelled underneath them.
+    expect(ctx.task.status).toBe('ASSIGNED');
+    expect(ctx.task.cancelledAt).toBeUndefined();
+  });
+
+  it('shop accept: the task is cancelled after the order was read, the order still PLACED', async () => {
+    const ctx = build({
+      order: { paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      entries: [],
+    });
+    // Only the task moves, so the order's own conditional UPDATE still
+    // matches and it is the task's predicate that has to refuse.
+    ctx.afterOrderRead(1, ({ task }) => {
+      task.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.acceptOrder(SHOP, 'order-1', {})),
+      'ORDER_STATE_CHANGED',
+    );
+
+    // A cancelled task was not given a dispatch time.
+    expect(ctx.task.status).toBe('CANCELLED');
+    expect(ctx.task.dispatchDueAt).toBeUndefined();
+  });
 });
 
 // ===========================================================================
@@ -597,5 +726,210 @@ describe('what the caller is told about a refund', () => {
     expect(
       (await wallet.service.rejectOrder(SHOP, 'order-1', { reason: 'Closed' })).refundedMinor,
     ).toBe(3500);
+  });
+});
+
+// ===========================================================================
+// 7. An administrator cancels a picked-up order (FR-ADM-04)
+// ===========================================================================
+
+/**
+ * `adminCancelInTransaction` is called by the escalations service inside its
+ * own transaction; here the stand-in plays that transaction. The order of an
+ * escalated delivery is PICKED_UP.
+ */
+describe('adminCancelInTransaction', () => {
+  const PICKED_UP = { order: { status: 'PICKED_UP' }, task: { status: 'ESCALATED' } };
+  const call = (ctx: ReturnType<typeof build>) =>
+    ctx.service.adminCancelInTransaction(ctx.prisma as never, {
+      orderId: 'order-1',
+      adminUserId: 'admin-1',
+      reason: 'Rider could not find the student; food returned.',
+    });
+  /** The position, among all mock calls in this test, of a mock's first call. */
+  const firstCall = (mock: jest.Mock) => mock.mock.invocationCallOrder[0];
+
+  it('WALLET order: cancelled by ADMIN, REFUNDED, exactly one release of the full total', async () => {
+    const ctx = build(PICKED_UP);
+
+    await expect(call(ctx)).resolves.toEqual({
+      outcome: 'CANCELLED',
+      refundedMinor: 3500,
+      studentId: 'student-1',
+    });
+
+    expect(ctx.order).toMatchObject({
+      status: 'CANCELLED',
+      cancelledBy: 'ADMIN',
+      cancelledReason: 'Rider could not find the student; food returned.',
+      paymentStatus: 'REFUNDED',
+    });
+    const releases = ctx.entries.filter((e) => e.type === 'ORDER_RELEASE');
+    expect(releases).toHaveLength(1);
+    expect(releases[0]).toMatchObject({
+      userId: 'student-1',
+      direction: 'CREDIT',
+      amountMinor: 3500,
+      balanceAfterMinor: 5000,
+      orderId: 'order-1',
+    });
+    // Stamped after the hold it reverses, like every other ledger entry.
+    expect(releases[0].createdAt.getTime()).toBeGreaterThan(ctx.entries[0].createdAt.getTime());
+  });
+
+  it('leaves the task row alone and opens no transaction of its own', async () => {
+    const ctx = build(PICKED_UP);
+    const openTransaction = jest.spyOn(ctx.prisma, '$transaction');
+
+    await call(ctx);
+
+    // The caller's conditional UPDATE on the task decides the escalation race.
+    expect(ctx.task.status).toBe('ESCALATED');
+    expect(ctx.prisma.task.updateMany).not.toHaveBeenCalled();
+    expect(openTransaction).not.toHaveBeenCalled();
+  });
+
+  it('takes the wallet lock before it writes any row', async () => {
+    const ctx = build(PICKED_UP);
+
+    await call(ctx);
+
+    // Goes red if the lock is removed, or moved after the UPDATE.
+    expect(ctx.prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const [strings, lockedUser] = ctx.prisma.$executeRaw.mock.calls[0] as [string[], string];
+    expect(strings.join('?')).toContain("pg_advisory_xact_lock(hashtext('wallet:' || ?))");
+    expect(lockedUser).toBe('student-1');
+    expect(firstCall(ctx.prisma.$executeRaw)).toBeLessThan(firstCall(ctx.prisma.order.updateMany));
+    expect(firstCall(ctx.prisma.$executeRaw)).toBeLessThan(firstCall(ctx.prisma.walletEntry.create));
+  });
+
+  it('records who refunded, in the same transaction (FR-ADM-06)', async () => {
+    const ctx = build(PICKED_UP);
+
+    await call(ctx);
+
+    expect(ctx.audit.recordInTransaction).toHaveBeenCalledTimes(1);
+    expect(ctx.audit.recordInTransaction).toHaveBeenCalledWith(
+      ctx.prisma,
+      expect.objectContaining({
+        actorId: 'admin-1',
+        collegeId: 'col-1',
+        action: 'WALLET_ADJUSTED',
+        targetType: 'order',
+        targetId: 'order-1',
+        detail: expect.objectContaining({ entryType: 'ORDER_RELEASE', amountMinor: 3500 }),
+      }),
+    );
+  });
+
+  it('CASH order: cancelled, nothing refunded, no lock, no ledger entry, no wallet audit', async () => {
+    const ctx = build({
+      order: { status: 'PICKED_UP', paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      task: { status: 'ESCALATED' },
+      entries: [],
+    });
+
+    await expect(call(ctx)).resolves.toEqual({
+      outcome: 'CANCELLED',
+      refundedMinor: 0,
+      studentId: 'student-1',
+    });
+
+    expect(ctx.order).toMatchObject({
+      status: 'CANCELLED',
+      cancelledBy: 'ADMIN',
+      paymentStatus: 'NOT_REQUIRED',
+    });
+    expect(ctx.entries).toHaveLength(0);
+    expect(ctx.prisma.$executeRaw).not.toHaveBeenCalled();
+    expect(ctx.audit.recordInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('stale read: a correct handover code settles the order after it was read', async () => {
+    const ctx = build(PICKED_UP);
+    // Read 1 is the method's own read of the order.
+    ctx.afterOrderRead(1, ({ order }) => {
+      order.status = 'DELIVERED';
+    });
+
+    // Goes red if `status` is taken out of the conditional UPDATE: the
+    // delivered order would be cancelled and its payment refunded.
+    await expect(call(ctx)).resolves.toEqual({ outcome: 'STATE_CHANGED' });
+
+    expect(ctx.order).toMatchObject({ status: 'DELIVERED', paymentStatus: 'HELD' });
+    expect(ctx.order.cancelledBy).toBeUndefined();
+    expect(ctx.entries.filter((e) => e.type === 'ORDER_RELEASE')).toHaveLength(0);
+    expect(ctx.audit.recordInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('a second resolution finds nothing to cancel and refunds nothing more', async () => {
+    const ctx = build(PICKED_UP);
+
+    await call(ctx);
+    await expect(call(ctx)).resolves.toEqual({ outcome: 'STATE_CHANGED' });
+
+    expect(ctx.entries.filter((e) => e.type === 'ORDER_RELEASE')).toHaveLength(1);
+  });
+
+  it('only a PICKED_UP order: one still with the shop is not this method\'s to cancel', async () => {
+    for (const status of ['PLACED', 'PREPARING', 'READY', 'COMPLETED', 'CANCELLED']) {
+      const ctx = build({ order: { status } });
+      await expect(call(ctx)).resolves.toEqual({ outcome: 'STATE_CHANGED' });
+      expect(ctx.order.status).toBe(status);
+      expect(ctx.entries).toHaveLength(1);
+    }
+  });
+
+  it('an order that does not exist: says so, writes nothing', async () => {
+    const ctx = build(PICKED_UP);
+    ctx.prisma.order.findUnique.mockResolvedValueOnce(null);
+
+    await expect(call(ctx)).resolves.toEqual({ outcome: 'ORDER_NOT_FOUND' });
+    expect(ctx.prisma.order.updateMany).not.toHaveBeenCalled();
+    expect(ctx.entries).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// 8. Every refund path takes the wallet lock first
+// ===========================================================================
+
+describe('the wallet lock comes before any write, on every path that refunds', () => {
+  const firstCall = (mock: jest.Mock) => mock.mock.invocationCallOrder[0];
+
+  function expectLockedFirst(ctx: ReturnType<typeof build>): void {
+    expect(ctx.prisma.$executeRaw).toHaveBeenCalled();
+    const lock = firstCall(ctx.prisma.$executeRaw);
+    for (const write of [
+      ctx.prisma.order.updateMany,
+      ctx.prisma.task.updateMany,
+      ctx.prisma.walletEntry.create,
+    ]) {
+      if (write.mock.calls.length > 0) expect(lock).toBeLessThan(firstCall(write));
+    }
+  }
+
+  it('student cancel', async () => {
+    const ctx = build();
+    await ctx.service.cancelByStudent(STUDENT, 'order-1', {});
+    expectLockedFirst(ctx);
+  });
+
+  it('shop reject', async () => {
+    const ctx = build();
+    await ctx.service.rejectOrder(SHOP, 'order-1', { reason: 'Closed' });
+    expectLockedFirst(ctx);
+  });
+
+  it('no rider, cancel', async () => {
+    const ctx = build({ order: { status: 'PREPARING' }, task: { status: 'UNFULFILLED' } });
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL');
+    expectLockedFirst(ctx);
+  });
+
+  it('no rider, collect in person', async () => {
+    const ctx = build({ order: { status: 'READY' }, task: { status: 'UNFULFILLED' } });
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON');
+    expectLockedFirst(ctx);
   });
 });

@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/com
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { MY_ORDERS_DEFAULT_LIMIT, OrdersService } from './orders.service';
+import { AdminOrdersService } from './admin-orders.service';
 import { clampPageLimit } from '../common/pagination';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -106,7 +107,28 @@ export class OrdersController {
 @Controller('shops/:listingId/orders')
 @Roles('SHOP_OWNER', 'SHOP_STAFF', 'ADMIN')
 export class ShopOrdersController {
-  constructor(private readonly orders: OrdersService) {}
+  constructor(
+    private readonly orders: OrdersService,
+    private readonly report: AdminOrdersService,
+  ) {}
+
+  /**
+   * D-10: orders that are over. The queue below only ever holds orders still
+   * in play; a completed or cancelled one is found here, a page at a time.
+   */
+  @Get('history')
+  @ApiOperation({ summary: 'Completed and cancelled orders for this shop, paginated' })
+  history(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('listingId') listingId: string,
+    @Query('status') status?: string | string[],
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.report.shopHistory(user, listingId, { status, from, to, limit, cursor });
+  }
 
   /** FR-SHP-01 */
   @Get()

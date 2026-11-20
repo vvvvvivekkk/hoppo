@@ -28,7 +28,7 @@ import {
 } from '@hoppo/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantService } from '../common/tenant/tenant.service';
-import { AuditService } from '../audit/audit.service';
+import { AuditAction, AuditService } from '../audit/audit.service';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import { clampPageLimit } from '../common/pagination';
 import {
@@ -36,7 +36,7 @@ import {
   resolveOrderTransition,
   resolveTaskTransition,
 } from './order-transition';
-import { WALLET_HEAD_ORDER, readWalletHead } from '../wallet/wallet-ledger';
+import { WALLET_HEAD_ORDER, lockWallets, readWalletHead } from '../wallet/wallet-ledger';
 import type {
   AcceptOrderDto,
   CancelOrderDto,
@@ -52,6 +52,20 @@ import type {
  * input was the fix; changing what an existing client gets by default was not.
  */
 export const MY_ORDERS_DEFAULT_LIMIT = 20;
+
+/**
+ * What `OrdersService.adminCancelInTransaction` did.
+ *
+ * - `CANCELLED`: the order is now CANCELLED by ADMIN. `refundedMinor` is what
+ *   went back to the student's wallet — the full total for a WALLET order, 0
+ *   for cash, where nothing was ever held.
+ * - `STATE_CHANGED`: the order was no longer PICKED_UP. Nothing was written.
+ * - `ORDER_NOT_FOUND`: no such order. Nothing was written.
+ */
+export type AdminCancelResult =
+  | { outcome: 'CANCELLED'; refundedMinor: number; studentId: string }
+  | { outcome: 'STATE_CHANGED' }
+  | { outcome: 'ORDER_NOT_FOUND' };
 
 @Injectable()
 export class OrdersService {
@@ -933,20 +947,11 @@ export class OrdersService {
         if (orderMoved.count === 0) throw this.notReadyToCollect();
 
         if (refundsFeeToWallet) {
-          const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, order!.studentId);
-          await tx.walletEntry.create({
-            data: {
-              userId: order!.studentId,
-              direction: 'CREDIT',
-              amountMinor: order!.deliveryFeeMinor,
-              type: 'ORDER_RELEASE',
-              orderId,
-              balanceAfterMinor: balance + order!.deliveryFeeMinor,
-              // Strictly after the entry this balance was read from, so the
-              // ledger has one unambiguous latest row (see wallet-ledger.ts).
-              createdAt: nextCreatedAt,
-              note: `Delivery fee refunded on ${order!.reference}; collected in person`,
-            },
+          await this.releaseHold(tx, {
+            userId: order!.studentId,
+            orderId,
+            amountMinor: order!.deliveryFeeMinor,
+            note: `Delivery fee refunded on ${order!.reference}; collected in person`,
           });
         }
 
@@ -1016,39 +1021,25 @@ export class OrdersService {
 
       // An order whose task ran out of riders is still with the shop. Any
       // other status means something else finished or cancelled it first.
-      const orderMoved = await tx.order.updateMany({
-        where: {
-          id: orderId,
-          status: {
-            in: [DbOrderStatus.SHOP_ACCEPTED, DbOrderStatus.PREPARING, DbOrderStatus.READY],
-          },
-        },
+      const orderMoved = await this.cancelOrderIfStill(tx, {
+        orderId,
+        expected: [DbOrderStatus.SHOP_ACCEPTED, DbOrderStatus.PREPARING, DbOrderStatus.READY],
         data: {
-          status: 'CANCELLED',
+          status: DbOrderStatus.CANCELLED,
           cancelledAt: new Date(),
           cancelledBy: 'STUDENT',
           cancelledReason: 'No rider was available; cancelled by the student with a full refund.',
-          // The hold is released in full just below; see transitionOrderAndTask.
-          ...(refundsToWallet ? { paymentStatus: 'REFUNDED' as const } : {}),
         },
+        refundsHold: refundsToWallet,
       });
-      if (orderMoved.count === 0) throw this.orderStateChanged();
+      if (!orderMoved) throw this.orderStateChanged();
 
       if (refundsToWallet) {
-        const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, order!.studentId);
-        await tx.walletEntry.create({
-          data: {
-            userId: order!.studentId,
-            direction: 'CREDIT',
-            amountMinor: order!.totalMinor,
-            type: 'ORDER_RELEASE',
-            orderId,
-            balanceAfterMinor: balance + order!.totalMinor,
-            // Strictly after the entry this balance was read from, so the
-            // ledger has one unambiguous latest row (see wallet-ledger.ts).
-            createdAt: nextCreatedAt,
-            note: `Full refund on ${order!.reference}; no rider available`,
-          },
+        await this.releaseHold(tx, {
+          userId: order!.studentId,
+          orderId,
+          amountMinor: order!.totalMinor,
+          note: `Full refund on ${order!.reference}; no rider available`,
         });
       }
     });
@@ -1420,20 +1411,13 @@ export class OrdersService {
       // 500. This only words the refusal; the UPDATE still decides.
       const nextOrderStatus = resolveOrderTransition(order.status as OrderStatus, orderEvent);
 
-      const orderMoved = await tx.order.updateMany({
-        where: { id: orderId, status: order.status },
-        data: {
-          ...orderData,
-          status: nextOrderStatus as DbOrderStatus,
-          // A released hold is money returned, and the order has to say so:
-          // left at HELD, a cancelled order would claim to be sitting on
-          // funds the ledger shows were given back. Written in the same
-          // UPDATE as the status, so the two cannot disagree. Cash orders
-          // never held anything and keep NOT_REQUIRED.
-          ...(releaseWalletHold ? { paymentStatus: 'REFUNDED' as const } : {}),
-        },
+      const orderMoved = await this.cancelOrderIfStill(tx, {
+        orderId,
+        expected: [order.status],
+        data: { ...orderData, status: nextOrderStatus as DbOrderStatus },
+        refundsHold: releaseWalletHold,
       });
-      if (orderMoved.count === 0) throw this.orderStateChanged();
+      if (!orderMoved) throw this.orderStateChanged();
 
       if (taskId) {
         const task = await tx.task.findUnique({
@@ -1463,20 +1447,11 @@ export class OrdersService {
       // ledger is append-only (ADR-007), so a release is a new credit rather
       // than an edit to the original debit.
       if (releaseWalletHold) {
-        const { balanceMinor: balance, nextCreatedAt } = await readWalletHead(tx, userId);
-        await tx.walletEntry.create({
-          data: {
-            userId,
-            direction: 'CREDIT',
-            amountMinor: walletAmountMinor,
-            type: 'ORDER_RELEASE',
-            orderId,
-            balanceAfterMinor: balance + walletAmountMinor,
-            // Strictly after the entry this balance was read from, so the
-            // ledger has one unambiguous latest row (see wallet-ledger.ts).
-            createdAt: nextCreatedAt,
-            note: `Hold released for cancelled order ${reference}`,
-          },
+        await this.releaseHold(tx, {
+          userId,
+          orderId,
+          amountMinor: walletAmountMinor,
+          note: `Hold released for cancelled order ${reference}`,
         });
       }
     });
@@ -1492,7 +1467,9 @@ export class OrdersService {
    * assertSameTenant unconditionally. Returning early for ADMIN before this
    * check is what once let an admin of one college read another's queue.
    */
-  private async assertShopAccess(user: AuthenticatedUser, listingId: string): Promise<void> {
+  // Public so AdminOrdersService.shopHistory applies the very same check
+  // rather than a second copy of it.
+  async assertShopAccess(user: AuthenticatedUser, listingId: string): Promise<void> {
     const listing = await this.prisma.shopListing.findUnique({
       where: { id: listingId },
       select: {
@@ -1512,6 +1489,192 @@ export class OrdersService {
         message: 'You do not manage this shop.',
       });
     }
+  }
+
+  // =======================================================================
+  // The refund core — one implementation, four callers
+  // =======================================================================
+
+  /**
+   * Cancel an order if, and only if, it is still in one of the expected
+   * statuses.
+   *
+   * This is the single statement that decides every cancellation: student
+   * cancel, shop reject, "no rider, cancel", and an administrator's
+   * resolution all come through here. It is one conditional UPDATE (ADR-001)
+   * — whatever the caller read beforehand is stale by the time this runs, so
+   * the status is named in the WHERE clause and the database, not the caller,
+   * says whether the order was still there to cancel. `false` means it was
+   * not: someone else moved it first, and the caller must write nothing more.
+   *
+   * When the cancellation gives back a wallet hold, `paymentStatus` becomes
+   * REFUNDED in this same UPDATE, so the order's status and its payment
+   * status cannot disagree. Left at HELD, a cancelled order would claim to be
+   * sitting on funds the ledger shows were returned. Cash orders never held
+   * anything and keep NOT_REQUIRED.
+   */
+  private async cancelOrderIfStill(
+    tx: Prisma.TransactionClient,
+    params: {
+      orderId: string;
+      expected: DbOrderStatus[];
+      data: Prisma.OrderUpdateManyMutationInput;
+      refundsHold: boolean;
+    },
+  ): Promise<boolean> {
+    const moved = await tx.order.updateMany({
+      where: { id: params.orderId, status: { in: params.expected } },
+      data: {
+        ...params.data,
+        ...(params.refundsHold ? { paymentStatus: 'REFUNDED' as const } : {}),
+      },
+    });
+    return moved.count > 0;
+  }
+
+  /**
+   * Give held money back: one ORDER_RELEASE credit on the student's ledger.
+   *
+   * FR-SHP-04 / FR-PAY-06. The ledger is append-only (ADR-007), so a release
+   * is a new credit, never an edit to the original debit. The caller must
+   * already hold the wallet lock and must already have won the conditional
+   * UPDATE above — this function does not ask whether the refund is due, it
+   * writes it. The partial unique index on (order_id, type) is the last line
+   * of defence: a second release for the same order fails the INSERT.
+   */
+  private async releaseHold(
+    tx: Prisma.TransactionClient,
+    params: { userId: string; orderId: string; amountMinor: number; note: string },
+  ): Promise<void> {
+    const head = await readWalletHead(tx, params.userId);
+    await tx.walletEntry.create({
+      data: {
+        userId: params.userId,
+        direction: 'CREDIT',
+        amountMinor: params.amountMinor,
+        type: 'ORDER_RELEASE',
+        orderId: params.orderId,
+        balanceAfterMinor: head.balanceMinor + params.amountMinor,
+        // Strictly after the entry this balance was read from, so the
+        // ledger has one unambiguous latest row (see wallet-ledger.ts).
+        createdAt: head.nextCreatedAt,
+        note: params.note,
+      },
+    });
+  }
+
+  /**
+   * FR-ADM-04: cancel an order on an administrator's decision — an escalated
+   * delivery resolved as "not delivered" — and refund any wallet hold.
+   *
+   * Runs entirely inside the CALLER's transaction, so the caller's own
+   * changes (the task row, the audit entry for the resolution) and this
+   * cancellation commit or roll back together. It never opens a transaction,
+   * never touches the task row, and never emits a socket event; those belong
+   * to the caller.
+   *
+   * LOCK ORDER — the same rule as RiderService.settleDelivery and every other
+   * wallet writer (stated in full on `lockWallets`): wallet locks before any
+   * row is written, ascending by user id. This method reads the order (a
+   * read takes no lock), locks the student's wallet, and only then writes.
+   * So the caller must do one of two things:
+   *
+   *   - call this BEFORE writing any row in its transaction; or
+   *   - take the lock itself first — `lockWallets(tx, [studentId, ...])`,
+   *     every wallet it will need, in one call — and call this afterwards.
+   *     Re-taking a lock the transaction already holds returns at once.
+   *
+   * Only the student's wallet is written. A refund does not touch the
+   * rider's, so there is one lock and "sorted" is trivially satisfied.
+   *
+   * The conditional UPDATE decides. The order must still be PICKED_UP, the
+   * only status an escalated delivery's order can be in. If it is not — a
+   * correct handover code settled it a moment ago, or another administrator
+   * resolved it — the result is `STATE_CHANGED`, nothing has been written by
+   * this method, and the caller should answer 409 and let its transaction
+   * roll back.
+   *
+   * Returns rather than throws for that case, because the caller is another
+   * service with its own error vocabulary, not an HTTP client.
+   */
+  async adminCancelInTransaction(
+    tx: Prisma.TransactionClient,
+    params: {
+      orderId: string;
+      /** The administrator making the decision; recorded on the audit entry for the refund. */
+      adminUserId: string;
+      /** Becomes the order's cancelledReason. */
+      reason: string;
+    },
+  ): Promise<AdminCancelResult> {
+    const { orderId, adminUserId, reason } = params;
+
+    // Read only what cannot change over an order's life: who placed it and
+    // how it is paid. Neither is trusted for the decision — they say which
+    // wallet to lock.
+    const order = await tx.order.findUnique({
+      where: { id: orderId },
+      select: { collegeId: true, studentId: true, paymentMethod: true },
+    });
+    if (!order) return { outcome: 'ORDER_NOT_FOUND' };
+
+    const refundsHold = order.paymentMethod === PaymentMethod.WALLET;
+    if (refundsHold) await lockWallets(tx, [order.studentId]);
+
+    // The state machine must allow the move at all; this is a constant check
+    // that fails loudly if the table is ever changed, not a race check.
+    assertOrderTransition(OrderStatus.PICKED_UP, OrderEvent.ADMIN_CANCELLED);
+
+    const cancelled = await this.cancelOrderIfStill(tx, {
+      orderId,
+      expected: [DbOrderStatus.PICKED_UP],
+      data: {
+        status: DbOrderStatus.CANCELLED,
+        cancelledAt: new Date(),
+        cancelledBy: 'ADMIN',
+        cancelledReason: reason,
+      },
+      refundsHold,
+    });
+    if (!cancelled) return { outcome: 'STATE_CHANGED' };
+
+    if (!refundsHold) {
+      return { outcome: 'CANCELLED', refundedMinor: 0, studentId: order.studentId };
+    }
+
+    // Read the amount now, under the lock and after the UPDATE has made the
+    // row ours, rather than trusting a figure read before either.
+    const held = await tx.order.findUnique({
+      where: { id: orderId },
+      select: { totalMinor: true, reference: true },
+    });
+    const refundedMinor = held!.totalMinor;
+
+    await this.releaseHold(tx, {
+      userId: order.studentId,
+      orderId,
+      amountMinor: refundedMinor,
+      note: `Full refund on ${held!.reference}; cancelled by an administrator`,
+    });
+
+    // FR-ADM-06: an administrative action that moves money in a wallet is
+    // recorded, in this transaction, whoever the caller is — so this method
+    // cannot be used to refund without leaving the row.
+    await this.audit.recordInTransaction(tx, {
+      actorId: adminUserId,
+      collegeId: order.collegeId,
+      action: AuditAction.WALLET_ADJUSTED,
+      targetType: 'order',
+      targetId: orderId,
+      detail: {
+        entryType: 'ORDER_RELEASE',
+        amountMinor: refundedMinor,
+        studentId: order.studentId,
+        reason,
+      },
+    });
+
+    return { outcome: 'CANCELLED', refundedMinor, studentId: order.studentId };
   }
 
   // =======================================================================
@@ -1582,7 +1745,8 @@ export class OrdersService {
    * column.
    */
   private async lockWallet(tx: Prisma.TransactionClient, userId: string): Promise<void> {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${userId}))`;
+    // One implementation of the lock, shared with every other writer.
+    await lockWallets(tx, [userId]);
   }
 
   /**

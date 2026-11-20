@@ -425,6 +425,13 @@ model User {
   suspendedAt     DateTime? @map("suspended_at")
   suspendedReason String?   @map("suspended_reason")
 
+  /// FR-PRIV-01: which version of the privacy notice this account accepted,
+  /// and when. Both null for an account created before the notice was
+  /// recorded here. Kept on the account, not only in the audit log, so
+  /// "who has not accepted version X" is an ordinary indexed-table question.
+  privacyNoticeVersion    String?   @map("privacy_notice_version")
+  privacyNoticeAcceptedAt DateTime? @map("privacy_notice_accepted_at")
+
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
@@ -1016,6 +1023,11 @@ model Task {
   feeMinor     Int @map("fee_minor")
 
   broadcastRound Int @default(0) @map("broadcast_round")
+  /// Which search for a rider this is. A task returns to the pool after an
+  /// abandonment, a suspension or "keep waiting", and its rounds restart at
+  /// 1; the cycle is what tells the second search's round 1 from the first's.
+  /// Starts at 1 and only ever goes up.
+  broadcastCycle Int @default(1) @map("broadcast_cycle")
   currentProximityM Int? @map("current_proximity_m")
   /// When the live acceptance window closes. The dispatcher scans on this.
   offerExpiresAt DateTime? @map("offer_expires_at")
@@ -1072,6 +1084,9 @@ model Task {
 model BroadcastLog {
   id     String @id @default(uuid())
   taskId String @map("task_id")
+  /// The task's broadcastCycle when this round was sent. Not yet part of the
+  /// unique key below — see migration 20261121090000_privacy_and_broadcast_cycle.
+  cycle  Int @default(1)
   round  Int
   radiusM Int   @map("radius_m")
   feeMinor Int  @map("fee_minor")
