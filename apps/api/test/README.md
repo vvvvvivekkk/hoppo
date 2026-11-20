@@ -459,6 +459,21 @@ and again at the end, it says whether one restarted *during* this run. A
 development container that restarts takes all three down and brings Redis
 back empty, and without this that reads as a string of unrelated failures.
 
+**One at a time.** The harnesses are serial by design and must not be run in
+parallel with each other, with a second copy of this script, or with the
+walks. They share the five racer accounts and their rate limits, and each one
+that uses riders begins by taking every *other* rider offline
+(`quiet_other_riders`, which changes shared rider state in PostgreSQL and
+Redis) and ends by taking its own offline; two running together would switch
+each other's riders off mid-race and report it as the dispatcher never
+offering a task.
+
+The last check, `scan-broadcast-log.py`, reads the dispatcher's log as the run
+left it and fails on any of three states the dispatcher cannot produce: a
+`PENDING` row on a finished task, two rows for one (task, cycle, round), or a
+`PENDING` row from a cycle older than the task's current one. It counts rows
+written since the run began and prints all-time counts beside them.
+
 Run it on a quiet stack. The harnesses and walks use the seeded rider
 accounts; anything else driving those accounts at the same time (a second
 copy of this script, another tool pinging the same rider from somewhere else)

@@ -691,13 +691,21 @@ def quiet_other_riders(keep=()) -> list:
 
       - through the API (POST /rider/work-mode {enabled:false}, as that rider)
         for accounts that use the seed password;
-      - for any other account, which the harness cannot sign in as, directly:
+      - directly, for any other account (the harness cannot sign in as it, and
+        never guesses a password), and for a seed account whose API call did
+        not answer 200:
             UPDATE rider_state SET work_mode_on=false WHERE user_id=<id>
-        plus ZREM riders:geo:<college> <id> and SREM riders:busy:<college> <id>
-        in Redis, which is what the route does.
+        and, in Redis, exactly what RedisService.removeRider does:
+            ZREM riders:geo:<college> <id>
+            HDEL riders:ping:<college> <id>
+            SREM riders:busy:<college> <id>
 
-    Returns what it did, for the log. Riders carrying a task keep it: going
-    offline only stops new offers.
+    Every rider it touches gets a `[riders]` line saying which way, so a run's
+    log shows who was online when it started. Riders carrying a task keep it:
+    going offline only stops new offers.
+
+    This changes shared state - which riders are online - and so do the
+    harnesses that follow it. They are written to run one at a time.
     """
     keep_ids = {user_id(e) for e in keep}
     done = []
@@ -707,16 +715,22 @@ def quiet_other_riders(keep=()) -> list:
         uid, email, college = line.split("|")
         if uid in keep_ids:
             continue
+        why = "cannot sign in as this account"
         if email in SEED_PASSWORD_ACCOUNTS:      # never guess at anybody else's password
-            off, _ = http("POST", "/rider/work-mode", login(email), {"enabled": False})
+            try:
+                off, body = http("POST", "/rider/work-mode", login(email), {"enabled": False})
+            except Blocked as e:
+                off, body = 0, {"code": str(e)}
             if off == 200:
                 done.append(f"{email}: offline through the API")
                 continue
+            why = f"the API answered {off} {body.get('code') or ''}".strip()
         psql(f"UPDATE rider_state SET work_mode_on=false WHERE user_id={q(uid)}")
         if college:
             redis("ZREM", f"riders:geo:{college}", uid)
+            redis("HDEL", f"riders:ping:{college}", uid)
             redis("SREM", f"riders:busy:{college}", uid)
-        done.append(f"{email}: offline by SQL (cannot sign in as this account)")
+        done.append(f"{email}: FORCED offline by SQL and Redis ({why})")
     for d in done:
         print(f"  [riders] {d}")
     return done
@@ -837,7 +851,10 @@ def close_open_order(student: str, order_id: str, task_id: str) -> bool:
     the proper way.
     """
     for _ in range(2):
-        if not retire_unfulfilled(task_id):
+        # CREATED or BROADCASTING: the task went back to the pool and the
+        # dispatcher may or may not have re-broadcast it yet. UNFULFILLED: the
+        # second time round this loop, after a cancel that did not take.
+        if not retire_unfulfilled(task_id, ("CREATED", "BROADCASTING", "UNFULFILLED")):
             return False
         status, _ = http("POST", f"/orders/{order_id}/unfulfilled", login(student), {"choice": "CANCEL"})
         if status == 200:
@@ -846,28 +863,39 @@ def close_open_order(student: str, order_id: str, task_id: str) -> bool:
     return False
 
 
-def retire_unfulfilled(task_id: str) -> bool:
+def retire_unfulfilled(task_id: str, allowed_from=("BROADCASTING",)) -> bool:
     """
     Put an unassigned task into UNFULFILLED the way the product does.
 
-    DispatchService.retireUnfulfilled does two things in one transaction: the
-    task goes to UNFULFILLED with no offer deadline, and every PENDING
-    broadcast_log row of that task is resolved as EXPIRED. The harnesses take
-    this shortcut because the real route is three expired sixty-second rounds;
-    a shortcut that moved only the task left "a cancelled task with an offer
-    still pending", a state the product can never produce. Both halves, one
-    transaction, here too.
+    DispatchService.retireUnfulfilled moves the task (BROADCASTING, no rider)
+    to UNFULFILLED with no offer deadline and then, in the same transaction,
+    resolves as EXPIRED the PENDING broadcast_log rows of the task's *current
+    search* - `cycle = task.broadcast_cycle` - and no others. This does the
+    same, task first, in one statement: the task UPDATE decides, and the log
+    UPDATE works from the row it returned, so there is no moment at which the
+    log has been touched for a task that then turns out not to qualify.
+
+    Only the current cycle, deliberately. A PENDING row from an earlier search
+    is something the product should never leave behind; if it has, this
+    shortcut must not tidy it away - scan-broadcast-log.py looks for exactly
+    that after a run.
+
+    `allowed_from` is the status the caller knows the task to be in. The
+    product only ever retires from BROADCASTING; the harness also uses this on
+    a task still CREATED (never broadcast, so it has no rows to expire).
     """
-    moved = psql(f"""BEGIN;
-        UPDATE broadcast_log SET outcome='EXPIRED', resolved_at=now()
-          WHERE task_id={q(task_id)} AND outcome='PENDING'
-            AND EXISTS (SELECT 1 FROM task WHERE id={q(task_id)} AND rider_id IS NULL
-                        AND status IN ('CREATED','BROADCASTING','UNFULFILLED'));
-        UPDATE task SET status='UNFULFILLED', offer_expires_at=NULL, updated_at=now()
-          WHERE id={q(task_id)} AND rider_id IS NULL AND status IN ('CREATED','BROADCASTING','UNFULFILLED')
-          RETURNING 1;
-        COMMIT;""")
-    return moved.strip().splitlines()[-1:] == ["1"] or "1" in moved.split()
+    statuses = ",".join(q(s) for s in allowed_from)
+    moved = psql(f"""WITH moved AS (
+            UPDATE task SET status='UNFULFILLED', offer_expires_at=NULL, updated_at=now()
+            WHERE id={q(task_id)} AND rider_id IS NULL AND status IN ({statuses})
+            RETURNING id, broadcast_cycle),
+        expired AS (
+            UPDATE broadcast_log b SET outcome='EXPIRED', resolved_at=now()
+            FROM moved m
+            WHERE b.task_id=m.id AND b.cycle=m.broadcast_cycle AND b.outcome='PENDING'
+            RETURNING 1)
+        SELECT (SELECT count(*) FROM moved)""")
+    return moved == "1"
 
 
 def reissue_code(student: str, task_id: str) -> str:

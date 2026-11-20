@@ -78,7 +78,11 @@ def run() -> int:
                                   {"prepMinutes": 60})   # an hour: the dispatcher will not touch it
             if status != 200:
                 raise RuntimeError(f"shop accept failed: {status} {body.get('code')} {body.get('message')}")
-            if not h.retire_unfulfilled(task_id):
+            # Accepted with an hour's preparation time, so the dispatcher has
+            # not broadcast it: the task is CREATED, and only CREATED is accepted
+            # here. (If it is anything else the fixture is not what this round
+            # assumes, and it is better to stop than to race something unknown.)
+            if not h.retire_unfulfilled(task_id, ("CREATED",)):
                 raise RuntimeError(f"could not put task {task_id} into UNFULFILLED for the fixture")
             if variant == "D":
                 # "Collect it myself" is only offered once the food is ready.

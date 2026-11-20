@@ -82,6 +82,7 @@ run() {  # name, timeout seconds, command...
   record "$name" "$code" "$log"
 }
 
+RUN_STARTED_UTC="$(date -u '+%Y-%m-%d %H:%M:%S')"
 services
 services --mark this-run >/dev/null
 echo
@@ -140,6 +141,11 @@ if [ "${SKIP_SLOW:-0}" != 1 ]; then
 else
   summary+=("SKIP    race-unfulfilled       SKIP_SLOW=1"); echo "${summary[-1]}"
 fi
+
+# Last: is the dispatcher's log, as this run left it, a state the dispatcher
+# could have produced? (No open offer on a finished task, no round logged
+# twice, no earlier search left open.)
+run scan-broadcast-log 120 python3 -I "$HERE/scan-broadcast-log.py" --since "$RUN_STARTED_UTC" "$BASE"
 
 echo
 restarts="$(services --since this-run | grep -a 'RESTARTED\|came back\|RESULT:')"
