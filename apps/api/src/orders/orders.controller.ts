@@ -77,6 +77,16 @@ export class OrdersController {
     return this.orders.orderDetail(user, orderId);
   }
 
+  /**
+   * S-21: a draft cart from a past order, priced from today's menu. A GET
+   * because it changes nothing — no order is placed and nothing is reserved.
+   */
+  @Get(':orderId/reorder')
+  @ApiOperation({ summary: 'A draft cart from a past order, at current prices and availability' })
+  reorder(@CurrentUser() user: AuthenticatedUser, @Param('orderId') orderId: string) {
+    return this.orders.reorderDraft(user, orderId);
+  }
+
   /** FR-ORD-05 */
   @Post(':orderId/cancel')
   @HttpCode(200)

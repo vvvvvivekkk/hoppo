@@ -721,6 +721,209 @@ export class OrdersService {
     };
   }
 
+  // =======================================================================
+  // Reorder — S-21
+  // =======================================================================
+
+  /**
+   * S-21 "reorder": turn one of the student's past orders into a draft cart
+   * for the same shop.
+   *
+   * This is a read. It places nothing, holds nothing and reserves nothing —
+   * the student still goes through quote and confirm, where `place` prices
+   * the cart again and refuses if the total moved (FR-ORD-03).
+   *
+   * The one rule that matters: a past order is a record of WHAT was bought,
+   * never of what it costs now. The old order keeps a snapshot of each
+   * item's name and price so that a later menu edit cannot rewrite a receipt;
+   * for the same reason that snapshot must not be reused as today's price.
+   * So only two things are taken from the old order — which catalog items,
+   * and how many — and everything else is read from the menu as it is at
+   * this moment:
+   *
+   *   - the price is the item's current price;
+   *   - an item the shop has deleted, or marked unavailable (FR-CAT-03), is
+   *     left out of the cart and reported back by name, so the student is
+   *     told rather than finding a shorter cart;
+   *   - items are matched by id, scoped to this shop's listing. An item that
+   *     was deleted and re-created under the same name is a different item
+   *     and is not matched: guessing by name could put the wrong dish, at
+   *     the wrong price, into someone's cart.
+   *
+   * FR-ORD-01 (one shop per cart) holds by construction: every line comes
+   * from the one listing the old order was placed with.
+   */
+  async reorderDraft(user: AuthenticatedUser, orderId: string) {
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        collegeId: true,
+        studentId: true,
+        reference: true,
+        placedAt: true,
+        shopListingId: true,
+        deliveryPointId: true,
+        items: {
+          select: {
+            catalogItemId: true,
+            nameSnapshot: true,
+            unitPriceMinor: true,
+            quantity: true,
+            note: true,
+          },
+        },
+      },
+    });
+
+    this.tenant.assertSameTenant(user, order, 'Order');
+
+    // Only the person who placed it. Shop staff and administrators can read
+    // an order, but a cart built from someone else's order is not theirs to
+    // have.
+    if (order!.studentId !== user.userId) {
+      throw new ForbiddenException({
+        code: 'NOT_YOUR_ORDER',
+        message: 'You can only reorder your own orders.',
+      });
+    }
+
+    const listing = await this.prisma.shopListing.findUnique({
+      where: { id: order!.shopListingId },
+      select: {
+        id: true,
+        collegeId: true,
+        status: true,
+        temporarilyClosedUntil: true,
+        shop: { select: { id: true, name: true } },
+        hours: { select: { dayOfWeek: true, openMinute: true, closeMinute: true } },
+        college: { select: { timezone: true } },
+      },
+    });
+
+    // A shop that has left the platform, been suspended, or is no longer
+    // listed for this college cannot be ordered from at all, so there is no
+    // cart to offer. Same code and status as `quote` gives for it.
+    if (!listing || listing.collegeId !== order!.collegeId || listing.status !== 'ACTIVE') {
+      throw new BadRequestException({
+        code: 'SHOP_NOT_AVAILABLE',
+        message: 'That shop is not currently taking orders, so this order cannot be repeated.',
+      });
+    }
+
+    // FR-CAT-05. A closed shop is not an error here: the student may be
+    // lining up tomorrow's breakfast. The draft says the shop is closed and
+    // that it cannot be checked out yet.
+    const openState = resolveOpenState({
+      rows: listing.hours,
+      now: new Date(),
+      timeZone: listing.college.timezone ?? DEFAULT_TIMEZONE,
+      temporarilyClosedUntil: listing.temporarilyClosedUntil,
+    });
+
+    // The menu as it is now. Scoped to the listing and to items not deleted,
+    // exactly as `loadOrderContext` scopes a cart, so an id from the old
+    // order that no longer belongs to this shop's menu is simply not found.
+    const itemIds = order!.items
+      .map((i) => i.catalogItemId)
+      .filter((id): id is string => id !== null);
+    const current = await this.prisma.catalogItem.findMany({
+      where: { id: { in: itemIds }, shopListingId: listing.id, isDeleted: false },
+      select: { id: true, name: true, priceMinor: true, prepMinutes: true, isAvailable: true },
+    });
+    const currentById = new Map(current.map((i) => [i.id, i]));
+
+    const lines: {
+      catalogItemId: string;
+      name: string;
+      quantity: number;
+      unitPriceMinor: number;
+      lineTotalMinor: number;
+      note: string | null;
+      previousUnitPriceMinor: number;
+      priceChanged: boolean;
+    }[] = [];
+    const unavailable: {
+      catalogItemId: string | null;
+      name: string;
+      quantity: number;
+      reason: 'REMOVED' | 'UNAVAILABLE';
+    }[] = [];
+
+    for (const old of order!.items) {
+      const item = old.catalogItemId ? currentById.get(old.catalogItemId) : undefined;
+
+      if (!item) {
+        // Deleted from the menu (or never linked to a catalog item). The
+        // name shown is the old snapshot — it is all that is left of it.
+        unavailable.push({
+          catalogItemId: old.catalogItemId,
+          name: old.nameSnapshot,
+          quantity: old.quantity,
+          reason: 'REMOVED',
+        });
+        continue;
+      }
+
+      if (!item.isAvailable) {
+        unavailable.push({
+          catalogItemId: item.id,
+          name: item.name,
+          quantity: old.quantity,
+          reason: 'UNAVAILABLE',
+        });
+        continue;
+      }
+
+      lines.push({
+        catalogItemId: item.id,
+        // Current name and current price. `previousUnitPriceMinor` is only
+        // there so the screen can say "was ₹60" — it is never charged.
+        name: item.name,
+        quantity: old.quantity,
+        unitPriceMinor: item.priceMinor,
+        lineTotalMinor: item.priceMinor * old.quantity,
+        note: old.note,
+        previousUnitPriceMinor: old.unitPriceMinor,
+        priceChanged: item.priceMinor !== old.unitPriceMinor,
+      });
+    }
+
+    // The previous campus delivery point, if it still exists. A free-text
+    // landmark is not carried over: it comes with map coordinates that
+    // decide the delivery fee, and the student may be somewhere else today.
+    const point = order!.deliveryPointId
+      ? await this.prisma.deliveryPoint.findFirst({
+          where: { id: order!.deliveryPointId, collegeId: order!.collegeId, isActive: true },
+          select: { id: true, name: true },
+        })
+      : null;
+
+    const itemsSubtotalMinor = lines.reduce((sum, l) => sum + l.lineTotalMinor, 0);
+
+    return {
+      sourceOrder: { id: order!.id, reference: order!.reference, placedAt: order!.placedAt },
+      listingId: listing.id,
+      shop: listing.shop,
+      shopIsOpen: openState.isOpen,
+      closedReason: openState.isOpen ? null : openState.reason,
+      lines,
+      unavailable,
+      itemsSubtotalMinor,
+      itemsSubtotalLabel: formatMinor(itemsSubtotalMinor),
+      anyPriceChanged: lines.some((l) => l.priceChanged),
+      estimatedPrepMinutes:
+        lines.length > 0
+          ? Math.max(...lines.map((l) => currentById.get(l.catalogItemId)!.prepMinutes))
+          : null,
+      suggestedDeliveryPoint: point,
+      // Something to buy, from a shop that is open. The delivery fee and the
+      // total are not here on purpose: they depend on where it is going, and
+      // that is asked again at checkout (POST /orders/quote).
+      canCheckout: lines.length > 0 && openState.isOpen,
+    };
+  }
+
   private async isStaffOfListing(userId: string, listingId: string): Promise<boolean> {
     const listing = await this.prisma.shopListing.findUnique({
       where: { id: listingId },

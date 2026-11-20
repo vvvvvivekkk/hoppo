@@ -276,6 +276,8 @@ model College {
   posts          Post[]
 
   @@index([status])
+  riderPresenceHours RiderPresenceHour[]
+
   @@map("college")
 }
 
@@ -468,6 +470,7 @@ model User {
   verificationsDecided VerificationSubmission[] @relation("VerificationDecider")
   shopListingsApproved ShopListing[]    @relation("ShopListingApprover")
   withdrawalsHandled   WithdrawalRequest[] @relation("WithdrawalHandler")
+  riderPresenceHours   RiderPresenceHour[]
   riderReliability     RiderReliability?
 
   @@index([collegeId, role, status])
@@ -583,6 +586,42 @@ model RiderState {
 
   @@index([workModeOn, lastPingAt])
   @@map("rider_state")
+}
+
+/// FR-ADM-05 "active riders by hour": the clock hours in which a rider was
+/// online — work mode on and the device actually heard from.
+///
+/// One row per rider per hour, written once when the rider is first seen in
+/// that hour and never updated. The primary key is what makes the write safe
+/// to repeat: a second insert for the same rider and hour (two API instances,
+/// a socket ping and an HTTP ping) conflicts and is skipped, so nobody is
+/// counted twice. Insert with `createMany({ skipDuplicates: true })`.
+///
+/// Deliberately holds no duration and no location. FR-PRIV-02 restricts a
+/// rider's location to the requester of their current task; a presence
+/// history must not turn into a location history. It is still a per-person
+/// record of when a student was working, so it is deleted with the account
+/// (onDelete: Cascade) and the dashboard shows counts only.
+///
+/// A CHECK in migration 20261122090000_rider_presence_hour, which Prisma
+/// cannot express, refuses an hourStart that is not exactly on the hour.
+model RiderPresenceHour {
+  /// Denormalised from the user so the dashboard's query is one indexed range
+  /// scan, tenant-scoped without a join (C-1).
+  collegeId String   @map("college_id")
+  userId    String   @map("user_id")
+  /// The start of the clock hour in UTC: minutes, seconds and milliseconds
+  /// all zero. Grouping into the college's local day is the report's job.
+  hourStart DateTime @map("hour_start")
+  /// When the rider was first seen in this hour.
+  firstSeenAt DateTime @default(now()) @map("first_seen_at")
+
+  college College @relation(fields: [collegeId], references: [id])
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, hourStart])
+  @@index([collegeId, hourStart])
+  @@map("rider_presence_hour")
 }
 
 /// FR-TRST-03: derived metrics, recomputed on task completion rather than

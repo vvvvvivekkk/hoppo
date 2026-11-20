@@ -5,6 +5,8 @@ import { ForbiddenException, HttpException } from '@nestjs/common';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { AdminOrdersService } from './admin-orders.service';
 import { AdminOrdersController } from './admin-orders.controller';
+import { ShopSettlementsService } from './shop-settlements.service';
+import { ShopSettlementsController } from './shop-settlements.controller';
 import { OrdersService } from './orders.service';
 import { TenantService } from '../common/tenant/tenant.service';
 import { AuditService } from '../audit/audit.service';
@@ -85,6 +87,9 @@ interface World {
   studentA: string;
   riderA: string;
   report: AdminOrdersService;
+  settlements: ShopSettlementsService;
+  /** A counter-staff account of shop A1 (not its owner). */
+  staffA1: AuthenticatedUser;
   adminA: AuthenticatedUser;
   adminB: AuthenticatedUser;
   ownerA1: AuthenticatedUser;
@@ -467,6 +472,14 @@ async function inRolledBackTransaction(body: (world: World) => Promise<void>): P
         new AuditService(prisma as never),
       );
       const report = new AdminOrdersService(prisma as never, tenant, orders);
+      const settlements = new ShopSettlementsService(prisma as never, tenant);
+
+      const staffA1Id = await person(a.id, 'SHOP_OWNER', 'Counter Staff A1');
+      const a1 = await tx.shopListing.findUniqueOrThrow({
+        where: { id: listingA1 },
+        select: { shopId: true },
+      });
+      await tx.shopStaff.create({ data: { shopId: a1.shopId, userId: staffA1Id, isOwner: false } });
 
       const as = (userId: string, collegeId: string, role: AuthenticatedUser['role']) =>
         ({ userId, collegeId, role, isVerified: false, shopApproved: true }) as AuthenticatedUser;
@@ -477,6 +490,8 @@ async function inRolledBackTransaction(body: (world: World) => Promise<void>): P
         studentA,
         riderA,
         report,
+        settlements,
+        staffA1: as(staffA1Id, a.id, 'SHOP_STAFF'),
         adminA: as(adminAId, a.id, 'ADMIN'),
         adminB: as(adminBId, b.id, 'ADMIN'),
         ownerA1: as(ownerA1Id, a.id, 'SHOP_OWNER'),
@@ -1241,6 +1256,212 @@ describe('OrdersService.adminCancelInTransaction against PostgreSQL', () => {
   it('reports an unknown order rather than throwing', async () => {
     await inRolledBackTransaction(async (w) => {
       expect(await cancel(w, randomUUID())).toEqual({ outcome: 'ORDER_NOT_FOUND' });
+    });
+  });
+});
+
+// ===========================================================================
+// Shop settlement statement — D-14
+// ===========================================================================
+
+describe('GET /shops/:listingId/settlements', () => {
+  /** A completed order at shop A1 that the fixture does not already hold. */
+  async function completedOrder(
+    w: World,
+    seed: { key: string; method: 'CASH' | 'WALLET'; items: number; commission: number; placedAt: Date; completedAt: Date },
+  ) {
+    const order = await w.tx.order.create({
+      data: {
+        collegeId: w.collegeA,
+        reference: `TSET-${seed.key}-${randomUUID().slice(0, 6).toUpperCase()}`,
+        studentId: w.studentA,
+        shopListingId: w.listingA1,
+        status: 'COMPLETED',
+        itemsSubtotalMinor: seed.items,
+        deliveryFeeMinor: 2000,
+        platformFeeMinor: 500,
+        totalMinor: seed.items + 2500,
+        commissionMinor: seed.commission,
+        paymentMethod: seed.method,
+        paymentStatus: seed.method === 'CASH' ? 'NOT_REQUIRED' : 'CAPTURED',
+        placedAt: seed.placedAt,
+        completedAt: seed.completedAt,
+      },
+      select: { id: true, reference: true },
+    });
+    return order;
+  }
+
+  it('closes the routes to counter staff at the guard, and names owner and admin only', () => {
+    expect(Reflect.getMetadata(ROLES_KEY, ShopSettlementsController)).toEqual(['SHOP_OWNER', 'ADMIN']);
+  });
+
+  it('totals the period from completed orders, split by how the student paid', async () => {
+    await inRolledBackTransaction(async (w) => {
+      // The fixture gives shop A1 one completed cash order on DAY (o1: 12000,
+      // commission 600), two cancelled ones and one still being prepared.
+      const wallet = await completedOrder(w, {
+        key: 'W', method: 'WALLET', items: 8000, commission: 400,
+        placedAt: ist('15:00'), completedAt: ist('15:40'),
+      });
+
+      const s = await w.settlements.statement(w.ownerA1, w.listingA1, range);
+
+      expect(s.range).toEqual({ from: DAY, to: DAY, timezone: 'Asia/Kolkata' });
+      expect(s.basis).toEqual({ status: 'COMPLETED', date: 'completedAt' });
+      expect(s.totals).toMatchObject({
+        ordersDelivered: 2,
+        grossItemsMinor: 20000,
+        commissionMinor: 1000,
+        netEarningsMinor: 19000,
+        effectiveCommissionBps: 500,
+      });
+      expect(s.byPaymentMethod.cash).toMatchObject({
+        orders: 1, grossItemsMinor: 12000, commissionMinor: 600, alreadyReceivedByShopMinor: 12000,
+      });
+      expect(s.byPaymentMethod.heldByPlatform).toMatchObject({
+        orders: 1, grossItemsMinor: 8000, commissionMinor: 400, owedToShopMinor: 7600,
+      });
+      // Platform holds 8000 and keeps 400 of it; the shop owes 600 on its cash sale.
+      expect(s.position).toMatchObject({
+        platformOwesShopMinor: 7600,
+        shopOwesPlatformMinor: 600,
+        netPayableToShopMinor: 7000,
+      });
+
+      // The lines are those two orders and add up to the totals.
+      expect(s.lines.map((l) => l.reference)).toEqual([wallet.reference, w.ref.o1]);
+      expect(s.lines[0]).toMatchObject({
+        paymentMethod: 'WALLET', itemsSubtotalMinor: 8000, commissionMinor: 400,
+        netToShopMinor: 7600, settledBy: 'PLATFORM',
+      });
+      expect(s.lines[1]).toMatchObject({
+        paymentMethod: 'CASH', itemsSubtotalMinor: 12000, commissionMinor: 600,
+        netToShopMinor: 11400, settledBy: 'CASH_AT_COUNTER',
+      });
+      expect(s.lines.reduce((sum, l) => sum + l.itemsSubtotalMinor, 0)).toBe(s.totals.grossItemsMinor);
+      expect(s.lines.reduce((sum, l) => sum + l.commissionMinor, 0)).toBe(s.totals.commissionMinor);
+
+      // Every figure is a whole number of paise.
+      const numbers = JSON.stringify(s).match(/Minor":(-?[\d.]+)/g) ?? [];
+      expect(numbers.length).toBeGreaterThan(10);
+      for (const n of numbers) expect(n).not.toContain('.');
+    });
+  });
+
+  it('pays nothing out and stores nothing about where to pay', async () => {
+    await inRolledBackTransaction(async (w) => {
+      const before = await w.tx.walletEntry.count();
+      const s = await w.settlements.statement(w.ownerA1, w.listingA1, range);
+
+      expect(s.payout.status).toBe('NOT_AVAILABLE');
+      expect(await w.tx.walletEntry.count()).toBe(before);
+      expect(await w.tx.withdrawalRequest.count({ where: { userId: w.ownerA1.userId } })).toBe(0);
+      expect(JSON.stringify(s)).not.toMatch(/bank|ifsc|upi|account/i);
+    });
+  });
+
+  it('dates an order by when it was completed, not when it was placed', async () => {
+    await inRolledBackTransaction(async (w) => {
+      // Placed at 11:50 pm on DAY, handed over at 12:10 am the next day.
+      const late = await completedOrder(w, {
+        key: 'L', method: 'CASH', items: 5000, commission: 250,
+        placedAt: ist('23:50'), completedAt: ist('00:10', '2026-03-11'),
+      });
+
+      const day = await w.settlements.statement(w.ownerA1, w.listingA1, range);
+      expect(day.lines.map((l) => l.reference)).not.toContain(late.reference);
+      expect(day.totals.ordersDelivered).toBe(1);
+
+      const next = await w.settlements.statement(w.ownerA1, w.listingA1, {
+        from: '2026-03-11', to: '2026-03-11',
+      });
+      // o6 (placed and completed just after midnight) and the late one.
+      expect(next.lines.map((l) => l.reference).sort()).toEqual([late.reference, w.ref.o6].sort());
+      expect(next.totals).toMatchObject({ ordersDelivered: 2, grossItemsMinor: 104000 });
+    });
+  });
+
+  it('leaves out cancelled and unfinished orders, and other shops', async () => {
+    await inRolledBackTransaction(async (w) => {
+      // A row that should not exist but could after a bad data fix: cancelled,
+      // yet carrying a completion time inside the period. The statement goes
+      // by status as well as by date, so it must not be paid on.
+      const ghost = await completedOrder(w, {
+        key: 'G', method: 'WALLET', items: 70000, commission: 3500,
+        placedAt: ist('16:00'), completedAt: ist('16:30'),
+      });
+      await w.tx.order.update({
+        where: { id: ghost.id },
+        data: { status: 'CANCELLED', cancelledAt: ist('16:31'), cancelledBy: 'ADMIN' },
+      });
+
+      const s = await w.settlements.statement(w.ownerA1, w.listingA1, { from: DAY, to: '2026-03-11' });
+
+      // Of o1..o7 at shop A1: only o1 and o6 completed. o2 is another shop's.
+      expect(s.lines.map((l) => l.reference).sort()).toEqual([w.ref.o1, w.ref.o6].sort());
+      expect(s.totals).toMatchObject({ ordersDelivered: 2, grossItemsMinor: 111000, commissionMinor: 5550 });
+      // All cash: the platform holds nothing, the shop owes the commission.
+      expect(s.position).toMatchObject({
+        platformOwesShopMinor: 0, shopOwesPlatformMinor: 5550, netPayableToShopMinor: -5550,
+      });
+    });
+  });
+
+  it('is zeros on a period with no deliveries, and pages its lines', async () => {
+    await inRolledBackTransaction(async (w) => {
+      const empty = await w.settlements.statement(w.ownerA1, w.listingA1, {
+        from: '2025-01-01', to: '2025-01-31',
+      });
+      expect(empty.totals).toMatchObject({ ordersDelivered: 0, grossItemsMinor: 0, effectiveCommissionBps: 0 });
+      expect(empty.position.netPayableToShopMinor).toBe(0);
+      expect(empty.lines).toEqual([]);
+
+      const wide = { from: DAY, to: '2026-03-11' };
+      const first = await w.settlements.statement(w.ownerA1, w.listingA1, { ...wide, limit: '1' });
+      expect(first.lines).toHaveLength(1);
+      // Totals describe the whole period, not the page.
+      expect(first.totals.ordersDelivered).toBe(2);
+      const second = await w.settlements.statement(w.ownerA1, w.listingA1, {
+        ...wide, limit: '1', cursor: first.nextCursor!,
+      });
+      expect(second.lines).toHaveLength(1);
+      expect(second.lines[0].orderId).not.toBe(first.lines[0].orderId);
+      expect(second.nextCursor).toBeNull();
+
+      expect(
+        await refusal(w.settlements.statement(w.ownerA1, w.listingA1, { ...wide, cursor: w.id.oB })),
+      ).toEqual({ status: 400, code: 'INVALID_CURSOR' });
+      expect(
+        await refusal(w.settlements.statement(w.ownerA1, w.listingA1, { from: 'last week' })),
+      ).toEqual({ status: 400, code: 'INVALID_DATE' });
+    });
+  });
+
+  it("is for the shop's owner and its college's administrator only", async () => {
+    await inRolledBackTransaction(async (w) => {
+      // Counter staff of this very shop: can work the queue, cannot see the money.
+      expect(await refusal(w.settlements.statement(w.staffA1, w.listingA1, range))).toEqual({
+        status: 403, code: 'NOT_SHOP_OWNER',
+      });
+      // The owner of A1 has no claim on shop A2, or on a shop in another college.
+      expect(await refusal(w.settlements.statement(w.ownerA1, w.listingA2, range))).toEqual({
+        status: 403, code: 'NOT_SHOP_STAFF',
+      });
+      expect(await refusal(w.settlements.statement(w.ownerA1, w.listingB, range))).toEqual({
+        status: 403, code: 'CROSS_TENANT_ACCESS',
+      });
+      expect(await refusal(w.settlements.statement(w.adminB, w.listingA1, range))).toEqual({
+        status: 403, code: 'CROSS_TENANT_ACCESS',
+      });
+      expect(await refusal(w.settlements.statement(w.adminA, randomUUID(), range))).toEqual({
+        status: 404, code: 'SHOP_NOT_FOUND',
+      });
+
+      const asAdmin = await w.settlements.statement(w.adminA, w.listingA2, range);
+      expect(asAdmin.totals).toMatchObject({ ordersDelivered: 1, grossItemsMinor: 8000 });
+      // o2 was paid from the wallet: the platform owes that shop 8000 - 400.
+      expect(asAdmin.position.netPayableToShopMinor).toBe(7600);
     });
   });
 });
