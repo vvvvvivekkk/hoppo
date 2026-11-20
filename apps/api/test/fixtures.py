@@ -11,6 +11,7 @@ admin, vivek, srichandana, fresher). The harnesses and walks also need:
   dropme@anurag.edu.in      a verified student for the suspension check to suspend and reinstate
   cafe@example.com          the owner of the seeded Campus Corner Cafe
   admin@rit.edu.in          the administrator of a second college (cross-tenant checks)
+  admin2@anurag.edu.in      a second administrator of the main college (created through the platform API)
   srichandana@              rider terms accepted, so the Earn screen opens on work mode
   Campus Corner Cafe        open all day (the seed's 08:00-21:00 would fail every night run)
 
@@ -101,7 +102,7 @@ def accept_rider_terms(email: str) -> None:
         say(f"rider terms for {email}", "exists")
     else:
         status, accepted = h.http("POST", "/verification/rider-terms/accept", token, {})
-        need(status in (200, 201), f"{email}: accepting the rider terms -> {status} {accepted.get('code')}")
+        need(status == 200, f"{email}: accepting the rider terms -> {status} {accepted.get('code')}")
         say(f"rider terms for {email} (version {accepted.get('version')}, via the API)", "created")
         status, body = h.http("GET", "/rider/status", token)
         can = body.get("canEnable", {})
@@ -148,6 +149,19 @@ def run() -> int:
                ON CONFLICT (college_id) DO NOTHING""")
     say("second college (Riverside Institute of Technology) with its config", "exists" if had_college else "created")
     upsert_user("rit-admin", SECOND_ADMIN, "+919000000130", "RIT Admin", "ADMIN", SECOND_COLLEGE, pw_hash)
+
+    # ---- a second administrator for the main college, through the platform API
+    # (two administrators resolving the same escalation is a race worth having).
+    second = "admin2@anurag.edu.in"
+    if h.psql(f'SELECT count(*) FROM "user" WHERE email={h.q(second)}') == "1":
+        say(f"account {second} (ADMIN)", "exists")
+    else:
+        status, body = h.http("POST", f"/platform/colleges/{COLLEGE}/admins", h.login("super@hoppo.app"),
+                              {"name": "AU Second Admin", "mobile": "+919000000002", "email": second,
+                               "password": h.PASSWORD})
+        need(status == 201, f"creating {second} through POST /platform/colleges/:id/admins -> {status} "
+                            f"{body.get('code')} {body.get('message')}")
+        say(f"account {second} (ADMIN, via the platform API as the super admin)", "created")
 
     # ---- the rest through the API -----------------------------------------
     for email in h.RACERS + [WALK_RIDER]:

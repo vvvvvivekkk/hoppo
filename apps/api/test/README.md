@@ -58,7 +58,7 @@ a harness that cannot sign in has proved nothing.
 
 ## The race harnesses
 
-Nine harnesses, one shape. Each one builds a fixture through the real HTTP API,
+Ten harnesses, one shape. Each one builds a fixture through the real HTTP API,
 lines N requests up behind a thread barrier so they leave at the same instant,
 then counts rows in PostgreSQL and compares them with what the callers were
 told. A sequential test would pass against a read-then-write implementation
@@ -283,6 +283,49 @@ UNFULFILLED`, or a 5xx on `answer KEEP_WAITING` (it once issued a DELETE the
 append-only trigger refuses). It fails itself if one of the three answers
 never won. `SKIP_SLOW=1 run-all.sh` leaves it out.
 
+### `race-escalation-resolve.py` - two administrators, one escalated delivery (FR-ADM-04)
+
+A delivery whose code was entered wrongly too many times waits for an
+administrator to say what happened: `DELIVERED` (the rider is paid, as if the
+code had been right) or `NOT_DELIVERED` (task and order cancelled, the rider
+paid nothing). Each round escalates a real order with the configured number
+of wrong codes and fires N `POST /admin/escalations/:taskId/resolve` at once
+from two administrator accounts, half saying each, with the head start
+alternating; for a wallet order, where the server does not offer
+`NOT_DELIVERED`, all N say `DELIVERED`. It proves there is one resolution:
+one 200, the rest `409 ALREADY_RESOLVED`; task and order in the state that
+one answer describes; one `DELIVERY_FEE_EARNED` row if delivered and none
+otherwise, with the rider's completed count to match; exactly one
+`TASK_RESOLVED` audit row carrying the winner's note; and the escalation
+reading back resolved with `canResolveAs: []`. Another college's
+administrator is refused before the race. A failure looks like `2 resolves
+answered 200: ['DELIVERED', 'NOT_DELIVERED']`, `the rider was paid 2 times
+for one delivery`, or `2 TASK_RESOLVED audit rows`. It fails itself if one of
+the two outcomes never won.
+
+## `e2e-admin.py` - the administrator's side
+
+Not a race: about eighty single requests, each with a stated expectation.
+It starts from the SRS's own acceptance test (section 12.3, "...and the order
+appears in the administrator's report"): it delivers an order through the
+real flow, finds it by reference in `GET /admin/orders`, and checks that its
+detail has the complete timeline in time order, that its money is integer
+paise that add up (items + delivery + platform = total), and that every
+figure in today's summary equals the same figure computed from the database.
+Another college's administrator finds nothing and gets `403
+CROSS_TENANT_ACCESS` on the detail; none of the responses contains a mobile
+number or an email address, checked against the student's and rider's real
+ones. It then proves a fee-band change is audited with before and after and
+is charged on the very next quote (restored in a `finally`); that
+deactivating a delivery point takes it out of the student's picker and
+reactivating puts it back; that the audit log shows an administrator only
+their own college's rows, whatever they ask for; and that a super
+administrator can create a college and its administrator, who signs in to an
+empty college and is locked out with `COLLEGE_INACTIVE` once the college is
+deactivated. A failure is one `FAIL` line naming what was expected and what
+came back. Each run leaves one completed order, one inactive "E2E Test
+Point" (reused next time) and one deactivated "E2E College".
+
 ## `e2e-shop-approval.py` - who may reach what, before and after approval
 
 Not a race: thirty-odd single requests, each with a stated expectation,
@@ -325,22 +368,24 @@ Standard library only; it needs the accounts `fixtures.py` creates.
 The second walk drives the web app itself in a headless browser at a phone
 viewport (sign-up errors, the verify gates, search, cart, checkout, a
 two-person delivery with a real offer over the rider's socket and the handover
-code over the student's, a ceiling on `GET /auth/me`, and the screens' wording
-for a changed price, an escalated delivery, an order collected in person and a
-rider timed out for silence). It needs Playwright, which is not a dependency
+code over the student's, a ceiling on `GET /auth/me`, the screens' wording
+for a changed price, a refund, an escalated delivery, an order collected in
+person and a rider timed out for silence, the receipt, and the privacy
+screens: a real registration that must accept the notice, a real data export
+compared with the database, and a real account deletion). It needs Playwright, which is not a dependency
 of this repository, so it lives outside it (`$WALK_DIR/pw/browser.mjs`);
 `run-all.sh` runs it when it is there and prints `SKIP` when it is not.
 
 ### `run-all.sh` - everything, in order
 
-Runs `fixtures.py`, both walks, the access checks and the nine harnesses in
+Runs `fixtures.py`, both walks, the two end-to-end checks and the ten harnesses in
 sequence against one API base and one web origin, prints one `PASS` / `FAIL`
 / `BLOCKED` line each, and exits non-zero unless all of them passed (3 if the
 fixtures could not be created, in which case nothing else is run). A check
 that dies because the watch-mode API restarted under it is retried once after
 twenty seconds. `SKIP_WALKS=1` runs the harnesses alone, `SKIP_BROWSER=1`
 leaves out only the browser walk, and `SKIP_SLOW=1` leaves out
-`race-unfulfilled.py`. A full run takes about fifteen minutes. Full output
+`race-unfulfilled.py`. A full run takes about twenty minutes. Full output
 for each check is kept in the log directory it prints.
 
 Run it on a quiet stack. The harnesses and walks use the seeded rider

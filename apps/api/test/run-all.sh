@@ -102,7 +102,7 @@ if [ "${SKIP_WALKS:-0}" != 1 ]; then
   run walk-api 300 python3 -I "$HERE/walk-api.py" "$BASE"
   if [ "${SKIP_BROWSER:-0}" != 1 ]; then
     if [ -f "$WALK_DIR/pw/browser.mjs" ] && [ -d "$WALK_DIR/pw/node_modules/playwright" ]; then
-      run walk-browser 600 bash -c "cd '$WALK_DIR/pw' && node browser.mjs '$WEB' '$BASE'"
+      run walk-browser 1100 bash -c "cd '$WALK_DIR/pw' && node browser.mjs '$WEB' '$BASE'"
     else
       summary+=("SKIP    walk-browser           $WALK_DIR/pw/browser.mjs or its Playwright install not found"); echo "${summary[-1]}"
     fi
@@ -110,12 +110,13 @@ if [ "${SKIP_WALKS:-0}" != 1 ]; then
 fi
 
 run e2e-shop-approval 300 python3 -I "$HERE/e2e-shop-approval.py" "$BASE"
+run e2e-admin 400 python3 -I "$HERE/e2e-admin.py" "$BASE"
 
 # race-unfulfilled goes last: it needs every rider offline for three and a
 # half minutes while the dispatcher runs its rounds out. SKIP_SLOW=1 leaves it
 # (and only it) out.
 for harness in race-stress race-two-tasks race-refund race-wallet-spend race-payout race-otp-cap \
-               race-abandon-pickup race-sweep-cancel; do
+               race-abandon-pickup race-escalation-resolve race-sweep-cancel; do
   run "$harness" 900 python3 -I "$HERE/$harness.py" "$BASE"
 done
 if [ "${SKIP_SLOW:-0}" != 1 ]; then
