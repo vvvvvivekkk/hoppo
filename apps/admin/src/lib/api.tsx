@@ -90,13 +90,48 @@ export function ApiProvider({ children }: { children: ReactNode }) {
         // idea why, and signs in again only to be refused.
         const blocked = error?.accountBlocked ?? null;
         if (blocked) setNotice(blockedMessage(blocked));
-        else if (signedInRef.current) setNotice('Your session has ended. Sign in again to carry on.');
+        // `leaving`: a refused revoke on the way out is not news to anyone.
+        else if (signedInRef.current && !leaving.current) {
+          setNotice('Your session has ended. Sign in again to carry on.');
+        }
         setUser(null);
       },
     });
   }
 
   const api = useMemo(() => endpoints(clientRef.current!), []);
+
+  /**
+   * End the session in this tab now, and tell the server afterwards.
+   *
+   * It used to be the other way round — `await` the server's revoke, then
+   * clear the tokens — which made signing out exactly as slow as the API: a
+   * busy server (or one that never answers, up to the client's 20 s timeout)
+   * left a session sitting in a tab whose screen already said it was over.
+   * It could not fail silently, since a thrown revoke was caught and the
+   * tokens cleared anyway, but it could take that long.
+   *
+   * The revoke is started first because the client reads the access token as
+   * it builds the request, synchronously inside the call, so the request
+   * already carries its Authorization header by the time the store is
+   * emptied on the next line. Nothing waits for the answer.
+   */
+  const leaving = useRef(false);
+  const dropSession = useCallback(async () => {
+    const client = clientRef.current!;
+    if (client.hasSession()) {
+      leaving.current = true;
+      const revoke = api.auth.logout(client.currentRefreshToken());
+      void revoke
+        .catch(() => {
+          // The session is gone here whatever the server made of the revoke.
+        })
+        .finally(() => {
+          leaving.current = false;
+        });
+    }
+    await client.clearTokens();
+  }, [api]);
 
   // One /auth/me at a time. A login stores the tokens (which notifies the
   // effect below) and then asks for the user itself, so without this the same
@@ -123,12 +158,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
           // session: a signed-in tab that can do nothing is worse than a
           // login screen that explains itself.
           setNotice(wrongAppMessage(me.role));
-          try {
-            await api.auth.logout(clientRef.current!.currentRefreshToken());
-          } catch {
-            // Dropping the tokens locally is what matters here.
-          }
-          await clientRef.current!.clearTokens();
+          await dropSession();
           setUser(null);
           return;
         }
@@ -153,7 +183,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       if (refreshInFlight.current === run) refreshInFlight.current = null;
     });
     return run;
-  }, [api]);
+  }, [api, dropSession]);
 
   useEffect(() => {
     void refreshUser();
@@ -170,19 +200,14 @@ export function ApiProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    try {
-      // Revoke this device's refresh token server-side, so closing the tab is
-      // not the only thing standing between the next person and the session.
-      await api.auth.logout(clientRef.current!.currentRefreshToken());
-    } catch {
-      // Logging out locally matters more than the server acknowledging it.
-    }
-    await clientRef.current!.clearTokens();
+    // Revoke this device's refresh token server-side, so closing the tab is
+    // not the only thing standing between the next person and the session —
+    // but sign out here first; see dropSession.
+    await dropSession();
     setUser(null);
-    // Signing out on purpose needs no explanation on the login screen, even
-    // if the server answered the revoke with "that session had expired".
+    // Signing out on purpose needs no explanation on the login screen.
     setNotice(null);
-  }, [api]);
+  }, [dropSession]);
 
   const value = useMemo<ApiContextValue>(
     () => ({ api, user, loading, signedIn: user !== null, login, logout, refreshUser, notice }),

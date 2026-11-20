@@ -5,6 +5,7 @@ import { ApiError } from '@hoppo/api-client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Field, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { SHOP_TABS, Tabs } from '@/lib/kit';
 
 /**
  * A-05 and A-06: the shop verification queue.
@@ -98,6 +99,8 @@ export default function ShopsPage() {
         <h1 className="text-2xl font-black tracking-tight">Shop verification</h1>
         <p className="text-sm text-[var(--color-ink-faint)]">{total} waiting · oldest first</p>
       </div>
+
+      <Tabs current="/shops" tabs={SHOP_TABS} />
 
       {error && <Banner tone="error">{error}</Banner>}
       {notice && <Banner tone="success">{notice}</Banner>}

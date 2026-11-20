@@ -5,6 +5,7 @@ import { ApiError } from '@hoppo/api-client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Field, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { STUDENT_TABS, Tabs } from '@/lib/kit';
 
 /**
  * A-03 and A-04: the student verification queue.
@@ -109,6 +110,8 @@ export default function StudentsPage() {
           {total} waiting · oldest first
         </p>
       </div>
+
+      <Tabs current="/students" tabs={STUDENT_TABS} />
 
       {error && <Banner tone="error">{error}</Banner>}
       {notice && <Banner tone="success">{notice}</Banner>}

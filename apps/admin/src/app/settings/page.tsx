@@ -5,14 +5,14 @@ import type { FlaggedShop } from '@hoppo/api-client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Banner, Button, Detail, Empty, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { SETTINGS_TABS, Tabs } from '@/lib/kit';
 
 /**
  * A-09: college settings.
  *
- * Phase 1E exposes the one setting with teeth: the serviceable radius
- * (FR-TEN-04). The rest of FR-ADM-03 — fee bands, broadcast rounds, timeouts
- * — is in the database and configurable, but no screen for it yet, which this
- * page says rather than hides.
+ * This tab is the serviceable radius (FR-TEN-04). The rest of FR-ADM-03 —
+ * fee bands, broadcast rounds, timeouts — is on the "Fees and timings" tab,
+ * and the radius is kept apart from it on purpose:
  *
  * The radius is not a harmless slider. FR-TEN-05: reducing it leaves
  * already-approved shops outside the new limit, and they *stay active* and
@@ -81,6 +81,8 @@ export default function SettingsPage() {
           {user?.college?.name ?? 'All colleges'}
         </p>
       </div>
+
+      <Tabs current="/settings" tabs={SETTINGS_TABS} />
 
       {error && <Banner tone="error">{error}</Banner>}
       {notice && <Banner tone="success">{notice}</Banner>}
@@ -204,26 +206,6 @@ export default function SettingsPage() {
             ))}
           </ul>
         )}
-      </Panel>
-
-      <Panel
-        title="Configurable but not on a screen yet"
-        subtitle="These live in the database and can be changed there (FR-ADM-03)"
-      >
-        <ul className="divide-y divide-[var(--color-line)] text-sm">
-          {[
-            ['Base delivery fee and distance bands', 'fee_band table'],
-            ['Fee increment per re-broadcast round', 'college_config.fee_increment_minor'],
-            ['Acceptance window and broadcast rounds', 'college_config'],
-            ['Work-mode inactivity timeout', 'college_config.work_mode_idle_timeout_minutes'],
-            ['Campus delivery points', 'delivery_point table'],
-          ].map(([label, where]) => (
-            <li key={label} className="flex flex-wrap items-baseline gap-2 px-4 py-2">
-              <span className="font-semibold">{label}</span>
-              <span className="nums text-[var(--color-ink-faint)]">{where}</span>
-            </li>
-          ))}
-        </ul>
       </Panel>
     </div>
   );

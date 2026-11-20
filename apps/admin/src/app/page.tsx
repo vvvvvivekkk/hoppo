@@ -1,35 +1,47 @@
 'use client';
 
+import type { AdminOrderSummary } from '@hoppo/api-client';
 import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { Banner, Panel, Pill } from '@/components/ui';
 import { describeError, useApi } from '@/lib/api';
+import { ORDER_STATUS } from '@/lib/kit';
 
 /**
  * A-02: the operations overview.
  *
- * Built from what Phase 1 actually exposes rather than from the full A-02
- * screen in the SRS, which also wants live order counts, unfulfilled
- * broadcasts and riders online. Those come from the operational reporting in
- * FR-ADM-05, which is Phase 2 work — so rather than show plausible-looking
- * zeros, this page shows the queues that exist and says plainly what is not
- * here yet.
- *
- * The purpose of the page is "what needs me right now", so the queues lead
- * and the counts are the headline.
+ * "What needs me right now": the queues waiting on a decision, and today's
+ * orders from the order summary (FR-ADM-05). The SRS also asks for riders
+ * online; the API does not keep rider presence history, so that figure is
+ * named below as missing rather than shown as a zero.
  */
+const LIVE_STATUSES = ['PLACED', 'SHOP_ACCEPTED', 'PREPARING', 'READY', 'PICKED_UP'] as const;
+
 export default function OverviewPage() {
   const { api, user } = useApi();
   const [students, setStudents] = useState<number | null>(null);
   const [shops, setShops] = useState<number | null>(null);
   const [flagged, setFlagged] = useState<number | null>(null);
+  const [today, setToday] = useState<AdminOrderSummary | null>(null);
+  const [todayError, setTodayError] = useState<string | null>(null);
   const [health, setHealth] = useState<Awaited<ReturnType<typeof api.health.ready>> | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    // Today's orders are read on their own: a failure there should cost that
+    // panel, not the queue counts beside it.
+    void (async () => {
+      try {
+        setToday(await api.admin.orders.summary());
+        setTodayError(null);
+      } catch (e) {
+        setTodayError(describeError(e));
+      }
+    })();
+
     try {
-      // Fetched together rather than in sequence: three independent reads, and
-      // a dashboard that paints in three steps feels slower than it is.
+      // Fetched together rather than in sequence: independent reads, and a
+      // dashboard that paints in steps feels slower than it is.
       const [studentQueue, shopQueue, flaggedShops, ready] = await Promise.all([
         api.admin.verificationQueue(1),
         api.admin.shopQueue(1),
@@ -54,6 +66,7 @@ export default function OverviewPage() {
   }, [load]);
 
   const postgisDown = health?.checks?.postgis?.ok === false;
+  const isSuper = user?.role === 'SUPER_ADMIN';
 
   return (
     <div className="space-y-5">
@@ -92,7 +105,7 @@ export default function OverviewPage() {
           hint="Nothing they submit is visible to students until approved."
         />
         <QueueCard
-          href="/settings"
+          href={isSuper ? '/shops/all' : '/settings'}
           label="Shops outside the radius"
           count={flagged}
           hint="Approved under a wider radius. They stay active until you decide."
@@ -100,14 +113,63 @@ export default function OverviewPage() {
         />
       </div>
 
+      <Panel
+        title="Orders today"
+        subtitle={
+          today
+            ? `Placed on ${today.range.from ?? 'today'} (${today.range.timezone}) · refreshed every 15 seconds`
+            : 'Placed today'
+        }
+        actions={
+          <Link href="/orders" className="text-sm font-semibold text-[var(--color-accent)] underline">
+            Open the order report
+          </Link>
+        }
+      >
+        {todayError && (
+          <div className="p-4">
+            <Banner tone="warn">Today&rsquo;s orders could not be read: {todayError}</Banner>
+          </div>
+        )}
+        {!today && !todayError && (
+          <p className="p-4 text-sm text-[var(--color-ink-faint)]">Loading today&rsquo;s orders…</p>
+        )}
+        {today && (
+          <>
+            <div className="grid gap-4 p-4 sm:grid-cols-2 lg:grid-cols-4">
+              <Stat label="Placed" value={today.ordersPlaced} />
+              <Stat label="Completed" value={today.byStatus.COMPLETED} />
+              <Stat label="Cancelled" value={today.cancellations.total} />
+              <Stat
+                label="No rider found"
+                value={today.unfulfilledBroadcasts}
+                alert={today.unfulfilledBroadcasts > 0}
+              />
+            </div>
+            <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-[var(--color-line)] px-4 py-3 text-sm">
+              <span className="font-bold">In progress now</span>
+              {LIVE_STATUSES.map((status) => (
+                <span key={status}>
+                  <span className="nums font-bold">{today.byStatus[status]}</span>{' '}
+                  <span className="text-[var(--color-ink-soft)]">{ORDER_STATUS[status].toLowerCase()}</span>
+                </span>
+              ))}
+            </div>
+            <p className="border-t border-[var(--color-line)] px-4 py-3 text-sm">
+              <span className="nums font-bold">{today.money.totalLabel}</span> paid by students today
+              {today.money.basis === 'COMPLETED' ? ', counting completed orders only.' : '.'}
+            </p>
+          </>
+        )}
+      </Panel>
+
       <Panel title="Not in this build" subtitle="So the gaps are visible rather than implied">
         <ul className="divide-y divide-[var(--color-line)] text-sm">
           {[
-            ['Live order board (A-07)', 'Orders by status with stuck-order flags'],
-            ['Escalated tasks (A-08)', 'OTP failures and abandonments needing resolution'],
-            ['Analytics (A-14)', 'Acceptance latency, rider supply by hour, revenue by shop'],
-            ['Audit log viewer (A-15)', 'The log is written on every action; the viewer is not built'],
-            ['Campus delivery points (A-10)', 'Map editor for drop points'],
+            ['Riders online', 'The API keeps no history of rider presence yet, so there is no count to show'],
+            ['Analytics (A-14)', 'Rider supply by hour and funnels; the order report has the figures that exist'],
+            ['Withdrawal requests (A-13)', 'Marking payouts as paid'],
+            ['Reported users and content (A-11, A-12)', 'Community moderation queues'],
           ].map(([title, body]) => (
             <li key={title} className="flex flex-wrap items-baseline gap-2 px-4 py-2">
               <span className="font-semibold">{title}</span>
@@ -134,6 +196,15 @@ export default function OverviewPage() {
           </dl>
         </Panel>
       )}
+    </div>
+  );
+}
+
+function Stat({ label, value, alert }: { label: string; value: number; alert?: boolean }) {
+  return (
+    <div>
+      <p className="text-xs uppercase tracking-wide text-[var(--color-ink-faint)]">{label}</p>
+      <p className={`nums text-3xl font-black ${alert ? 'text-[var(--color-pending)]' : ''}`}>{value}</p>
     </div>
   );
 }
@@ -166,4 +237,3 @@ function QueueCard({
     </Link>
   );
 }
-
