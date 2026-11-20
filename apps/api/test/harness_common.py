@@ -148,7 +148,7 @@ def http(method: str, path: str, token: str = None, body=None, who: str = None, 
 
 # The API's own limits, per signed-in user per route (see the @Throttle
 # decorators; anything unlisted gets the global 120 a minute).
-ROUTE_LIMITS = {"place": 20, "handover": 20, "reissue": 5, "ping": 60, "login": 10}
+ROUTE_LIMITS = {"place": 20, "handover": 20, "reissue": 5, "ping": 60, "login": 10, "resolve": 30}
 DEFAULT_LIMIT = 120
 WINDOW_S = 62.0
 _sent_lock = threading.Lock()
@@ -983,3 +983,138 @@ def batches(rounds: int, methods) -> list:
             n += 1
         plan.append(batch)
     return plan
+
+
+# --------------------------------------------------------------------------
+# For the end-to-end scripts that are not races: one request at a time, each
+# with a stated expectation.
+# --------------------------------------------------------------------------
+
+class Checks:
+    def __init__(self, name: str):
+        self.name, self.count, self.failures, self.five_xx = name, 0, [], 0
+
+    def check(self, what: str, ok, got="") -> bool:
+        self.count += 1
+        shown = str(got)[:300]
+        print(f"  {'ok  ' if ok else 'FAIL'} {what}" + (f"   [{shown}]" if got != "" and not ok else ""))
+        if not ok:
+            self.failures.append(f"{what} - got {shown}" if got != "" else what)
+        return bool(ok)
+
+    def call(self, method, path, token, body=None):
+        status, res = http(method, path, token, body)
+        if status == 0:
+            raise Blocked(f"api: lost the API during {method} {path}: {res.get('message')}")
+        if status >= 500:
+            self.five_xx += 1
+            self.failures.append(f"{method} {path} answered {status} {res.get('code')}")
+        return status, res
+
+    def finish(self, minimum: int, proves: str) -> int:
+        print(f"\nchecks: {self.count} | failed: {len(self.failures)} | 5xx: {self.five_xx}")
+        for f in self.failures:
+            print("  FAIL  " + f)
+        if self.failures:
+            print(f"RESULT: FAIL - {len(self.failures)} of {self.count} checks failed. {self.name}")
+            return 1
+        if self.count < minimum:
+            print(f"RESULT: FAIL - the script stopped early; too few checks ran to mean anything. {self.name}")
+            return 2
+        print(f"RESULT: PASS - all {self.count} checks held: {proves}")
+        return 0
+
+
+def audit_rows(action: str, target_id: str, since: str) -> int:
+    """Audit rows for one action on one target written since a database timestamp."""
+    return int(psql(f"SELECT count(*) FROM audit_log WHERE action={q(action)} AND target_id={q(target_id)} "
+                    f"AND created_at >= {q(since)}"))
+
+
+def raw_login(identifier: str, password: str):
+    """A sign-in that is not cached: for accounts a script made itself, or expects to be refused."""
+    make_room("ip", "login", 1)
+    status, body = http("POST", "/auth/login", None, {"identifier": identifier, "password": password},
+                        who="ip", route="login")
+    if status == 429:
+        time.sleep(WINDOW_S)
+        status, body = http("POST", "/auth/login", None, {"identifier": identifier, "password": password},
+                            who="ip", route="login")
+    return status, body
+
+
+def register_student(label: str) -> dict:
+    """
+    A new student, registered the way the app does it: mobile OTP requested
+    and verified (the development build returns the code), then
+    POST /auth/register accepting the current privacy notice. Unverified, as
+    every new student is. The OTP route allows three a minute per address, so
+    a script should make one of these, not a dozen.
+    """
+    tag = os.urandom(4).hex()
+    mobile = "+9194" + str(int(tag, 16) % 10 ** 8).zfill(8)
+    email = f"{label}-{tag}@anurag.edu.in"
+    password = "E2e-register-2026"
+    for attempt in range(2):
+        status, otp = http("POST", "/auth/mobile/request-otp", None, {"mobile": mobile})
+        if status != 429:
+            break
+        time.sleep(WINDOW_S)
+    if status not in (200, 201) or not otp.get("devCode"):
+        raise Blocked(f"cannot request a sign-up code: {status} {otp.get('code')} "
+                      "(the development build must return devCode)")
+    status, res = http("POST", "/auth/mobile/verify-otp", None, {"challengeId": otp["challengeId"], "code": otp["devCode"]})
+    if status not in (200, 201):
+        raise Blocked(f"cannot verify the sign-up code: {status} {res.get('code')}")
+    _, notice = http("GET", "/legal/privacy-notice")
+    status, tokens = http("POST", "/auth/register", None, {
+        "name": f"E2E {label.title()} {tag}", "mobile": mobile, "email": email, "password": password,
+        "collegeId": college_id(), "mobileOtpChallengeId": otp["challengeId"],
+        "privacyNoticeVersion": notice.get("version")})
+    if status not in (200, 201) or "accessToken" not in tokens:
+        raise Blocked(f"cannot register a student: {status} {tokens.get('code')} {tokens.get('message')}")
+    uid = psql(f'SELECT id FROM "user" WHERE email={q(email)}')
+    return {"id": uid, "email": email, "mobile": mobile, "password": password, "name": f"E2E {label.title()} {tag}",
+            "accessToken": tokens["accessToken"], "refreshToken": tokens.get("refreshToken")}
+
+
+def register_shop(label: str) -> dict:
+    """A new shop registered through POST /shops/register (five a minute per address). PENDING until approved."""
+    tag = os.urandom(4).hex()
+    c = catalog()
+    email = f"{label}-{tag}@example.com"
+    docs = [{"docType": d, "fileKey": f"shop-docs/e2e-{tag}/{d.lower()}.pdf", "fileName": f"{d.lower()}.pdf",
+             "mimeType": "application/pdf", "sizeBytes": 1000}
+            for d in ("ESTABLISHMENT_LICENCE", "FRONTAGE_PHOTO", "OWNER_PHOTO_ID")]
+    _, notice = http("GET", "/legal/privacy-notice")
+    body = {"name": f"E2E {label.title()} {tag}", "category": "STATIONERY", "ownerName": "E2E Shop Owner",
+            "ownerMobile": "+9193" + str(int(tag, 16) % 10 ** 8).zfill(8), "ownerEmail": email, "password": PASSWORD,
+            "address": "Near the main gate, Venkatapur", "city": "Hyderabad", "state": "Telangana",
+            "latitude": c["shop_lat"] + 0.001, "longitude": c["shop_lng"] + 0.001,
+            "locationType": "OFF_CAMPUS", "collegeId": college_id(), "documents": docs,
+            "privacyNoticeVersion": notice.get("version")}
+    for attempt in range(2):
+        status, res = http("POST", "/shops/register", None, body)
+        if status != 429:
+            break
+        time.sleep(WINDOW_S)
+    if status != 201:
+        raise Blocked(f"cannot register a shop: {status} {res.get('code')} {res.get('message')}")
+    listing = psql("SELECT l.id FROM shop_listing l JOIN shop_staff s ON s.shop_id=l.shop_id "
+                   f'JOIN "user" u ON u.id=s.user_id WHERE u.email={q(email)}')
+    return {"listing_id": listing, "email": email, "name": body["name"],
+            "owner_id": psql(f'SELECT id FROM "user" WHERE email={q(email)}')}
+
+
+def escalations(admin_token: str) -> list:
+    """Every escalated task the administrator can see: the list is paged, oldest first."""
+    items, cursor = [], None
+    for _ in range(50):
+        status, page = http("GET", "/admin/escalations?limit=100" + (f"&cursor={cursor}" if cursor else ""), admin_token)
+        if status != 200:
+            raise RuntimeError(f"GET /admin/escalations -> {status} {page.get('code')}")
+        items += page.get("items", [])
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+    return items

@@ -120,6 +120,14 @@ def run() -> int:
                     tally.fail(f"round {n} task {task}", p)
                 tally.rounds_run += 1
                 h.progress(not problems)
+                if status == "ESCALATED":
+                    # Checked; now close it the way an administrator would, so
+                    # the escalations list does not grow by ten a run. (Thirty
+                    # resolves a minute are allowed.)
+                    h.make_room("admin@anurag.edu.in", "resolve", 1)
+                    h.http("POST", f"/admin/escalations/{task}/resolve", h.login("admin@anurag.edu.in"),
+                           {"outcome": "NOT_DELIVERED", "note": f"race-otp-cap {h.RUN}: harness fixture, closed after the check"},
+                           who="admin@anurag.edu.in", route="resolve")
 
     return tally.finish(f"wrong codes sent together were each counted, and the cap of {cap} was never "
                         "exceeded: no batch bought extra guesses.")

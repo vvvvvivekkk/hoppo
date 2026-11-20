@@ -58,7 +58,7 @@ a harness that cannot sign in has proved nothing.
 
 ## The race harnesses
 
-Ten harnesses, one shape. Each one builds a fixture through the real HTTP API,
+Twelve harnesses, one shape. Each one builds a fixture through the real HTTP API,
 lines N requests up behind a thread barrier so they leave at the same instant,
 then counts rows in PostgreSQL and compares them with what the callers were
 told. A sequential test would pass against a read-then-write implementation
@@ -303,6 +303,33 @@ answered 200: ['DELIVERED', 'NOT_DELIVERED']`, `the rider was paid 2 times
 for one delivery`, or `2 TASK_RESOLVED audit rows`. It fails itself if one of
 the two outcomes never won.
 
+### `race-shop-reinstate.py` - two administrators, one suspended shop
+
+One shop is registered and approved for the run; each round suspends it and
+fires N `POST /admin/shops/:listingId/reinstate` at once from two
+administrators. It proves one decision is recorded once: one 200, the rest
+`409 NOT_SUSPENDED`, exactly one `SHOP_REINSTATED` audit row written in the
+round and naming the administrator who got the 200, the listing `ACTIVE`. A
+failure looks like `6 reinstates answered 200` with `6 SHOP_REINSTATED audit
+rows for one reinstatement` - the status was read and then written, and the
+audit log, which cannot be edited, now says it happened six times. The shop
+is left suspended.
+
+### `race-admin-decisions.py` - approve against reject, on one pending application
+
+Two administrators working the same queue can give different answers to the
+same row at once. Each round takes one pending shop (registered through the
+API) or one pending verification submission (inserted for a student made for
+the round) and fires N approves and rejects together from two administrators,
+alternating which has the head start. It proves the application is decided
+once: one success, the rest `409 ALREADY_DECIDED`; the listing `ACTIVE` or
+`REJECTED` as the winner chose (for a verification, the submission and the
+student's profile agreeing); exactly one approve-or-reject audit row. A
+failure looks like `5 decisions succeeded: ['approve', 'reject', 'reject',
+'approve', 'reject']` with `5 approve/reject audit rows for one listing` - the
+row ends as whoever wrote last and the audit log records decisions that did
+not stand. Few shop rounds, because shop registration allows five a minute.
+
 ## `e2e-admin.py` - the administrator's side
 
 Not a race: about eighty single requests, each with a stated expectation.
@@ -325,6 +352,42 @@ empty college and is locked out with `COLLEGE_INACTIVE` once the college is
 deactivated. A failure is one `FAIL` line naming what was expected and what
 came back. Each run leaves one completed order, one inactive "E2E Test
 Point" (reused next time) and one deactivated "E2E College".
+
+## `e2e-admin-actions.py` - the administrator's buttons, pressed for real
+
+The consoles' own walk checks these actions against intercepted requests,
+which proves the screen sends the right thing. This proves the API does the
+right thing with it, on fixtures it creates and puts back: it registers a
+student through the sign-up routes, suspends them and confirms their token
+stops working, their open socket is dropped and their refresh token is dead,
+then reinstates them and signs in again; registers and approves a shop,
+suspends it (gone from the students' list, still reachable by its owner) and
+reinstates it; saves a configuration value and reads it back from the row and
+the audit log; reverses the delivery points and checks the students' picker
+follows, then restores the order; and escalates a real delivery with wrong
+codes and resolves it - one payout, the requester's socket told an
+administrator resolved it, gone from the list, a second resolve refused. A
+failure is one `FAIL` line naming what was expected and what came back.
+
+## `e2e-account.py` - a person's own account
+
+Registers a student, signs them in from a named device, gives them an avatar
+reference and a device token, and deletes the account. It then checks the
+database rather than the response: the name, number and email are gone from
+the row; no session row still carries their IP address or user agent; device
+tokens and the avatar reference are gone; a rename writes an audit row that says the name changed without
+holding either name; no audit row written from the deletion onwards names
+them; the response's `caveats` admit that past audit entries cannot be
+altered; and every item the response lists as `erased`
+really was - the list may not overstate. It proves deletion and export are for
+students only (an administrator, a super administrator and a shop owner are
+refused by role; only wrong passwords are ever sent, so an open door deletes
+nothing), and that deactivating a college revokes its users' refresh tokens, drops
+their open sockets and refuses new ones with `COLLEGE_INACTIVE`. A failure looks like `no session row still carries the
+person's IP address or user agent [2 with an IP address, 2 with a user agent,
+of 2]` or `super@hoppo.app is refused POST /account/delete by role [403
+PASSWORD_INCORRECT]`. It cannot check that the avatar *object* left the
+bucket: object storage is not configured in development.
 
 ## `e2e-shop-approval.py` - who may reach what, before and after approval
 
@@ -378,7 +441,7 @@ of this repository, so it lives outside it (`$WALK_DIR/pw/browser.mjs`);
 
 ### `run-all.sh` - everything, in order
 
-Runs `fixtures.py`, both walks, the two end-to-end checks and the ten harnesses in
+Runs `fixtures.py`, both walks, the four end-to-end checks and the twelve harnesses in
 sequence against one API base and one web origin, prints one `PASS` / `FAIL`
 / `BLOCKED` line each, and exits non-zero unless all of them passed (3 if the
 fixtures could not be created, in which case nothing else is run). A check
@@ -387,6 +450,14 @@ twenty seconds. `SKIP_WALKS=1` runs the harnesses alone, `SKIP_BROWSER=1`
 leaves out only the browser walk, and `SKIP_SLOW=1` leaves out
 `race-unfulfilled.py`. A full run takes about twenty minutes. Full output
 for each check is kept in the log directory it prints.
+
+It also says when the ground moved. At the start it prints when PostgreSQL,
+Redis and the API last started and whether any restarted since the previous
+run (`services.py`: `pg_postmaster_start_time()`, Redis `uptime_in_seconds`
+and `run_id`, the API's reported uptime); after any check that does not pass,
+and again at the end, it says whether one restarted *during* this run. A
+development container that restarts takes all three down and brings Redis
+back empty, and without this that reads as a string of unrelated failures.
 
 Run it on a quiet stack. The harnesses and walks use the seeded rider
 accounts; anything else driving those accounts at the same time (a second

@@ -376,8 +376,7 @@ def platform(admin) -> None:
     status, res = call("GET", "/admin/orders", token)
     check("the administrator's existing token now answers 403 COLLEGE_INACTIVE",
           (status, res.get("code")) == (403, "COLLEGE_INACTIVE"), f"{status} {res.get('code')}")
-    h.make_room("ip", "login", 1)
-    status, res = call("POST", "/auth/login", None, {"identifier": email, "password": h.PASSWORD})
+    status, res = h.raw_login(email, h.PASSWORD)     # waits out the shared sign-in limit if it has to
     check("...and signing in again is refused with COLLEGE_INACTIVE", (status, res.get("code")) == (403, "COLLEGE_INACTIVE"),
           f"{status} {res.get('code')}")
     status, public = call("GET", "/auth/colleges", None)

@@ -174,8 +174,7 @@ def run() -> int:
                 if outcome == "DELIVERED" and (releases or student1 != student0):
                     problems.append(f"DELIVERED won but the student's wallet moved by {student1 - student0} "
                                     f"({releases} ORDER_RELEASE row(s))")
-                status, listed = h.http("GET", "/admin/escalations?limit=100", h.login(ADMINS[0]))
-                if any(i.get("taskId") == task for i in listed.get("items", [])):
+                if any(i.get("taskId") == task for i in h.escalations(h.login(ADMINS[0]))):
                     problems.append("the resolved task is still in the escalations list")
                 if outcome and note != wins[0].call.body["note"]:
                     problems.append(f"the stored resolution note is not the winner's: {note!r}")

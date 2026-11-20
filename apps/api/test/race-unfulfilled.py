@@ -104,6 +104,9 @@ def run() -> int:
         fee = int(h.psql(f'SELECT delivery_fee_minor FROM "order" WHERE id={h.q(order_id)}'))
         b0, s0 = h.balance(uid), h.ledger_sum(uid)
         log_before = h.psql(f"SELECT id FROM broadcast_log WHERE task_id={h.q(task_id)} ORDER BY id").split()
+        history_sql = ("SELECT id || '|' || round || '|' || outcome || '|' || sent_at FROM broadcast_log "
+                       f"WHERE task_id={h.q(task_id)} AND id IN ({','.join(h.q(i) for i in log_before) or 'NULL'}) ORDER BY id")
+        history_before = h.psql(history_sql)
 
         calls = []
         for i in range(N):
@@ -158,7 +161,19 @@ def run() -> int:
             expect = dict(releases=0, released=0, captures=0, order="READY", payment="HELD", gain=0)
             if task_status not in ("CREATED", "BROADCASTING"):
                 problems.append(f"kept waiting but the task is {task_status} (must be back on its way to riders)")
-            if stale_pending:
+            # The new search starts within one dispatcher tick. Wait for it,
+            # then look at the old search's rows again: they are history, and
+            # the new search must write rows of its own, not reuse them.
+            deadline = time.time() + 12
+            while time.time() < deadline and h.psql(
+                    f"SELECT count(*) FROM broadcast_log WHERE task_id={h.q(task_id)} AND outcome='PENDING'") == "0":
+                time.sleep(0.5)
+            history_after = h.psql(history_sql)
+            if history_after != history_before:
+                changed = sorted(set(history_before.splitlines()) ^ set(history_after.splitlines()))
+                problems.append("the new search rewrote the finished search's broadcast_log rows instead of adding its "
+                                f"own (id|round|outcome|sent_at before/after): {changed[:4]}")
+            elif stale_pending:
                 problems.append(f"{stale_pending} broadcast_log row(s) from the finished search are still PENDING")
         else:
             expect = None

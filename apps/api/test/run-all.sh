@@ -42,6 +42,12 @@ echo
 summary=()
 failed=0
 
+# Which services restarted, and when. Printed against the last run of this
+# script at the start, and against the start of this run after any check that
+# does not pass and again at the end - so a container restart in the middle of
+# the suite is in the log as a restart, next to the checks it broke.
+services() { python3 -I "$HERE/services.py" "$@" "$BASE" 2>&1 | grep -a '^services:\|^RESULT:' ; }
+
 record() {  # name, exit code, log file
   local name="$1" code="$2" log="$3" verdict detail
   case "$code" in
@@ -54,6 +60,9 @@ record() {  # name, exit code, log file
   [ "$code" = 124 ] && detail="timed out"
   summary+=("$(printf '%-7s %-22s %s' "$verdict" "$name" "$detail")")
   printf '%-7s %-22s %s\n' "$verdict" "$name" "$detail"
+  if [ "$verdict" != PASS ]; then
+    services --since this-run | grep -a 'RESTARTED\|came back\|RESULT:' | sed 's/^/        /'
+  fi
 }
 
 run() {  # name, timeout seconds, command...
@@ -72,6 +81,10 @@ run() {  # name, timeout seconds, command...
   fi
   record "$name" "$code" "$log"
 }
+
+services
+services --mark this-run >/dev/null
+echo
 
 # Fixtures first. A reset database has none of the accounts the checks below
 # sign in as, and a harness that cannot sign in has proved nothing - so if the
@@ -111,12 +124,15 @@ fi
 
 run e2e-shop-approval 300 python3 -I "$HERE/e2e-shop-approval.py" "$BASE"
 run e2e-admin 400 python3 -I "$HERE/e2e-admin.py" "$BASE"
+run e2e-admin-actions 500 python3 -I "$HERE/e2e-admin-actions.py" "$BASE"
+run e2e-account 400 python3 -I "$HERE/e2e-account.py" "$BASE"
 
 # race-unfulfilled goes last: it needs every rider offline for three and a
 # half minutes while the dispatcher runs its rounds out. SKIP_SLOW=1 leaves it
 # (and only it) out.
 for harness in race-stress race-two-tasks race-refund race-wallet-spend race-payout race-otp-cap \
-               race-abandon-pickup race-escalation-resolve race-sweep-cancel; do
+               race-abandon-pickup race-escalation-resolve race-shop-reinstate race-admin-decisions \
+               race-sweep-cancel; do
   run "$harness" 900 python3 -I "$HERE/$harness.py" "$BASE"
 done
 if [ "${SKIP_SLOW:-0}" != 1 ]; then
@@ -126,6 +142,13 @@ else
 fi
 
 echo
+restarts="$(services --since this-run | grep -a 'RESTARTED\|came back\|RESULT:')"
+if [ -n "$restarts" ]; then
+  echo "A service restarted DURING this run - results from around that time are not trustworthy:"
+  echo "$restarts"
+else
+  echo "services: none restarted during this run"
+fi
 echo "================ summary ================"
 printf '%s\n' "${summary[@]}"
 echo "logs: $LOG_DIR"
