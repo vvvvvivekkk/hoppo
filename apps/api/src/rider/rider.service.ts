@@ -26,6 +26,7 @@ import { StorageService } from '../storage/storage.service';
 import { TenantService } from '../common/tenant/tenant.service';
 import { DispatchService } from '../dispatch/dispatch.service';
 import { DispatchGateway } from '../dispatch/dispatch.gateway';
+import { presenceHour, recordRiderPresence } from '../dispatch/rider-presence';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import { lockWallets, readWalletHead } from '../wallet/wallet-ledger';
 import { acceptanceRateBps, acceptanceRatePercent } from './acceptance-rate';
@@ -310,6 +311,9 @@ export class RiderService {
       },
     });
 
+    // FR-ADM-05: going online, with a position, is being present this hour.
+    await recordRiderPresence(this.prisma, collegeId, user.userId);
+
     await this.redis.setRiderPosition({
       collegeId,
       userId: user.userId,
@@ -340,7 +344,7 @@ export class RiderService {
 
     const state = await this.prisma.riderState.findUnique({
       where: { userId: user.userId },
-      select: { workModeOn: true },
+      select: { workModeOn: true, lastPingAt: true },
     });
 
     if (!state?.workModeOn) {
@@ -349,6 +353,8 @@ export class RiderService {
         message: 'You are offline. Go online to receive offers.',
       });
     }
+
+    const now = new Date();
 
     const config = await this.prisma.collegeConfig.findUnique({
       where: { collegeId },
@@ -365,8 +371,18 @@ export class RiderService {
 
     await this.prisma.riderState.update({
       where: { userId: user.userId },
-      data: { lastLatitude: latitude, lastLongitude: longitude, lastPingAt: new Date() },
+      data: { lastLatitude: latitude, lastLongitude: longitude, lastPingAt: now },
     });
+
+    // FR-ADM-05: the first ping of each clock hour records the rider as
+    // present in it. "First" is judged from the previous ping's time, which
+    // was just read — only to save an INSERT on the other 239 pings of the
+    // hour. It decides nothing: two pings racing past this check both insert,
+    // and the table's primary key keeps one row.
+    const previousHour = state.lastPingAt ? presenceHour(state.lastPingAt).getTime() : null;
+    if (previousHour !== presenceHour(now).getTime()) {
+      await recordRiderPresence(this.prisma, collegeId, user.userId, now);
+    }
 
     return { ok: true };
   }

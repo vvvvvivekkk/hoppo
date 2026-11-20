@@ -144,7 +144,8 @@ export function seedRider(prisma: any, userId: string, riderState: Row = {}): Ro
 /** The task's chat room, with its members, linked from the task row. */
 export function seedChatRoom(prisma: any, task: Row, memberIds: string[]): Row {
   const [room] = prisma.$seed('chatRoom', [
-    { id: 'room-1', collegeId: 'col-1', type: 'TASK', taskId: task.id, isArchived: false },
+    // `task` is the row itself, so a filter through the relation sees its live status.
+    { id: 'room-1', collegeId: 'col-1', type: 'TASK', taskId: task.id, task, isArchived: false, archivedAt: null },
   ]);
   prisma.$seed(
     'chatMember',

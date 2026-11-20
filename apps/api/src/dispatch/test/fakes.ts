@@ -442,6 +442,8 @@ export function fakePrisma(): any {
   const tables = new Map<string, Row[]>();
   const models = new Map<string, Record<string, jest.Mock>>();
   const staleReads = new Map<string, Row[]>();
+  /** Unique keys, per model: an insert that repeats one is refused. */
+  const uniques = new Map<string, string[][]>();
   const locks: string[] = [];
   let nextId = 1;
 
@@ -452,7 +454,18 @@ export function fakePrisma(): any {
 
   const implementations = (name: string): Record<string, (args: any) => unknown> => {
     const find = (where: Row | undefined) => table(name).filter((row) => matchesWhere(row, where));
+    /** The existing row a new one would collide with on a declared unique key. */
+    const collision = (data: Row): Row | undefined =>
+      (uniques.get(name) ?? [])
+        .map((fields) => table(name).find((row) => fields.every((f) => same(row[f], data[f]))))
+        .find(Boolean);
+
     const insert = (data: Row) => {
+      // As PostgreSQL does (P2002 through Prisma): a duplicate key fails the
+      // INSERT. Only for models a spec has declared a key on with `$unique`.
+      if (collision(data)) {
+        throw new Error(`fake database: Unique constraint failed on ${name}`);
+      }
       const row = { id: `${name}-${nextId++}`, ...data };
       table(name).push(row);
       return row;
@@ -488,13 +501,35 @@ export function fakePrisma(): any {
           .map((row) => ({ ...row }));
       },
       count: ({ where } = {}) => find(where).length,
+      // `groupBy` with `_count` of a field — as much of it as is used.
+      groupBy: ({ by, where, _count }) => {
+        const groups = new Map<string, { key: Row; rows: Row[] }>();
+        for (const row of find(where)) {
+          const key = Object.fromEntries((by as string[]).map((field) => [field, row[field]]));
+          const id = JSON.stringify((by as string[]).map((field) => comparable(row[field])));
+          if (!groups.has(id)) groups.set(id, { key, rows: [] });
+          groups.get(id)!.rows.push(row);
+        }
+        return [...groups.values()].map(({ key, rows }) => ({
+          ...key,
+          ...(_count
+            ? {
+                _count: Object.fromEntries(
+                  Object.keys(_count).map((field) => [field, rows.filter((r) => r[field] != null).length]),
+                ),
+              }
+            : {}),
+        }));
+      },
       create: ({ data }) => ({ ...insert(data) }),
       createMany: ({ data, skipDuplicates }) => {
         let count = 0;
         for (const item of [data].flat() as Row[]) {
-          // A duplicate, for this purpose, is a row already carrying every
-          // value the new one would — enough for the keyed inserts sent here.
-          if (skipDuplicates && find(item).length > 0) continue;
+          // ON CONFLICT DO NOTHING. A duplicate is a collision on a declared
+          // unique key; for a model with none declared, a row already
+          // carrying every value the new one would.
+          const duplicate = uniques.has(name) ? collision(item) !== undefined : find(item).length > 0;
+          if (skipDuplicates && duplicate) continue;
           insert(item);
           count++;
         }
@@ -615,6 +650,10 @@ export function fakePrisma(): any {
       return rows;
     },
     $rows: (name: string): Row[] => table(name),
+    /** Declare a unique key on a model, e.g. `$unique('riderPresenceHour', ['userId', 'hourStart'])`. */
+    $unique: (name: string, fields: string[]) => {
+      uniques.set(name, [...(uniques.get(name) ?? []), fields]);
+    },
     $staleRead: (name: string, row: Row) => {
       staleReads.set(name, [...(staleReads.get(name) ?? []), row]);
     },

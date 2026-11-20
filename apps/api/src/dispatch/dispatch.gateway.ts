@@ -14,6 +14,7 @@ import { Server, Socket } from 'socket.io';
 import { wsEvents } from '@hoppo/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
+import { presenceHour, recordRiderPresence } from './rider-presence';
 import type { AccessTokenPayload } from '../common/types/authenticated-user';
 import {
   SHOP_NOT_APPROVED_CODE,
@@ -274,6 +275,18 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
       },
     });
 
+    // FR-ADM-05: one presence row per rider per clock hour. A ping arrives
+    // every fifteen seconds, so the row is written on the first ping this
+    // socket sees in each hour and not again — one INSERT an hour instead of
+    // two hundred and forty. The memory is per socket and only an
+    // optimisation: a reconnect, or a second instance, simply inserts again
+    // and the database skips the duplicate.
+    const hour = presenceHour(new Date(nowMs)).getTime();
+    if (client.data.presenceHour !== hour) {
+      await recordRiderPresence(this.prisma, user.collegeId, user.userId, new Date(nowMs));
+      client.data.presenceHour = hour;
+    }
+
     return { ok: true };
   }
 
@@ -398,6 +411,18 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
    */
   disconnectUser(userId: string): void {
     this.server?.in(`user:${userId}`).disconnectSockets(true);
+  }
+
+  /**
+   * FR-CHAT / FR-DLV-10: a chat message, to the people in the conversation.
+   *
+   * Addressed to `user:<id>` rooms — the same rule as every status event
+   * here (M7). The caller supplies the recipients, having just established
+   * from the database who the parties are; the gateway decides nothing. A
+   * sender's own id belongs in the list: their other devices show it too.
+   */
+  sendChatMessage(recipientUserIds: readonly string[], message: Record<string, unknown>): void {
+    this.emitToUsers(recipientUserIds, wsEvents.MESSAGE_NEW, message);
   }
 
   /** FR-SHP-01: the shop dashboard's audible alert. */
