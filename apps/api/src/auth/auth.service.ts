@@ -471,6 +471,40 @@ export class AuthService {
       });
     }
 
+    // Why the session ended, before whether the token was reused.
+    //
+    // Suspending a student, deactivating an administrator or a college all
+    // revoke the account's refresh tokens. Without this, the next refresh
+    // from that person's own phone reached the reuse branch below: it was
+    // answered "ended for security reasons" and logged as a possible token
+    // theft, and the app could not tell the user they had been suspended.
+    // The codes are the ones the JWT strategy uses for the same states, so
+    // a client needs one rule for both.
+    const owner = await this.prisma.user.findUnique({
+      where: { id: stored.userId },
+      select: { status: true, college: { select: { status: true } } },
+    });
+
+    if (owner && owner.status !== 'ACTIVE') {
+      await this.revokeFamily(stored.familyId);
+      throw new UnauthorizedException(
+        owner.status === 'SUSPENDED'
+          ? {
+              code: 'ACCOUNT_SUSPENDED',
+              message: 'This account has been suspended. Contact your campus administrator.',
+            }
+          : { code: 'ACCOUNT_DEACTIVATED', message: 'This account has been closed.' },
+      );
+    }
+
+    if (owner?.college?.status === 'INACTIVE') {
+      await this.revokeFamily(stored.familyId);
+      throw new ForbiddenException({
+        code: 'COLLEGE_INACTIVE',
+        message: 'This college is not currently active on Hoppo.',
+      });
+    }
+
     if (stored.revokedAt) {
       this.logger.warn(
         `Refresh token reuse detected for user ${stored.userId}; revoking family ${stored.familyId}`,
@@ -537,8 +571,21 @@ export class AuthService {
     // owner's college (if it has one) must still be ACTIVE, at the moment of
     // the write. The checks above read that state earlier; a college
     // deactivated, or the same token presented twice, in between would
-    // otherwise still be handed a new pair. If the deactivation holds the
-    // row, this waits for it and then matches nothing.
+    // otherwise still be handed a new pair.
+    //
+    // What this does and does not guarantee. The statement locks only this
+    // refresh_token row; the college is read, not locked. So:
+    //  - once the deactivation has committed, this matches nothing — always;
+    //  - if the deactivation has already revoked this row but not committed,
+    //    this waits on the row and then matches nothing;
+    //  - if the deactivation is in flight and has not reached this row yet,
+    //    this still sees the college as ACTIVE and rotates. The pair it
+    //    mints is then either revoked by that same deactivation or, if the
+    //    insert below lands after its revoke, survives as a row that can do
+    //    nothing: the next refresh and every request are refused with
+    //    COLLEGE_INACTIVE. Closing that last gap would take a lock on the
+    //    college row around the rotation and the insert; it is left open
+    //    deliberately, as the token it leaves behind is inert.
     const rotated = await this.prisma.refreshToken.updateMany({
       where: {
         id: stored.id,

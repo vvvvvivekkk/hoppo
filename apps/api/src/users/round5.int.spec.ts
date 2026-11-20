@@ -339,7 +339,7 @@ describe('account deletion: what is left behind', () => {
         ]),
       );
       expect(result.retained).toEqual(
-        expect.arrayContaining(['audit log entries', 'ratings and chat messages you wrote']),
+        expect.arrayContaining(['audit log entries', 'ratings you wrote']),
       );
       // It does not claim the audit log was cleaned.
       expect(result.caveats.join(' ')).toMatch(/Audit log entries cannot be altered/);

@@ -59,6 +59,7 @@ export const ERASED_ON_DELETION = [
   'notes written on your orders',
   'descriptions written on your tasks',
   'bank and UPI details on your withdrawal requests',
+  'the text and attachments of chat messages you sent',
   'verification codes sent to your mobile number or email address',
   'notes an administrator wrote when rejecting a verification submission',
   'undecided verification submissions',
@@ -73,7 +74,9 @@ export const RETAINED_ON_DELETION = [
   'tasks (pickup and drop labels, fees, times)',
   'wallet entries and withdrawal amounts',
   'decided verification submissions (the decision only)',
-  'ratings and chat messages you wrote',
+  'ratings you wrote',
+  'chat messages you sent (that each was sent, and when — not its text)',
+  'hours in which you were online as a rider',
   'community posts, comments and reports you wrote',
   'audit log entries',
 ] as const;
@@ -242,6 +245,8 @@ export class AccountService {
       tasksDelivered,
       walletEntries,
       withdrawals,
+      chatMessages,
+      presenceHours,
     ] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
@@ -367,6 +372,24 @@ export class AccountService {
         select: { id: true, status: true, amountMinor: true, createdAt: true },
         orderBy: { createdAt: 'asc' },
       }),
+      // What the caller wrote in chat — their own messages only, never the
+      // other party's side of the conversation.
+      this.prisma.message.findMany({
+        where: { senderId: userId },
+        select: {
+          id: true,
+          sentAt: true,
+          body: true,
+          deletedAt: true,
+          room: { select: { taskId: true } },
+        },
+        orderBy: { sentAt: 'asc' },
+      }),
+      this.prisma.riderPresenceHour.findMany({
+        where: { userId },
+        select: { hourStart: true },
+        orderBy: { hourStart: 'asc' },
+      }),
     ]);
 
     const version = (acceptance?.detail as { version?: unknown } | null)?.version;
@@ -426,6 +449,14 @@ export class AccountService {
       tasksDelivered,
       walletEntries,
       withdrawals: withdrawals.map(({ createdAt, ...w }) => ({ ...w, requestedAt: createdAt })),
+      chatMessages: chatMessages.map((m) => ({
+        id: m.id,
+        sentAt: m.sentAt,
+        taskId: m.room.taskId,
+        body: m.body,
+        deleted: m.deletedAt !== null,
+      })),
+      riderPresenceHours: presenceHours.map((h) => h.hourStart),
     };
   }
 
@@ -629,6 +660,31 @@ export class AccountService {
         data: { bankAccountLast4: null, bankIfsc: null, upiId: null },
       });
 
+      // Chat: people type addresses, room numbers and phone numbers into it.
+      // Only messages this person SENT; the other party's are theirs. The row
+      // stays, marked deleted, so the other side's history keeps its shape
+      // and a dispute can still see that something was sent and when — the
+      // chat module already withholds a deleted message's words; nulling the
+      // body and attachment means they are gone, not merely hidden.
+      //
+      // Two statements. The content goes from every message they sent —
+      // including one they had already deleted themselves, whose words were
+      // hidden but still stored. The deletion mark is then added only where
+      // there was none, so an earlier deletion keeps its own time.
+      await tx.message.updateMany({
+        where: { senderId: userId },
+        data: {
+          body: null,
+          attachmentUrl: null,
+          attachmentType: null,
+          attachmentSizeBytes: null,
+        },
+      });
+      await tx.message.updateMany({
+        where: { senderId: userId, deletedAt: null },
+        data: { deletedAt },
+      });
+
       // OTP challenges are keyed by the number or address they were sent to,
       // not by user: every one of them holds this person's real mobile or
       // email in `recipient`. They are found by `contact`, which was read
@@ -691,8 +747,9 @@ export class AccountService {
       'Audit log entries cannot be altered. Entries written before this deletion are kept ' +
         'as they were and may include details recorded at the time, such as a previous ' +
         'display name, or the IP address and device of a sign-in.',
-      'Ratings, chat messages, community posts, comments and reports you wrote are kept, ' +
-        'shown as from a deleted user.',
+      'Ratings, community posts, comments and reports you wrote are kept, shown as from a ' +
+        'deleted user. Chat messages you sent keep their place in the conversation, ' +
+        'without their text.',
     ];
     if (filesRemoved < filesExpected) {
       // The references are gone either way; the objects are now orphans.

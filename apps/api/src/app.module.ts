@@ -20,6 +20,7 @@ import { CatalogModule } from './catalog/catalog.module';
 import { DispatchModule } from './dispatch/dispatch.module';
 import { OrdersModule } from './orders/orders.module';
 import { RiderModule } from './rider/rider.module';
+import { ChatModule } from './chat/chat.module';
 import { HealthModule } from './health/health.module';
 
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
@@ -63,6 +64,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     DispatchModule,
     OrdersModule,
     RiderModule,
+    ChatModule,
     HealthModule,
   ],
   providers: [

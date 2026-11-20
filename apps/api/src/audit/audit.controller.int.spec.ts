@@ -170,10 +170,12 @@ describe('audit log routes', () => {
   it('are read-only and restricted to administrators', () => {
     expect(Reflect.getMetadata('roles', AuditLogController)).toEqual(['ADMIN']);
 
+    // Every method that is a route (has a path), whatever it is called.
+    const proto = AuditLogController.prototype as unknown as Record<string, object>;
     const handlers = Object.getOwnPropertyNames(AuditLogController.prototype).filter(
-      (name) => name !== 'constructor',
+      (name) => name !== 'constructor' && Reflect.getMetadata('path', proto[name]) !== undefined,
     );
-    expect(handlers.sort()).toEqual(['actions', 'list']);
+    expect(handlers.sort()).toEqual(['actions', 'export', 'list']);
     for (const name of handlers) {
       const handler = (AuditLogController.prototype as unknown as Record<string, object>)[name];
       // RequestMethod.GET === 0: there is no POST, PATCH, PUT or DELETE.

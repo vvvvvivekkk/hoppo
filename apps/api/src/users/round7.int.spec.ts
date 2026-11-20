@@ -264,11 +264,18 @@ describe('refresh cannot rotate across a deactivation (the write is conditional)
       // The deactivation commits between this request's read and its write.
       await tx.college.update({ where: { id: w.college.id }, data: { status: 'INACTIVE' } });
 
-      await expect(w.service.refresh(TOKEN, {})).rejects.toMatchObject({ status: 401 });
+      await expect(w.service.refresh(TOKEN, {})).rejects.toMatchObject({
+        status: 401,
+        response: { code: 'REFRESH_INVALID' },
+      });
 
       expect(w.jwt.signAsync).not.toHaveBeenCalled();
       // Exactly the one row there was; nothing new was minted.
       expect(await tx.refreshToken.count({ where: { userId: w.user.id } })).toBe(1);
+      // And that row was not consumed: the conditional UPDATE matched nothing,
+      // so the refusal did not rotate the token on its way out.
+      const old = await tx.refreshToken.findUniqueOrThrow({ where: { id: w.stored.id } });
+      expect(old.revokedAt).toBeNull();
     });
   });
 
