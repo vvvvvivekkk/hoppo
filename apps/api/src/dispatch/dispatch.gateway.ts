@@ -104,11 +104,40 @@ export class DispatchGateway implements OnGatewayConnection, OnGatewayDisconnect
     // to take effect immediately.
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      select: { id: true, collegeId: true, role: true, status: true },
+      select: {
+        id: true,
+        collegeId: true,
+        role: true,
+        status: true,
+        college: { select: { status: true } },
+      },
     });
 
     if (!user || user.status !== 'ACTIVE') {
       this.logger.debug(`Socket rejected: account ${payload.sub} is not active`);
+      client.disconnect(true);
+      return;
+    }
+
+    // FR-ADM-07: a deactivated tenant's users are locked out at once. Their
+    // own accounts are still ACTIVE and their tokens still valid, so the user
+    // status above says nothing — HTTP refuses them in the JWT strategy
+    // (COLLEGE_INACTIVE), and until this check the socket did not: they
+    // could connect, sit in their college's room, and go on receiving offers
+    // and chat from a college that had been switched off. Read from the
+    // database at connect, never from the token. A super administrator has
+    // no college and is unaffected.
+    //
+    // This closes new connections. Sockets already open when a college is
+    // deactivated are closed by whoever deactivates it, through
+    // `disconnectUser`.
+    if (user.college?.status === 'INACTIVE') {
+      this.logger.debug(`Socket rejected: ${user.id}'s college is inactive`);
+      // The same code the HTTP API answers with, said before the door closes.
+      client.emit('exception', {
+        code: 'COLLEGE_INACTIVE',
+        message: 'This college is not currently active on Hoppo.',
+      });
       client.disconnect(true);
       return;
     }

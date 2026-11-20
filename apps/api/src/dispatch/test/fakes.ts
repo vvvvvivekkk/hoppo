@@ -222,7 +222,8 @@ type Expr = (row: Row) => unknown;
  *   SELECT expr AS "alias", ... FROM "t" WHERE expr
  *
  * with AND / OR / parentheses, comparisons, IS [NOT] NULL, `now()`, `+`,
- * string and number literals, and `$n` parameters.
+ * string and number literals, `$n` parameters, and a scalar subquery
+ * `(SELECT col FROM "t" WHERE expr)`.
  *
  * It exists so the WHERE clause of a raw conditional UPDATE is *evaluated*
  * against the rows, like every other write here. Anything it cannot read
@@ -234,6 +235,8 @@ class SqlReader {
   constructor(
     private readonly tokens: Token[],
     private readonly params: unknown[],
+    /** The rows of a table, by its SQL name — for a scalar subquery. */
+    private readonly rowsOf: (table: string) => Row[] = () => [],
   ) {}
 
   peek(offset = 0): Token | undefined {
@@ -355,6 +358,22 @@ class SqlReader {
     if (!t) throw new Error('fake database: SQL ended early');
 
     if (t.kind === 'symbol' && t.text === '(') {
+      // A scalar subquery: `(SELECT col FROM "t" WHERE expr)`. Its columns
+      // are the inner table's; it yields the first matching row's value, or
+      // NULL when there is none — and a comparison with NULL is not true.
+      if (this.isWord('SELECT')) {
+        this.takeWord('SELECT');
+        const value = this.sum();
+        this.takeWord('FROM');
+        const table = this.takeWord();
+        this.takeWord('WHERE');
+        const where = this.expression();
+        this.takeSymbol(')');
+        return () => {
+          const match = this.rowsOf(table).find((row) => Boolean(where(row)));
+          return match ? value(match) : null;
+        };
+      }
       const inner = this.expression();
       this.takeSymbol(')');
       return inner;
@@ -539,13 +558,14 @@ export function fakePrisma(): any {
       return { count: 1, rows: [] };
     }
 
-    const reader = new SqlReader(tokenize(sql), values);
+    // SQL names tables in snake_case; the models here are camelCase.
+    const reader = new SqlReader(tokenize(sql), values, (name) => table(camel(name)));
     const project = (columns: { alias: string; value: Expr }[], row: Row) =>
       Object.fromEntries(columns.map((c) => [c.alias, c.value(row)]));
 
     if (reader.isWord('UPDATE')) {
       reader.takeWord('UPDATE');
-      const rows = table(reader.takeWord());
+      const rows = table(camel(reader.takeWord()));
       reader.takeWord('SET');
 
       const assignments: { column: string; value: Expr }[] = [];
@@ -574,7 +594,7 @@ export function fakePrisma(): any {
       reader.takeWord('SELECT');
       const columns = reader.projection();
       reader.takeWord('FROM');
-      const rows = table(reader.takeWord());
+      const rows = table(camel(reader.takeWord()));
       reader.takeWord('WHERE');
       const where = reader.expression();
       if (!reader.done()) throw new Error(`fake database: unread SQL after "${reader.peek()?.text}"`);
@@ -663,10 +683,16 @@ export function fakeRedis() {
   const sets = new Map<string, Set<string>>();
   const ttls = new Map<string, number>();
   let failing = false;
+  /** How many more raw-client calls fail as if the connection had dropped. */
+  let failingCalls = 0;
   /** Commands that currently fail *inside* a pipeline, and for how many more calls. */
   const failingCommands = new Map<string, number>();
 
   const guard = () => {
+    if (failingCalls > 0) {
+      failingCalls--;
+      throw new Error('read ECONNRESET');
+    }
     if (failing) throw new Error('connect ECONNREFUSED 127.0.0.1:6379');
   };
 
@@ -710,6 +736,10 @@ export function fakeRedis() {
     /** Make Redis unreachable (or reachable again). */
     down: (isDown = true) => {
       failing = isDown;
+    },
+    /** Drop the connection for the next `calls` raw-client calls, then recover. */
+    downFor: (calls: number) => {
+      failingCalls = calls;
     },
     /**
      * Make one command fail *inside* pipelines — reported per entry, with

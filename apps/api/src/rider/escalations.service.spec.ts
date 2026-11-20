@@ -720,7 +720,6 @@ describe('resolve as NOT_DELIVERED', () => {
         'order.updateMany': world.prisma.order.updateMany,
         'walletEntry.create': world.prisma.walletEntry.create,
         'auditLog.create': world.prisma.auditLog.create,
-        'riderState.updateMany': world.prisma.riderState.updateMany,
         'chatRoom.updateMany': world.prisma.chatRoom.updateMany,
       };
       for (const [name, mock] of Object.entries(writes)) {
@@ -839,13 +838,22 @@ describe('resolve as NOT_DELIVERED', () => {
     expectUntouched(world, taskBefore, orderBefore);
   });
 
-  it('leaves alone a different task the rider has since taken — `activeTaskId: taskId`', async () => {
-    const world = escalated();
-    world.state.activeTaskId = 'task-newer';
+  it('does not touch the rider\'s state: they were released when the task escalated', async () => {
+    // Both ways a task becomes ESCALATED clear rider_state.active_task_id in
+    // the same transaction (RiderService.escalate; the suspension path), and
+    // nothing can point a rider back at an escalated task — accept only ever
+    // claims a BROADCASTING one. So by now the rider is either free or on a
+    // newer delivery, and cancelling this task has no business with either.
+    for (const holding of [null, 'task-newer']) {
+      const world = escalated();
+      world.state.activeTaskId = holding;
+      const before = { ...world.state };
 
-    await world.escalations.resolve(admin, 'task-1', notDelivered);
+      await world.escalations.resolve(admin, 'task-1', notDelivered);
 
-    expect(world.state.activeTaskId).toBe('task-newer');
+      expect(world.state).toEqual(before);
+      expect(world.prisma.riderState.updateMany).not.toHaveBeenCalled();
+    }
   });
 
   it('cancels nothing if the audit row cannot be written', async () => {

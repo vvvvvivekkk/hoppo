@@ -462,6 +462,48 @@ describe('when the offer list cannot be written (M8)', () => {
     expect(ctx.prisma.$rows('riderReliability')).toEqual([]);
   });
 
+  describe('one failed write is retried before the round is given up', () => {
+    /**
+     * The commonest failure is a connection that has only just come back:
+     * the first write fails and the next succeeds. Giving up on the first
+     * would cost the task five seconds, every time Redis blinks, for nothing.
+     */
+    it.each([
+      ['the write command fails once', (ctx: Ctx) => ctx.redis.failCommand('sadd', 1)],
+      ['setting the expiry fails once', (ctx: Ctx) => ctx.redis.failCommand('expire', 1)],
+      ['the connection drops for one call', (ctx: Ctx) => ctx.redis.downFor(1)],
+    ])('sends the round when %s', async (_name, fail) => {
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma);
+      nearby(ctx, 'rider-1');
+      fail(ctx);
+
+      const result = await ctx.service.broadcast('task-1', { round: 0 });
+
+      expect(result).toMatchObject({ eligibleCount: 1, round: 1 });
+      expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1 });
+      expect(sentOffers(ctx)).toEqual(['rider-1']);
+      // And the offer it sent is one the rider can take.
+      expect(ctx.redis.offeredTo('task-1', task.firstBroadcastAt)).toEqual(['rider-1']);
+      await ctx.service.accept('rider-1', 'task-1');
+      expect(task.riderId).toBe('rider-1');
+    });
+
+    it('gives the round up after the second failure, not the first and not the tenth', async () => {
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma);
+      nearby(ctx, 'rider-1');
+      ctx.redis.failCommand('sadd', 2);
+
+      expect(await ctx.service.broadcast('task-1', { round: 0 })).toBeNull();
+      expect(task.status).toBe('CREATED');
+      expect(ctx.server.emissions).toEqual([]);
+
+      // Both failures were spent on that one round: the next try goes through.
+      expect(await ctx.service.broadcast('task-1', { round: 0 })).toMatchObject({ round: 1 });
+    });
+  });
+
   it('S2: a failed write on the final round does not retire a task a rider wants', async () => {
     // Round 2 of 3 has expired. The sweep sends round 3 — the last — while
     // the write is failing. Before: the offer went out unrecorded, the rider
@@ -1054,8 +1096,8 @@ describe('sweepExpiredOffers', () => {
       offerExpiresAt: new Date(Date.now() - 1_000),
     });
     ctx.prisma.$seed('broadcastLog', [
-      { id: 'log-1', taskId: 'task-1', round: 1, outcome: 'EXPIRED' },
-      { id: 'log-3', taskId: 'task-1', round: 3, outcome: 'PENDING' },
+      { id: 'log-1', cycle: 1, taskId: 'task-1', round: 1, outcome: 'EXPIRED' },
+      { id: 'log-3', cycle: 1, taskId: 'task-1', round: 3, outcome: 'PENDING' },
     ]);
     return { ctx, task };
   }
@@ -1149,9 +1191,9 @@ describe('the append-only broadcast log (M5)', () => {
     const ctx = buildDispatch();
     const { task } = seedTask(ctx.prisma, { status: 'UNFULFILLED', broadcastRound: 3, feeMinor: 3000 });
     ctx.prisma.$seed('broadcastLog', [
-      { id: 'log-2', taskId: 'task-1', round: 2, outcome: 'PENDING' },
-      { id: 'log-3', taskId: 'task-1', round: 3, outcome: 'PENDING' },
-      { id: 'log-x', taskId: 'task-other', round: 1, outcome: 'PENDING' },
+      { id: 'log-2', cycle: 1, taskId: 'task-1', round: 2, outcome: 'PENDING' },
+      { id: 'log-3', cycle: 1, taskId: 'task-1', round: 3, outcome: 'PENDING' },
+      { id: 'log-x', cycle: 1, taskId: 'task-other', round: 1, outcome: 'PENDING' },
     ]);
     withTrigger(ctx);
 
@@ -1178,30 +1220,33 @@ describe('the append-only broadcast log (M5)', () => {
     expect(ctx.server.emissions).toEqual([]);
   });
 
-  it('resolves only rounds *before* the one going out — `round: { lt: newRound }`', async () => {
-    // A row is resolved when its own round is superseded. A PENDING row for a
-    // *later* round is a leftover from an earlier search that got further
-    // (a suspension returns a task to the pool without tidying the log); it
-    // will be re-opened when this search reaches that round. Stamping it
-    // EXPIRED now would record an expiry, with a time, that never happened.
+  it('closes every row still PENDING when a round goes out, except that round\'s own', async () => {
+    // Normally that is just the round before. It is also anything an earlier
+    // search left open — a suspension returns a task to the pool without
+    // tidying the log — whatever its cycle or round number.
     const ctx = buildDispatch();
-    seedTask(ctx.prisma, onOffer(1));
+    seedTask(ctx.prisma, { ...onOffer(1), broadcastCycle: 2 });
     ctx.prisma.$seed('broadcastLog', [
-      { id: 'log-1', taskId: 'task-1', round: 1, outcome: 'PENDING', resolvedAt: null },
-      { id: 'log-3', taskId: 'task-1', round: 3, outcome: 'PENDING', resolvedAt: null },
+      { id: 'log-old-3', cycle: 1, taskId: 'task-1', round: 3, outcome: 'PENDING', resolvedAt: null },
+      { id: 'log-new-1', cycle: 2, taskId: 'task-1', round: 1, outcome: 'PENDING', resolvedAt: null },
+      { id: 'log-other', cycle: 2, taskId: 'task-other', round: 1, outcome: 'PENDING', resolvedAt: null },
     ]);
 
     await ctx.service.broadcast('task-1', { round: 1 });
 
     const row = (id: string) => ctx.prisma.$rows('broadcastLog').find((l: any) => l.id === id);
-    expect(row('log-1')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
-    expect(row('log-3')).toMatchObject({ outcome: 'PENDING', resolvedAt: null });
+    expect(row('log-old-3')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+    expect(row('log-new-1')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+    expect(row('log-other')).toMatchObject({ outcome: 'PENDING', resolvedAt: null });
+    // The round that just went out is the one row left open.
+    const open = ctx.prisma.$rows('broadcastLog').filter((l: any) => l.taskId === 'task-1' && l.outcome === 'PENDING');
+    expect(open.map((l: any) => [l.cycle, l.round])).toEqual([[2, 2]]);
   });
 
   it('expires the previous round\'s pending row when the next round goes out', async () => {
     const ctx = buildDispatch();
     seedTask(ctx.prisma, onOffer(1));
-    ctx.prisma.$seed('broadcastLog', [{ id: 'log-1', taskId: 'task-1', round: 1, outcome: 'PENDING' }]);
+    ctx.prisma.$seed('broadcastLog', [{ id: 'log-1', cycle: 1, taskId: 'task-1', round: 1, outcome: 'PENDING' }]);
     withTrigger(ctx);
 
     const result = await ctx.service.broadcast('task-1', { round: 1 });
@@ -1214,4 +1259,393 @@ describe('the append-only broadcast log (M5)', () => {
     ]);
     expect(ctx.prisma.broadcastLog.deleteMany).not.toHaveBeenCalled();
   });
+});
+
+// ===========================================================================
+// A second search of the same task — broadcast_log keyed by cycle
+// ===========================================================================
+
+describe('searching for a rider a second time', () => {
+  /**
+   * A task is searched for again after a rider abandons it, a rider is
+   * suspended, or the student answers "keep waiting" to an unfulfilled
+   * search. Its rounds restart at 1.
+   *
+   * broadcast_log used to be keyed on (task, round), written with an upsert
+   * whose update branch re-opened the row. So the second search's round 1 was
+   * written *onto* the first search's round 1: same row id, `sent_at`
+   * replaced, EXPIRED back to PENDING. Three rows for four broadcasts, round
+   * 1 dated after rounds 2 and 3, and the administrator's "rounds" and
+   * "seconds to acceptance" computed from a row that described neither search.
+   *
+   * It is keyed on (task, cycle, round) now, and a search's rows are never
+   * touched by another's.
+   */
+  const T0 = new Date('2026-11-20T02:22:10.000Z');
+  const at = (seconds: number) => new Date(T0.getTime() + seconds * 1000);
+
+  /** The log of a first search that ran three rounds and found nobody. */
+  const FIRST_SEARCH = [
+    { id: 'first-1', taskId: 'task-1', cycle: 1, round: 1, radiusM: 1500, feeMinor: 2000, eligibleCount: 2, sentAt: at(0), outcome: 'EXPIRED', acceptedByUserId: null, resolvedAt: at(65) },
+    { id: 'first-2', taskId: 'task-1', cycle: 1, round: 2, radiusM: 2500, feeMinor: 2500, eligibleCount: 3, sentAt: at(65), outcome: 'EXPIRED', acceptedByUserId: null, resolvedAt: at(130) },
+    { id: 'first-3', taskId: 'task-1', cycle: 1, round: 3, radiusM: 3500, feeMinor: 3000, eligibleCount: 3, sentAt: at(130), outcome: 'EXPIRED', acceptedByUserId: null, resolvedAt: at(195) },
+  ];
+
+  /**
+   * The task as "keep waiting" leaves it: back in the pool, round 0, base
+   * fee — and on cycle 2, advanced by the statement that put it there.
+   */
+  function keptWaiting() {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, {
+      status: 'CREATED',
+      broadcastRound: 0,
+      broadcastCycle: 2,
+      firstBroadcastAt: at(0),
+      dispatchDueAt: at(200),
+    });
+    ctx.prisma.$seed('broadcastLog', FIRST_SEARCH.map((row) => ({ ...row })));
+    nearby(ctx, 'rider-1');
+    return { ctx, task };
+  }
+
+  const rows = (ctx: Ctx) => ctx.prisma.$rows('broadcastLog');
+  const firstSearchRows = (ctx: Ctx) => rows(ctx).filter((l: any) => l.cycle === 1);
+  const secondSearchRows = (ctx: Ctx) =>
+    rows(ctx)
+      .filter((l: any) => l.cycle === 2)
+      .map((l: any) => [l.round, l.outcome]);
+
+  it('does not touch a single field of the first search\'s rows', async () => {
+    const { ctx } = keptWaiting();
+
+    await ctx.service.dispatchDueTasks();
+
+    expect(firstSearchRows(ctx)).toEqual(FIRST_SEARCH);
+  });
+
+  it('records its own round 1 in a row of its own', async () => {
+    const { ctx } = keptWaiting();
+
+    await ctx.service.dispatchDueTasks();
+
+    // Four broadcasts, four rows.
+    expect(rows(ctx)).toHaveLength(4);
+    const [second] = rows(ctx).filter((l: any) => l.cycle === 2);
+    expect(second).toMatchObject({
+      taskId: 'task-1',
+      cycle: 2,
+      round: 1,
+      radiusM: 1500,
+      feeMinor: 2000,
+      eligibleCount: 1,
+      outcome: 'PENDING',
+    });
+    expect(second.id).not.toBe('first-1');
+  });
+
+  it('keeps the two searches apart through every later round', async () => {
+    const { ctx, task } = keptWaiting();
+
+    await ctx.service.dispatchDueTasks();
+    for (const round of [1, 2]) {
+      task.offerExpiresAt = new Date(Date.now() - 1_000);
+      await ctx.service.sweepExpiredOffers();
+      expect(task.broadcastRound).toBe(round + 1);
+    }
+
+    expect(firstSearchRows(ctx)).toEqual(FIRST_SEARCH);
+    expect(secondSearchRows(ctx)).toEqual([
+      [1, 'EXPIRED'],
+      [2, 'EXPIRED'],
+      [3, 'PENDING'],
+    ]);
+  });
+
+  it('marks the accepted round of the *second* search, not the first search\'s round 1', async () => {
+    const { ctx } = keptWaiting();
+    await ctx.service.dispatchDueTasks();
+
+    await ctx.service.accept('rider-1', 'task-1');
+
+    expect(firstSearchRows(ctx)).toEqual(FIRST_SEARCH);
+    expect(rows(ctx).filter((l: any) => l.outcome === 'ACCEPTED')).toEqual([
+      expect.objectContaining({ cycle: 2, round: 1, acceptedByUserId: 'rider-1', resolvedAt: expect.any(Date) }),
+    ]);
+  });
+
+  it('retires the second search without re-stamping the first', async () => {
+    const { ctx, task } = keptWaiting();
+    await ctx.service.dispatchDueTasks();
+    Object.assign(task, { broadcastRound: 3, offerExpiresAt: new Date(Date.now() - 1_000) });
+
+    await ctx.service.sweepExpiredOffers();
+
+    expect(task.status).toBe('UNFULFILLED');
+    expect(firstSearchRows(ctx)).toEqual(FIRST_SEARCH);
+    expect(secondSearchRows(ctx)).toEqual([[1, 'EXPIRED']]);
+  });
+
+  it('retires only the search that ran out — the log write is keyed on its cycle', async () => {
+    // A row of another search that is somehow still open is not this
+    // search's to close: it did not expire now, and stamping it with this
+    // moment would be a false record. (A new round going out does close it —
+    // see "closes every row still PENDING" — because then it is known to be
+    // over; a search being retired says nothing about any other.)
+    const { ctx, task } = keptWaiting();
+    Object.assign(task, { status: 'BROADCASTING', broadcastRound: 3, offerExpiresAt: new Date(Date.now() - 1_000) });
+    ctx.prisma.$seed('broadcastLog', [
+      { id: 'other-open', taskId: 'task-1', cycle: 1, round: 4, outcome: 'PENDING', resolvedAt: null },
+      { id: 'second-3', taskId: 'task-1', cycle: 2, round: 3, outcome: 'PENDING', resolvedAt: null },
+    ]);
+
+    await ctx.service.sweepExpiredOffers();
+
+    expect(task.status).toBe('UNFULFILLED');
+    const row = (id: string) => rows(ctx).find((l: any) => l.id === id);
+    expect(row('second-3')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+    expect(row('other-open')).toMatchObject({ outcome: 'PENDING', resolvedAt: null });
+  });
+
+  it('leaves the first search at cycle 1: sending a round never advances the cycle', async () => {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, { dispatchDueAt: at(0) });
+    nearby(ctx, 'rider-1');
+
+    await ctx.service.dispatchDueTasks();
+
+    expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1, broadcastCycle: 1 });
+    expect(rows(ctx).map((l: any) => [l.cycle, l.round, l.outcome])).toEqual([[1, 1, 'PENDING']]);
+  });
+
+  it('sends nothing if the task moved to a new search after it was read — `broadcastCycle`', async () => {
+    // The dispatcher read the task on cycle 1. Before its UPDATE the task
+    // was returned to the pool: same status, same round 0, new cycle. Without
+    // the cycle in the WHERE this round would be logged under the old search.
+    const { ctx, task } = keptWaiting();
+    ctx.prisma.$staleRead('task', { ...task, broadcastCycle: 1 });
+
+    const result = await ctx.service.broadcast('task-1', { round: 0 });
+
+    expect(result).toBeNull();
+    expect(task).toMatchObject({ status: 'CREATED', broadcastRound: 0, broadcastCycle: 2 });
+    expect(rows(ctx)).toEqual(FIRST_SEARCH);
+    expect(ctx.server.emissions).toEqual([]);
+  });
+
+  it('does not retire a task that is on a newer search than the one read — `broadcastCycle`', async () => {
+    // Same round number, different search: only the cycle tells them apart.
+    const { ctx, task } = keptWaiting();
+    Object.assign(task, { status: 'BROADCASTING', broadcastRound: 3, offerExpiresAt: new Date(Date.now() - 1_000) });
+    ctx.prisma.$seed('broadcastLog', [
+      { id: 'second-3', taskId: 'task-1', cycle: 2, round: 3, outcome: 'PENDING', resolvedAt: null },
+    ]);
+    const asRead = { ...task, broadcastCycle: 1 };
+    ctx.prisma.task.findMany.mockResolvedValueOnce([asRead]);
+    ctx.prisma.$staleRead('task', asRead);
+
+    await ctx.service.sweepExpiredOffers();
+
+    expect(task.status).toBe('BROADCASTING');
+    expect(rows(ctx).find((l: any) => l.id === 'second-3').outcome).toBe('PENDING');
+  });
+
+  describe('when something returned the task to the pool without advancing the cycle', () => {
+    /**
+     * Not every route back to the pool is in this module. If one forgets the
+     * cycle, the new search's round 1 meets the old search's row. The old
+     * behaviour was to overwrite it. Now the row is left exactly as it was,
+     * the round still goes out — a student is waiting — and it is logged as
+     * an error.
+     */
+    it('leaves the existing row alone, sends the round, and says so', async () => {
+      const { ctx, task } = keptWaiting();
+      task.broadcastCycle = 1;
+      const error = jest.spyOn((ctx.service as any).logger, 'error');
+
+      await ctx.service.dispatchDueTasks();
+
+      expect(rows(ctx)).toEqual(FIRST_SEARCH);
+      expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1 });
+      expect(ctx.server.roomsFor(wsEvents.TASK_OFFER)).toEqual(['user:rider-1']);
+      expect(error).toHaveBeenCalledWith(expect.stringMatching(/broadcast_cycle/));
+    });
+  });
+});
+
+describe('rebroadcastFromScratch and the cycle', () => {
+  it('advances the cycle in the statement that restarts an unfulfilled search', async () => {
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, { status: 'UNFULFILLED', broadcastRound: 3, broadcastCycle: 4 });
+
+    await ctx.service.rebroadcastFromScratch('task-1');
+
+    expect(task.broadcastCycle).toBe(5);
+    // One statement: the status and the cycle moved together.
+    const restart = ctx.prisma.task.updateMany.mock.calls
+      .map((c: any[]) => c[0])
+      .find((args: any) => args.data.status === 'CREATED');
+    expect(restart.where).toEqual({ id: 'task-1', status: 'UNFULFILLED', riderId: null });
+    expect(restart.data.broadcastCycle).toEqual({ increment: 1 });
+    expect(ctx.prisma.$rows('broadcastLog').map((l: any) => [l.cycle, l.round])).toEqual([[5, 1]]);
+  });
+
+  it('does not advance it again for a task its caller already returned to the pool', async () => {
+    // Abandonment returns the task (and advances the cycle) in its own
+    // UPDATE, then calls this to broadcast at once. One abandonment, one cycle.
+    const ctx = buildDispatch();
+    const { task } = seedTask(ctx.prisma, { status: 'CREATED', broadcastRound: 0, broadcastCycle: 2 });
+
+    await ctx.service.rebroadcastFromScratch('task-1');
+
+    expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1, broadcastCycle: 2 });
+  });
+
+  describe('closing the log of earlier searches', () => {
+    /**
+     * After returning a task to the pool this method resolves rows an earlier
+     * search left PENDING. It must never touch a row of the task's *current*
+     * cycle — and "current" has to be judged by the statement that writes,
+     * not by a check made before it.
+     *
+     * On the abandon path the task is already CREATED when this runs, so no
+     * UPDATE here holds its row. A dispatch tick is free to commit round 1 of
+     * the new search at any moment. A guard of the form "is the task still in
+     * the pool? then expire everything PENDING" can be passed just before
+     * that commit and acted on just after it — stamping the round that is
+     * live, the one riders are looking at, as EXPIRED.
+     */
+    const open = (id: string, cycle: number, round: number) => ({
+      id,
+      taskId: 'task-1',
+      cycle,
+      round,
+      outcome: 'PENDING',
+      resolvedAt: null,
+    });
+    const row = (ctx: Ctx, id: string) => ctx.prisma.$rows('broadcastLog').find((l: any) => l.id === id);
+
+    it('leaves the live round alone and closes the older search\'s, when a tick got there first', async () => {
+      // The state a moment after the race: the tick has sent round 1 of
+      // cycle 2. An earlier search also left a row open.
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma, { ...onOffer(1), broadcastCycle: 2 });
+      ctx.prisma.$seed('broadcastLog', [
+        open('older-search', 1, 3),
+        open('live-round', 2, 1),
+        { ...open('other-task', 1, 1), taskId: 'task-other' },
+      ]);
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(row(ctx, 'live-round')).toEqual(open('live-round', 2, 1));
+      expect(row(ctx, 'older-search')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+      expect(row(ctx, 'other-task')).toMatchObject({ outcome: 'PENDING', resolvedAt: null });
+      // And the task itself was not disturbed.
+      expect(task).toMatchObject({ status: 'BROADCASTING', broadcastRound: 1, broadcastCycle: 2 });
+    });
+
+    it('does not expire the live round when the tick commits at the last moment before the write', async () => {
+      // The race itself. An abandoned task is in the pool on cycle 2, with a
+      // row an earlier search left open. `tickCommits` is the dispatcher
+      // sending round 1 of cycle 2; it is made to happen at the last possible
+      // instant before this method writes to the log — after any check the
+      // method might make first, before the write. (Hooked on both things a
+      // version of this method could do immediately before writing, so the
+      // test does not depend on which it does.)
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma, { status: 'CREATED', broadcastRound: 0, broadcastCycle: 2 });
+      ctx.prisma.$seed('broadcastLog', [open('older-search', 1, 3)]);
+
+      let committed = false;
+      const tickCommits = () => {
+        if (committed) return;
+        committed = true;
+        Object.assign(task, onOffer(1));
+        ctx.prisma.$seed('broadcastLog', [open('live-round', 2, 1)]);
+      };
+
+      const count = ctx.prisma.task.count.getMockImplementation()!;
+      ctx.prisma.task.count.mockImplementation(async (args: unknown) => {
+        const pooled = await count(args);
+        tickCommits();
+        return pooled;
+      });
+      const executeRaw = ctx.prisma.$executeRaw.getMockImplementation()!;
+      ctx.prisma.$executeRaw.mockImplementation(async (...args: unknown[]) => {
+        tickCommits();
+        return executeRaw(...args);
+      });
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(committed).toBe(true);
+      expect(row(ctx, 'live-round')).toEqual(open('live-round', 2, 1));
+      expect(row(ctx, 'older-search')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+    });
+
+    it('decides "older" in the statement that writes, with no check before it', async () => {
+      // No read of the task stands between entering the transaction and the
+      // UPDATE of the log: there is nothing for a tick to slip in behind.
+      const ctx = buildDispatch();
+      seedTask(ctx.prisma, { ...onOffer(1), broadcastCycle: 2 });
+      ctx.prisma.$seed('broadcastLog', [open('older-search', 1, 3), open('live-round', 2, 1)]);
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(ctx.prisma.task.count).not.toHaveBeenCalled();
+      expect(ctx.prisma.broadcastLog.updateMany).not.toHaveBeenCalled();
+      const [sql] = ctx.prisma.$executeRaw.mock.calls.at(-1) as [TemplateStringsArray];
+      expect(sql.join('?')).toMatch(/cycle\s*<\s*\(\s*SELECT\s+broadcast_cycle\s+FROM\s+"task"/);
+    });
+
+    it('closes the search that just ran out when it restarts an unfulfilled task', async () => {
+      // The restart advances the cycle in the same transaction, so the search
+      // that was unfulfilled is now an older one.
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma, { status: 'UNFULFILLED', broadcastRound: 3, broadcastCycle: 1 });
+      ctx.prisma.$seed('broadcastLog', [open('ran-out', 1, 3)]);
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(task.broadcastCycle).toBe(2);
+      expect(row(ctx, 'ran-out')).toMatchObject({ outcome: 'EXPIRED', resolvedAt: expect.any(Date) });
+      expect(ctx.prisma.$rows('broadcastLog').filter((l: any) => l.outcome === 'PENDING').map((l: any) => [l.cycle, l.round])).toEqual([[2, 1]]);
+    });
+
+    it('never deletes', async () => {
+      const ctx = buildDispatch();
+      seedTask(ctx.prisma, { ...onOffer(1), broadcastCycle: 2 });
+      ctx.prisma.$seed('broadcastLog', [open('older-search', 1, 3)]);
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(ctx.prisma.$rows('broadcastLog')).toHaveLength(1);
+      expect(ctx.prisma.broadcastLog.deleteMany).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['ASSIGNED', 'PICKED_UP', 'CANCELLED', 'COMPLETED'])(
+    'neither restarts nor advances a %s task',
+    async (status) => {
+      const ctx = buildDispatch();
+      const { task } = seedTask(ctx.prisma, {
+        status,
+        riderId: status === 'CANCELLED' ? null : 'rider-9',
+        broadcastRound: 2,
+        broadcastCycle: 3,
+      });
+      ctx.prisma.$seed('broadcastLog', [
+        { id: 'log-2', cycle: 3, taskId: 'task-1', round: 2, outcome: 'ACCEPTED' },
+      ]);
+      const before = { ...task };
+
+      await ctx.service.rebroadcastFromScratch('task-1');
+
+      expect(task).toEqual(before);
+      expect(ctx.prisma.$rows('broadcastLog')).toEqual([
+        { id: 'log-2', cycle: 3, taskId: 'task-1', round: 2, outcome: 'ACCEPTED' },
+      ]);
+    },
+  );
 });

@@ -305,12 +305,14 @@ export class EscalationsService {
         refunded = result.refundedMinor;
       }
 
-      // Escalation released the rider already; this covers a task that
-      // escalated by another route, and only ever clears *this* task.
-      await tx.riderState.updateMany({
-        where: { userId: riderId, activeTaskId: taskId },
-        data: { activeTaskId: null },
-      });
+      // Nothing to do for rider_state. Every route into ESCALATED clears
+      // `active_task_id` in the transaction that escalates — the OTP cap
+      // (RiderService.escalate) and a rider's suspension
+      // (VerificationService.suspend) — and nothing can point a rider back
+      // at an escalated task, since `accept` only ever claims a BROADCASTING
+      // one. An UPDATE here matched no row in any reachable state; it was
+      // removed rather than left to look like a guard. A new route into
+      // ESCALATED must release the rider itself, as those two do.
 
       // Close the task's chat room to new messages, keeping its history.
       await tx.chatRoom.updateMany({

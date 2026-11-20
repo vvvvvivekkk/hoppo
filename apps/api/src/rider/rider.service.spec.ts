@@ -222,6 +222,52 @@ describe('abandonTask', () => {
     expect(world.prisma.$rows('riderReliability')[0]).toMatchObject({ userId: 'rider-1', tasksAbandoned: 1 });
   });
 
+  it('starts a new cycle in the same statement, and leaves the record of this rider\'s acceptance', async () => {
+    // The row that says "round 2 of the first search was accepted by rider-1"
+    // is history. The new search's rounds go in rows of their own.
+    const world = build({ broadcastRound: 2, broadcastCycle: 1 });
+    const accepted = {
+      id: 'log-accepted',
+      taskId: 'task-1',
+      cycle: 1,
+      round: 2,
+      outcome: 'ACCEPTED',
+      acceptedByUserId: 'rider-1',
+      sentAt: new Date('2026-11-20T02:23:15.000Z'),
+      resolvedAt: new Date('2026-11-20T02:23:40.000Z'),
+    };
+    world.prisma.$seed('broadcastLog', [
+      { id: 'log-first', taskId: 'task-1', cycle: 1, round: 1, outcome: 'EXPIRED' },
+      { ...accepted },
+    ]);
+
+    await world.rider.abandonTask(rider, 'task-1', reason);
+
+    expect(world.task.broadcastCycle).toBe(2);
+    // One UPDATE returned the task to the pool *and* advanced the cycle.
+    const returned = world.prisma.task.updateMany.mock.calls
+      .map((c: any[]) => c[0])
+      .find((args: any) => args.data.status === 'CREATED');
+    expect(returned.where).toEqual({ id: 'task-1', riderId: 'rider-1', status: 'ASSIGNED' });
+    expect(returned.data.broadcastCycle).toEqual({ increment: 1 });
+
+    const log = world.prisma.$rows('broadcastLog');
+    expect(log.find((l: any) => l.id === 'log-accepted')).toEqual(accepted);
+    expect(log.map((l: any) => [l.cycle, l.round, l.outcome])).toEqual([
+      [1, 1, 'EXPIRED'],
+      [1, 2, 'ACCEPTED'],
+      [2, 1, 'PENDING'],
+    ]);
+  });
+
+  it('advances the cycle exactly once per abandonment', async () => {
+    const world = build({ broadcastCycle: 7 });
+
+    await world.rider.abandonTask(rider, 'task-1', reason);
+
+    expect(world.task.broadcastCycle).toBe(8);
+  });
+
   it('archives the chat room and marks the rider as having left it', async () => {
     const world = build();
 
@@ -348,6 +394,22 @@ describe('submitHandoverCode: wrong codes (M1, M2)', () => {
     expect(await codeOf(world.rider.submitHandoverCode(rider, 'task-1', wrong))).toBe('OTP_INCORRECT');
 
     expect(world.task).toMatchObject({ status: 'PICKED_UP', otpAttempts: 1 });
+  });
+
+  it('escalates and releases the rider in one transaction — both or neither', async () => {
+    // EscalationsService relies on this: an ESCALATED task never still holds
+    // its rider. If the release could be lost while the escalation stayed,
+    // the rider would answer ALREADY_HOLDING_TASK until someone edited the
+    // database. Here the audit row — written after both — fails.
+    const world = carrying({ otpAttempts: 4 });
+    world.prisma.auditLog.create.mockRejectedValueOnce(new Error('audit_log unavailable'));
+
+    await expect(world.rider.submitHandoverCode(rider, 'task-1', wrong)).rejects.toThrow(
+      'audit_log unavailable',
+    );
+
+    expect(world.task.status).toBe('PICKED_UP');
+    expect(world.state.activeTaskId).toBe('task-1');
   });
 
   it('escalates on the fifth wrong code and releases the rider', async () => {

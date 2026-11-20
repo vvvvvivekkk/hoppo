@@ -80,6 +80,8 @@ export function seedTask(
     baseFeeMinor: 2000,
     feeMinor: 2000,
     broadcastRound: 0,
+    // Which search this is; advanced whenever the task returns to the pool.
+    broadcastCycle: 1,
     currentProximityM: null,
     description: null,
     reimbursementMinor: null,

@@ -11,7 +11,7 @@ import {
 } from '@hoppo/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
-import { readWalletHead } from '../wallet/wallet-ledger';
+import { lockWallets, readWalletHead } from '../wallet/wallet-ledger';
 import { DispatchGateway } from './dispatch.gateway';
 
 /**
@@ -114,7 +114,15 @@ const OFFERED_SET_SENTINEL = '-';
 const offerEntry = (search: Date | null, member: string): string =>
   search === null ? member : `${search.getTime()}:${member}`;
 
-/** How many times the offer list write is tried before the round is given up. */
+/**
+ * How many times the offer list write is tried before the round is given up.
+ *
+ * Two, and both numbers are deliberate. One would give up on the commonest
+ * failure there is — a connection that has only just been re-established —
+ * and cost the task a five-second wait for the next tick each time. More
+ * than two would hold a dispatch tick (and its task lock) on a Redis that is
+ * really down, when the next tick is going to try again anyway.
+ */
 const OFFER_LIST_WRITE_ATTEMPTS = 2;
 
 /**
@@ -289,8 +297,11 @@ export class DispatchService {
           // would both read the same "latest" and write the same balance.
           // Every wallet-writing transaction takes this same lock, and takes
           // it before its row locks so the two cannot deadlock.
+          // Taken through the ledger's own `lockWallets`, so there is one
+          // copy of the lock's key expression: a second spelling of it would
+          // be a second lock, and protect nothing.
           if (order.paymentMethod === 'WALLET') {
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${order.studentId}))`;
+            await lockWallets(tx, [order.studentId]);
           }
 
           assertOrderTransition(OrderStatus.PLACED, OrderEvent.ACCEPT_WINDOW_EXPIRED);
@@ -437,6 +448,7 @@ export class DispatchService {
         type: true,
         status: true,
         firstBroadcastAt: true,
+        broadcastCycle: true,
         requesterId: true,
         pickupLabel: true,
         pickupLatitude: true,
@@ -528,6 +540,11 @@ export class DispatchService {
     const offerExpiresAt = new Date(Date.now() + acceptanceWindowSeconds * 1000);
     const eligibleIds = eligible.map((r) => r.userId);
 
+    // Which search of this task the round belongs to, for the broadcast log.
+    // Advanced by whatever returns the task to the pool — never here: by the
+    // time a round is being sent, the search it belongs to has been decided.
+    const cycle = task.broadcastCycle;
+
     // Which search this round belongs to. Round 0 starts a new one, and its
     // start time is fixed here so the same instant goes into Redis (as the
     // stamp on each offer-list entry) and into the task row (below). It is
@@ -588,12 +605,19 @@ export class DispatchService {
       // `rider_id IS NULL` plus the status is what stops a broadcast landing
       // on top of an accept that committed a millisecond ago. The previous
       // read-then-write could do both.
+      //
+      // `broadcast_cycle` is in the WHERE for the log's sake. The round is
+      // about to be recorded under the cycle read at the top of this method;
+      // if the task has been returned to the pool since (a new search, so a
+      // new cycle), that record would be filed under the search before. Zero
+      // rows instead, and the next tick sends the round with the right cycle.
       const moved = await tx.task.updateMany({
         where: {
           id: taskId,
           status: fromStatus,
           riderId: null,
           broadcastRound: opts.round,
+          broadcastCycle: cycle,
         },
         data: {
           status: 'BROADCASTING',
@@ -609,42 +633,60 @@ export class DispatchService {
       });
       if (moved.count !== 1) return false;
 
-      // M5: the round before this one found nobody, so it is EXPIRED, not
-      // still PENDING. Left alone these rows accumulated, and the only code
-      // that ever cleared them was a DELETE the append-only trigger refuses.
+      // M5: whatever was still PENDING for this task found nobody, so it is
+      // EXPIRED. Normally that is the round before this one; it is also any
+      // row an earlier search left open (a suspension returns a task to the
+      // pool without tidying the log) — which is why this one write is not
+      // limited to the current cycle: once a new round goes out, no earlier
+      // row of this task, in any search, is still waiting on anybody. The
+      // row for the round going out now is written just below, after this.
+      // Resolved, never deleted: the table's trigger refuses DELETE.
       await tx.broadcastLog.updateMany({
-        where: { taskId, outcome: 'PENDING', round: { lt: newRound } },
+        where: { taskId, outcome: 'PENDING' },
         data: { outcome: 'EXPIRED', resolvedAt: new Date() },
       });
 
-      // FR-DLV-09 / FR-ADM-05: one row per round, so "how long to find a
-      // rider" and "how often do we fail" are answerable without guessing.
+      // FR-DLV-09 / FR-ADM-05: one row per round of each search, so "how long
+      // to find a rider" and "how often do we fail" are answerable without
+      // guessing.
       //
-      // (task_id, round) is unique and rows cannot be deleted, so a task that
-      // returns to the pool after an abandonment meets its own earlier
-      // round-1 row here. The update branch re-opens it — outcome, acceptor
-      // and timestamps included. Without that the row kept saying ACCEPTED by
-      // the rider who had since walked away.
-      await tx.broadcastLog.upsert({
-        where: { taskId_round: { taskId, round: newRound } },
-        update: {
-          eligibleCount: eligible.length,
-          radiusM,
-          feeMinor: offeredFeeMinor,
-          sentAt: new Date(),
-          outcome: 'PENDING',
-          acceptedByUserId: null,
-          resolvedAt: null,
-        },
+      // Keyed on (task, cycle, round). A task is searched for again after an
+      // abandonment, a suspension, or the student choosing to keep waiting,
+      // and its rounds restart at 1 — in a new cycle. The key used to be
+      // (task, round) alone, with an upsert whose update branch re-opened the
+      // row: so the second search's round 1 *was* the first search's round 1,
+      // same row, its `sent_at` replaced and its outcome put back to PENDING.
+      // The record of the first search was overwritten by the second, and
+      // anything computed from it — rounds sent, seconds to acceptance — was
+      // computed from a row that described neither.
+      //
+      // The update branch is now empty, on purpose. A row for this cycle and
+      // round can only already exist if something returned the task to the
+      // pool without advancing its cycle. That is a bug in whatever did, and
+      // it is reported below — but the history is not rewritten to hide it,
+      // and the round still goes out.
+      const logged = await tx.broadcastLog.upsert({
+        where: { taskId_cycle_round: { taskId, cycle, round: newRound } },
+        update: {},
         create: {
           taskId,
+          cycle,
           round: newRound,
           radiusM,
           feeMinor: offeredFeeMinor,
           eligibleCount: eligible.length,
           outcome: 'PENDING',
         },
+        select: { outcome: true },
       });
+
+      if (logged.outcome !== 'PENDING') {
+        this.logger.error(
+          `Task ${taskId} cycle ${cycle} round ${newRound} already has a resolved broadcast_log row ` +
+            `(${logged.outcome}): the task returned to the pool without its broadcast_cycle advancing. ` +
+            'The round was sent; its log row was left as it was.',
+        );
+      }
 
       return true;
     });
@@ -1266,8 +1308,18 @@ export class DispatchService {
         data: { leftAt: null, joinedAt: new Date() },
       });
 
+      // The round that was accepted, of the search that was accepted. Read
+      // here, after the conditional UPDATE made the row this rider's, rather
+      // than taken from the read at the top of the method: a task has a
+      // round 1 in every cycle, and marking another search's round 1 as
+      // ACCEPTED would credit this rider with an offer made before they were
+      // ever shown the task.
+      const assigned = await tx.task.findUniqueOrThrow({
+        where: { id: taskId },
+        select: { broadcastCycle: true, broadcastRound: true },
+      });
       await tx.broadcastLog.updateMany({
-        where: { taskId, round: task.broadcastRound },
+        where: { taskId, cycle: assigned.broadcastCycle, round: assigned.broadcastRound },
         data: { outcome: 'ACCEPTED', acceptedByUserId: userId, resolvedAt: new Date() },
       });
 
@@ -1338,7 +1390,14 @@ export class DispatchService {
   private async retireUnfulfilled(taskId: string): Promise<void> {
     const task = await this.prisma.task.findUnique({
       where: { id: taskId },
-      select: { id: true, collegeId: true, status: true, broadcastRound: true, orderId: true },
+      select: {
+        id: true,
+        collegeId: true,
+        status: true,
+        broadcastRound: true,
+        broadcastCycle: true,
+        orderId: true,
+      },
     });
 
     if (!task || task.status !== 'BROADCASTING') return;
@@ -1356,13 +1415,17 @@ export class DispatchService {
           status: 'BROADCASTING',
           riderId: null,
           broadcastRound: task.broadcastRound,
+          // The same search that was read: a task abandoned and re-offered
+          // in between is on a new cycle, and is not this one to retire.
+          broadcastCycle: task.broadcastCycle,
         },
         data: { status: 'UNFULFILLED', offerExpiresAt: null },
       });
       if (moved.count !== 1) return false;
 
+      // The search that just ran out — its rows, and nobody else's.
       await tx.broadcastLog.updateMany({
-        where: { taskId, outcome: 'PENDING' },
+        where: { taskId, cycle: task.broadcastCycle, outcome: 'PENDING' },
         data: { outcome: 'EXPIRED', resolvedAt: new Date() },
       });
 
@@ -1397,35 +1460,57 @@ export class DispatchService {
       });
       if (!task) return;
 
-      // Conditional (ADR-001): only a task nobody holds and nobody is being
-      // offered goes back to the start. This used to reset whatever it found,
-      // so a call arriving late could pull a task out from under the rider
-      // who had just accepted it — or, with a rider attached, fail the
-      // rider-presence CHECK. `baseFeeMinor` is immutable, so reading it
-      // first decides nothing.
-      const reset = await tx.task.updateMany({
-        where: { id: taskId, status: { in: ['CREATED', 'UNFULFILLED'] }, riderId: null },
+      // Conditional (ADR-001), and only from UNFULFILLED: that is the one
+      // state this method *restarts a search* from. A task that is already
+      // CREATED was returned to the pool by its caller — abandonment does it
+      // in its own conditional UPDATE — and there is nothing left to reset;
+      // it falls straight through to the broadcast below.
+      //
+      // The cycle advances in this same statement. A new search and a new
+      // `broadcast_cycle` are one fact, and written separately there would
+      // be a moment — or, after a crash, a lifetime — in which the task was
+      // being searched for again under the old search's number, and its new
+      // rounds would land on the old search's rows in broadcast_log.
+      // (Resetting from CREATED as well, as this used to, would now advance
+      // the cycle twice for one abandonment.) `baseFeeMinor` is immutable, so
+      // reading it first decides nothing.
+      await tx.task.updateMany({
+        where: { id: taskId, status: 'UNFULFILLED', riderId: null },
         data: {
           status: 'CREATED',
           broadcastRound: 0,
+          broadcastCycle: { increment: 1 },
           feeMinor: task.baseFeeMinor,
           currentProximityM: null,
           offerExpiresAt: null,
           dispatchDueAt: new Date(),
         },
       });
-      if (reset.count !== 1) return;
 
       // M5: broadcast_log is append-only — migration 20261119170100 puts a
       // BEFORE DELETE trigger on it, and UPDATE is the only change it
-      // permits. The `deleteMany` that stood here therefore raised on any
-      // task with a PENDING row: abandoning a task accepted in round 2 or
-      // later committed the abandonment and then answered 500. The rounds
-      // that found nobody are resolved as EXPIRED, which is also the truth.
-      await tx.broadcastLog.updateMany({
-        where: { taskId, outcome: 'PENDING' },
-        data: { outcome: 'EXPIRED', resolvedAt: new Date() },
-      });
+      // permits. Rows an earlier search left PENDING are resolved as EXPIRED,
+      // which is also the truth.
+      //
+      // "Earlier" is decided by this one statement: only rows whose cycle is
+      // below the task's cycle *as the statement sees it*. It never touches a
+      // row of the current search, whatever happens around it.
+      //
+      // That matters on the abandon path. The task is already CREATED when
+      // this method runs, so the UPDATE above matched nothing and holds no
+      // lock on it: a dispatch tick is free to commit round 1 of the new
+      // search at any instant. A check made first ("is the task still in the
+      // pool?") followed by "expire everything PENDING" can be passed just
+      // before that commit and acted on just after — stamping EXPIRED on the
+      // round riders are looking at. There is no check here to slip behind.
+      await tx.$executeRaw`
+        UPDATE "broadcast_log"
+        SET outcome = 'EXPIRED',
+            resolved_at = now()
+        WHERE task_id = ${taskId}
+          AND outcome = 'PENDING'
+          AND cycle < (SELECT broadcast_cycle FROM "task" WHERE id = ${taskId})
+      `;
     });
 
     // `broadcast` re-checks everything itself, and if it does nothing the

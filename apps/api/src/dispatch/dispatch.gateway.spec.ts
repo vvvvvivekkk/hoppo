@@ -100,3 +100,87 @@ describe('handleConnection and shop approval', () => {
     expect(client.disconnect).not.toHaveBeenCalled();
   });
 });
+
+// ===========================================================================
+// Connect: a deactivated college's users do not get a socket (FR-ADM-07)
+// ===========================================================================
+
+describe('handleConnection and a deactivated college', () => {
+  /**
+   * HTTP refuses every request from a user of an INACTIVE college (the JWT
+   * strategy, COLLEGE_INACTIVE). The socket handshake checked only the user's
+   * own status, so those same users — whose accounts are still ACTIVE — could
+   * connect, join their college's room, and go on receiving offers and chat.
+   */
+  function connecting(
+    ctx: ReturnType<typeof buildDispatch>,
+    user: { role?: string; collegeId?: string | null; college?: { status: string } | null },
+  ) {
+    ctx.jwt.verifyAsync.mockResolvedValue({ sub: 'user-1' });
+    ctx.prisma.$seed('user', [
+      { id: 'user-1', role: 'STUDENT', status: 'ACTIVE', collegeId: 'col-1', college: { status: 'ACTIVE' }, ...user },
+    ]);
+    return {
+      handshake: { auth: { token: 'signed' }, headers: {} },
+      data: {} as Record<string, unknown>,
+      join: jest.fn().mockResolvedValue(undefined),
+      emit: jest.fn(),
+      disconnect: jest.fn(),
+    };
+  }
+
+  it.each(['STUDENT', 'SHOP_OWNER', 'SHOP_STAFF', 'ADMIN'])(
+    'refuses a %s of an INACTIVE college, and joins no room',
+    async (role) => {
+      const ctx = buildDispatch({ shopApproved: true });
+      const client = connecting(ctx, { role, college: { status: 'INACTIVE' } });
+
+      await ctx.gateway.handleConnection(client as never);
+
+      expect(client.join).not.toHaveBeenCalled();
+      expect(client.data.user).toBeUndefined();
+      expect(client.emit).toHaveBeenCalledWith(
+        'exception',
+        expect.objectContaining({ code: 'COLLEGE_INACTIVE' }),
+      );
+      expect(client.disconnect).toHaveBeenCalledWith(true);
+    },
+  );
+
+  it('admits a user of an ACTIVE college to their rooms', async () => {
+    const ctx = buildDispatch();
+    const client = connecting(ctx, {});
+
+    await ctx.gateway.handleConnection(client as never);
+
+    expect(client.disconnect).not.toHaveBeenCalled();
+    expect(client.join.mock.calls.map((c) => c[0])).toEqual(['user:user-1', 'college:col-1']);
+  });
+
+  it('admits a super administrator, who belongs to no college', async () => {
+    const ctx = buildDispatch();
+    const client = connecting(ctx, { role: 'SUPER_ADMIN', collegeId: null, college: null });
+
+    await ctx.gateway.handleConnection(client as never);
+
+    expect(client.disconnect).not.toHaveBeenCalled();
+    expect(client.join.mock.calls.map((c) => c[0])).toEqual(['user:user-1']);
+  });
+
+  it('asks the database for the college\'s status at connect, not the token', async () => {
+    // The token was signed while the college was active. Deactivation has to
+    // take effect on the next connection without waiting for it to expire.
+    const ctx = buildDispatch();
+    const client = connecting(ctx, { college: { status: 'INACTIVE' } });
+    ctx.jwt.verifyAsync.mockResolvedValue({ sub: 'user-1', cid: 'col-1', role: 'STUDENT', ver: true });
+
+    await ctx.gateway.handleConnection(client as never);
+
+    expect(ctx.prisma.user.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ college: { select: { status: true } } }),
+      }),
+    );
+    expect(client.join).not.toHaveBeenCalled();
+  });
+});

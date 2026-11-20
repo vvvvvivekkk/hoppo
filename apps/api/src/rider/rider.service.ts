@@ -27,7 +27,7 @@ import { TenantService } from '../common/tenant/tenant.service';
 import { DispatchService } from '../dispatch/dispatch.service';
 import { DispatchGateway } from '../dispatch/dispatch.gateway';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
-import { readWalletHead } from '../wallet/wallet-ledger';
+import { lockWallets, readWalletHead } from '../wallet/wallet-ledger';
 import { acceptanceRateBps, acceptanceRatePercent } from './acceptance-rate';
 import type {
   AbandonTaskDto,
@@ -504,6 +504,12 @@ export class RiderService {
           status: 'CREATED',
           assignedAt: null,
           broadcastRound: 0,
+          // A fresh search is a new cycle, advanced here — in the statement
+          // that returns the task to the pool, so the two cannot come apart.
+          // broadcast_log is keyed on (task, cycle, round): without this the
+          // new search's round 1 would land on the row that records this
+          // rider's acceptance.
+          broadcastCycle: { increment: 1 },
           feeMinor: task!.baseFeeMinor,
           currentProximityM: null,
           offerExpiresAt: null,
@@ -1138,18 +1144,15 @@ export class RiderService {
        * makes writers to one wallet take turns; it is transaction-scoped, so
        * it releases itself on commit or rollback.
        *
-       * The call is byte-for-byte the one the orders module uses, because two
-       * different lock keys for one wallet would be no lock at all. It comes
-       * first, before the task row is touched, and the ids are sorted: every
+       * Taken through the ledger's own `lockWallets` — the one copy of the
+       * lock's key expression, shared with the orders module and the
+       * escalation refund, because two spellings of the key for one wallet
+       * would be two locks and no protection. It comes first, before the
+       * task row is touched, and `lockWallets` sorts the ids: every
        * transaction then acquires in the same order and none can deadlock
        * against another.
        */
-      const walletUserIds = [
-        ...new Set([riderId, ...(opts.walletStudentId ? [opts.walletStudentId] : [])]),
-      ].sort();
-      for (const walletUserId of walletUserIds) {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('wallet:' || ${walletUserId}))`;
-      }
+      await lockWallets(tx, [riderId, ...(opts.walletStudentId ? [opts.walletStudentId] : [])]);
 
       // DELIVERED then COMPLETED, both legal moves in the state machine —
       // reached by the handover code, or by an administrator's resolution.
