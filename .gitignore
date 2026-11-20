@@ -47,3 +47,4 @@ tmp/
 # Runtime and build junk
 dump.rdb
 __pycache__/
+shots/
