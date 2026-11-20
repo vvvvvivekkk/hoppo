@@ -1,0 +1,20 @@
+{
+  // What ships. `nest build` and the watch-mode dev server compile from here.
+  //
+  // tsconfig.json includes every file under src, tests and test support
+  // included, because the type checker and jest need to see them. Building
+  // from it meant every spec and test helper was emitted into dist, and that
+  // a spec file left half-edited stopped the dev server from starting for
+  // everyone. Excluding them here fixes both; they are still type-checked by
+  // tsconfig.typecheck.json and still run by jest.
+  "extends": "./tsconfig.json",
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test",
+    "prisma",
+    "src/**/*.spec.ts",
+    "src/**/testing/**",
+    "src/**/test/**"
+  ]
+}
