@@ -1,7 +1,7 @@
 'use client';
 
 import { useParams, useRouter } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { ApiError, type OrderDetail } from '@hoppo/api-client';
 import { formatMinor } from '@hoppo/shared';
 import { Shell } from '@/components/shell';
@@ -463,11 +463,19 @@ export default function Order() {
 
       {data.status === 'COMPLETED' && (
         <div className="mt-6 space-y-2 pb-safe">
-          <Button className="w-full" onClick={() => router.push(`/orders/${orderId}/receipt`)}>
+          <Button className="w-full" onClick={() => router.push(`/orders/${orderId}/reorder`)}>
+            Reorder this
+          </Button>
+          <Button tone="secondary" className="w-full" onClick={() => router.push(`/orders/${orderId}/receipt`)}>
             View the receipt
           </Button>
-          <Button tone="secondary" className="w-full" onClick={() => router.push('/shops')}>
-            Order again
+        </div>
+      )}
+
+      {cancelled && (
+        <div className="mt-6 space-y-2 pb-safe">
+          <Button className="w-full" onClick={() => router.push(`/orders/${orderId}/reorder`)}>
+            Reorder this
           </Button>
         </div>
       )}

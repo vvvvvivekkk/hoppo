@@ -19,7 +19,7 @@ import {
   type ReactNode,
 } from 'react';
 import { clearSessionEnd, readSessionEnd, writeSessionEnd } from './session-end';
-import { createTokenStore } from './tokens';
+import { createTokenStore, type WebTokenStore } from './tokens';
 
 interface ApiContextValue {
   api: Endpoints;
@@ -33,6 +33,15 @@ interface ApiContextValue {
    * retrying; a screen can say so instead of spinning without a word.
    */
   serverUnreachable: boolean;
+  /**
+   * Set, while `loading` is held, when the server *did* answer the question
+   * "who is signed in" and the answer was an error that is not about the
+   * session — a 500, a rate limit. Not retried automatically: it is not a
+   * connection problem, and saying "check your connection" over a broken
+   * server would be untrue. `retryLoad` asks again.
+   */
+  loadError: string | null;
+  retryLoad(): void;
   signedIn: boolean;
   /**
    * Set when the server has said this account is suspended or closed.
@@ -118,6 +127,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
    * deleted account). Every other clear is the client's, on a refusal.
    */
   const ownClear = useRef(false);
+  const tokensRef = useRef<WebTokenStore | null>(null);
 
   /**
    * Record why the server ended the session, if the error says: to storage
@@ -139,7 +149,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
   };
 
   if (!clientRef.current) {
-    const tokens = createTokenStore(() => {
+    const tokens = createTokenStore((source) => {
       // The client clears the tokens when the server refuses the session,
       // and only afterwards calls `onAuthFailure` with the reason. Reacting
       // to the clear itself announced "signed out" in the gap between the
@@ -151,9 +161,20 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       // `onAuthFailure` follows on every path, and sets the reason and the
       // signed-out state in one step, with nothing in between to observe.
       // New tokens, and a clear this provider made itself, are announced.
-      if (clientRef.current && !clientRef.current.hasSession() && !ownClear.current) return;
+      //
+      // A change made by another tab is always announced: nothing else will
+      // tell this tab that the student signed out, or in, over there.
+      if (
+        source === 'this-tab' &&
+        clientRef.current &&
+        !clientRef.current.hasSession() &&
+        !ownClear.current
+      ) {
+        return;
+      }
       setAuthVersion((v) => v + 1);
     });
+    tokensRef.current = tokens;
     clientRef.current = new ApiClient({
       baseUrl: API_URL,
       tokens,
@@ -161,10 +182,19 @@ export function ApiProvider({ children }: { children: ReactNode }) {
         // Any request can be the one that discovers a suspension or a
         // deactivated college, not only `/auth/me` — a rider mid-poll finds
         // out from `/rider/status`. Reason and sign-out together.
+        // The one case where the client's "session over" is not: the token
+        // store declined to clear because another tab had already replaced
+        // the pair (it won the refresh this tab lost). There is a session;
+        // it is just not the one that was refused. Carry on as it.
+        if (clientRef.current?.hasSession()) {
+          setAuthVersion((v) => v + 1);
+          return;
+        }
         noteSessionEnd(error);
         setUser(null);
         setLoading(false);
         setServerUnreachable(false);
+        setLoadError(null);
       },
     });
   }
@@ -192,6 +222,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
   const retryAttempt = useRef(0);
   const refreshUserRef = useRef<() => Promise<void>>(async () => {});
   const [serverUnreachable, setServerUnreachable] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const refreshUser = useCallback(async () => {
     // No tokens means no session, and there is nothing to ask the server.
@@ -209,6 +240,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       setUser(null);
       setLoading(false);
       setServerUnreachable(false);
+      setLoadError(null);
       return;
     }
 
@@ -217,7 +249,9 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       retryTimer.current = null;
     }
 
-    let retrying = false;
+    // True when the question "who is signed in" is still open after this
+    // attempt, so `loading` must not be released.
+    let holding = false;
     meInFlight.current += 1;
     try {
       const { user: me } = await api.auth.me();
@@ -231,17 +265,22 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       setUser(me);
       retryAttempt.current = 0;
       setServerUnreachable(false);
+      setLoadError(null);
       // The server has just described a live account: whatever ended an
       // earlier session in this tab is over.
       clearSessionEnd();
       setAccountBlocked(null);
       setCollegeInactive(null);
     } catch (error) {
-      noteSessionEnd(error);
+      if (!clientRef.current!.hasSession()) noteSessionEnd(error);
 
       if (error instanceof ApiError && error.isAuthFailure) {
         // A 401 is the normal state before sign-in, not something to log.
-        setUser(null);
+        // Signed out — unless the token store kept a pair another tab had
+        // just written (see `onAuthFailure`): then this refusal was of the
+        // old pair, a fresh read with the new one is already on its way,
+        // and the student is still signed in.
+        if (!clientRef.current!.hasSession()) setUser(null);
       } else {
         // The server could not be reached, which says nothing about whether
         // the session is still good. Keep whoever was signed in: this runs
@@ -258,19 +297,35 @@ export function ApiProvider({ children }: { children: ReactNode }) {
         // a little less often each time, until the server says who they are
         // or says the session is over.
         if (userRef.current === null && clientRef.current!.hasSession()) {
-          retrying = true;
-          const delay = Math.min(1000 * 2 ** retryAttempt.current, 8000);
-          retryAttempt.current += 1;
+          holding = true;
           setLoading(true);
-          setServerUnreachable(true);
-          retryTimer.current = setTimeout(() => void refreshUserRef.current(), delay);
+
+          if (error instanceof ApiError && error.status === 0) {
+            // No answer at all: the network, or a server that is down. Worth
+            // asking again unprompted, backing off to once every eight
+            // seconds and staying there for as long as it takes.
+            const delay = Math.min(1000 * 2 ** retryAttempt.current, 8000);
+            retryAttempt.current += 1;
+            setServerUnreachable(true);
+            setLoadError(null);
+            retryTimer.current = setTimeout(() => void refreshUserRef.current(), delay);
+          } else {
+            // The server answered, with something that is neither the
+            // account nor "your session is over": a 500, a 429. That is not
+            // the student's connection, and hammering a struggling server on
+            // a timer helps nobody. Say what it said and let them choose —
+            // try again, or sign out.
+            setServerUnreachable(false);
+            setLoadError(describeError(error));
+          }
         }
       }
     } finally {
       meInFlight.current -= 1;
-      if (!retrying) {
+      if (!holding) {
         setLoading(false);
         setServerUnreachable(false);
+        setLoadError(null);
       }
     }
   }, [api]);
@@ -345,29 +400,51 @@ export function ApiProvider({ children }: { children: ReactNode }) {
   );
 
   const dropSession = useCallback(async () => {
+    if (retryTimer.current) {
+      clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
+    retryAttempt.current = 0;
+
     ownClear.current = true;
     try {
-      await clientRef.current!.clearTokens();
+      // Unconditional: a deliberate sign-out removes the pair whatever it
+      // is, including one another tab has just refreshed.
+      tokensRef.current!.forceClear();
     } finally {
       ownClear.current = false;
     }
     clearSessionEnd();
     setUser(null);
+    // Whatever was being waited for, the answer no longer matters.
+    setLoading(false);
+    setServerUnreachable(false);
+    setLoadError(null);
     setAccountBlocked(null);
     setCollegeInactive(null);
   }, []);
 
   const logout = useCallback(async () => {
-    try {
-      await api.auth.logout(clientRef.current!.currentRefreshToken());
-    } catch {
-      // Signing out locally matters more than the server acknowledging it.
+    // Only when there is a session to end. A suspended student signing out
+    // of the "on hold" screen has none — the server already ended it — and
+    // the request could only come back refused.
+    if (clientRef.current!.hasSession()) {
+      try {
+        await api.auth.logout(clientRef.current!.currentRefreshToken());
+      } catch {
+        // Signing out locally matters more than the server acknowledging it.
+      }
     }
     // Last, so that a refusal of the request above (a suspended account's
     // sign-out is refused like everything else) cannot leave a reason behind
     // after the student has deliberately signed out.
     await dropSession();
   }, [api, dropSession]);
+
+  const retryLoad = useCallback(() => {
+    setLoadError(null);
+    void refreshUserRef.current();
+  }, []);
 
   const adoptUser = useCallback((next: AuthUser) => setUser(next), []);
 
@@ -379,6 +456,8 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       loading,
       signedIn: user !== null,
       serverUnreachable,
+      loadError,
+      retryLoad,
       accountBlocked,
       collegeInactive,
       login,
@@ -393,6 +472,8 @@ export function ApiProvider({ children }: { children: ReactNode }) {
       user,
       loading,
       serverUnreachable,
+      loadError,
+      retryLoad,
       accountBlocked,
       collegeInactive,
       login,

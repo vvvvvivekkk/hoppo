@@ -2,7 +2,8 @@
 
 import { useRouter } from 'next/navigation';
 import { useEffect } from 'react';
-import { AuthShell, SignOutButton } from '@/components/shell';
+import Link from 'next/link';
+import { AuthShell, SessionLoading, SignOutButton } from '@/components/shell';
 import { Banner } from '@/components/ui';
 import { useApi } from '@/lib/api';
 
@@ -34,6 +35,23 @@ export default function Suspended() {
     if (!loading && !blocked && !collegeInactive) router.replace('/');
   }, [loading, blocked, collegeInactive, router]);
 
+  // Not while the account is still being looked up. The reason on screen may
+  // be a stored one, from before an administrator lifted it; if there is a
+  // session, the server is about to say whether it still applies, and showing
+  // "your account is on hold" for that half second would be a claim nobody
+  // has checked.
+  //
+  // Nor when there turns out to be no reason at all: the effect above is
+  // already sending this visitor away, and the screen must not say "on hold"
+  // to them on the way out.
+  if (loading || (!blocked && !collegeInactive)) {
+    return (
+      <AuthShell>
+        <SessionLoading />
+      </AuthShell>
+    );
+  }
+
   // The college, not the student. Checked first and worded apart: nothing is
   // wrong with this person's account, and saying "suspended" would send them
   // to ask about a suspension that does not exist. The sentence in the banner
@@ -47,12 +65,9 @@ export default function Suspended() {
         </div>
         <p className="mt-4 text-[var(--color-ink-soft)]">
           This is about the college, not about you: your account has not been suspended. While the
-          college is inactive nobody there can sign in, order or deliver. There is nothing to do
-          here until it is switched back on.
+          college is inactive nobody there can sign in, order or deliver.
         </p>
-        <div className="mt-8">
-          <SignOutButton />
-        </div>
+        <TryAgain what="If the college has been switched back on since" />
       </AuthShell>
     );
   }
@@ -68,12 +83,43 @@ export default function Suspended() {
         </Banner>
       </div>
       <p className="mt-4 text-[var(--color-ink-soft)]">
-        Your college&apos;s Hoppo administrator can lift this. Contact them directly — there is
-        nothing to do here.
+        {blocked === 'DEACTIVATED'
+          ? 'A closed account cannot be reopened from here.'
+          : 'Your college\u2019s Hoppo administrator can lift this. Contact them directly.'}
       </p>
-      <div className="mt-8">
-        <SignOutButton />
-      </div>
+      {/* A closed account stays closed, so there is nothing to try again. */}
+      {blocked === 'DEACTIVATED' ? (
+        <div className="mt-8">
+          <SignOutButton />
+        </div>
+      ) : (
+        <TryAgain what="If it has been lifted since" />
+      )}
     </AuthShell>
+  );
+}
+
+/**
+ * The way back in.
+ *
+ * What this screen shows is what the server said last time, kept so that a
+ * reload does not lose it. It cannot know that an administrator has since
+ * reinstated the account. Without this link the only exits were "Sign out"
+ * and typing /login by hand, under copy that said nothing could be done —
+ * which stopped being true the moment the hold was lifted. Signing in asks
+ * the server afresh: it either works, or says again why not.
+ */
+function TryAgain({ what }: { what: string }) {
+  return (
+    <div className="mt-8 space-y-3">
+      <p className="text-sm text-[var(--color-ink-soft)]">{what}, signing in again will work.</p>
+      <Link
+        href="/login"
+        className="tap flex w-full items-center justify-center rounded-xl bg-[var(--color-accent)] px-5 font-semibold text-white"
+      >
+        Try signing in again
+      </Link>
+      <SignOutButton />
+    </div>
   );
 }

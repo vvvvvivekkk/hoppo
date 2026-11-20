@@ -127,6 +127,15 @@ function OrderRow({ order, live = false }: { order: MyOrder; live?: boolean }) {
                 timeStyle: 'short',
               })}
             </p>
+            {!live && (
+              <Link
+                href={`/orders/${order.id}/reorder`}
+                className="mt-2 inline-block text-sm font-semibold text-[var(--color-accent)]"
+                onClick={(e) => e.stopPropagation()}
+              >
+                Reorder
+              </Link>
+            )}
           </div>
           <div className="shrink-0 text-right">
             <p className="font-bold">{order.totalLabel}</p>

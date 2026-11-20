@@ -3,8 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect } from 'react';
 import { useApi } from '@/lib/api';
-import { AuthShell } from '@/components/shell';
-import { Spinner } from '@/components/ui';
+import { AuthShell, SessionLoading } from '@/components/shell';
 
 /**
  * S-01: the gate.
@@ -68,7 +67,9 @@ export default function Gate() {
 
   return (
     <AuthShell>
-      <Spinner label="Starting Hoppo" />
+      {/* Says so when the server cannot be reached or answers with an error,
+          and offers a way out, instead of spinning for ever. */}
+      <SessionLoading label="Starting Hoppo" />
     </AuthShell>
   );
 }

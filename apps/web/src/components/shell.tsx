@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, type ReactNode } from 'react';
-import { Spinner } from '@/components/ui';
+import { Banner, Button, Spinner } from '@/components/ui';
 import { useApi } from '@/lib/api';
 import { useCart } from '@/lib/cart';
 
@@ -48,7 +48,7 @@ export function Shell({
   const pathname = usePathname();
   const router = useRouter();
   const { itemCount } = useCart();
-  const { user, loading, serverUnreachable, accountBlocked, collegeInactive } = useApi();
+  const { user, loading, accountBlocked, collegeInactive } = useApi();
 
   const signedOut = !loading && !user;
 
@@ -83,15 +83,7 @@ export function Shell({
 
       <main className="px-3 pb-28 pt-3">
         {loading ? (
-          // Said plainly when it is the connection: a spinner that never
-          // ends, with no word of why, reads as a broken app.
-          <Spinner
-            label={
-              serverUnreachable
-                ? 'Cannot reach Hoppo. Check your connection — trying again…'
-                : 'Loading'
-            }
-          />
+          <SessionLoading />
         ) : signedOut ? (
           <Spinner label="Taking you to sign in" />
         ) : (
@@ -133,6 +125,47 @@ export function Shell({
       </nav>
     </div>
   );
+}
+
+/**
+ * What is shown while the app is finding out who is signed in.
+ *
+ * Usually a spinner for a fraction of a second. The two cases where it lasts
+ * are the reason this is a component: the server cannot be reached, or it
+ * answered with an error. Both are said in words, and both come with a way
+ * out — a spinner that never ends, with no sign-out, strands a student on a
+ * shared phone with their session still in it.
+ *
+ *  - **Unreachable**: the app keeps asking by itself; the text says so.
+ *  - **An error from the server** (a 500, a rate limit): not a connection
+ *    problem, so it is not described as one. The server's own message is
+ *    shown, and asking again is the student's decision.
+ */
+export function SessionLoading({ label = 'Loading' }: { label?: string }) {
+  const { serverUnreachable, loadError, retryLoad } = useApi();
+
+  if (loadError) {
+    return (
+      <div className="space-y-3">
+        <Banner tone="error">Hoppo could not load your account. {loadError}</Banner>
+        <Button className="w-full" onClick={retryLoad}>
+          Try again
+        </Button>
+        <SignOutButton />
+      </div>
+    );
+  }
+
+  if (serverUnreachable) {
+    return (
+      <div className="space-y-4">
+        <Spinner label="Cannot reach Hoppo. Check your connection — trying again…" />
+        <SignOutButton />
+      </div>
+    );
+  }
+
+  return <Spinner label={label} />;
 }
 
 /** A bare centred frame for the screens that come before sign-in. */

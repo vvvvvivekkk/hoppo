@@ -55,6 +55,9 @@ interface CartContextValue {
   itemCount: number;
   subtotalMinor: number;
   add(listingId: string, shopName: string, line: Omit<CartLine, 'quantity'>): void;
+  /** Replace the entire cart. Used by the reorder flow, which builds a full
+   *  cart from the API response rather than adding lines one at a time. */
+  replace(cart: Cart): void;
   setQuantity(catalogItemId: string, quantity: number): void;
   setNote(catalogItemId: string, note: string): void;
   clear(): void;
@@ -185,6 +188,8 @@ export function CartProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  const replace = useCallback((newCart: Cart) => setCart(newCart), []);
+
   const clear = useCallback(() => setCart(null), []);
 
   const value = useMemo<CartContextValue>(() => {
@@ -201,11 +206,12 @@ export function CartProvider({ children }: { children: ReactNode }) {
       itemCount: lines.reduce((sum, l) => sum + l.quantity, 0),
       subtotalMinor: lines.reduce((sum, l) => sum + l.unitPriceMinor * l.quantity, 0),
       add,
+      replace,
       setQuantity,
       setNote,
       clear,
     };
-  }, [cart, hydrated, add, setQuantity, setNote, clear]);
+  }, [cart, hydrated, add, replace, setQuantity, setNote, clear]);
 
   return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
 }
