@@ -1,7 +1,7 @@
 'use client';
 
 import { wsEvents } from '@hoppo/shared';
-import type { ApiClient, TaskOffer } from '@hoppo/api-client';
+import type { ApiClient, SocketException, TaskOffer } from '@hoppo/api-client';
 import { useEffect, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 
@@ -150,6 +150,10 @@ export function useSocket(
     setSocket(socket);
 
     let disposed = false;
+    // Set when the server has said why it is about to close the socket and
+    // the reason is one a fresh token cannot fix. From then on a kick is
+    // final for this socket: no recovery, no reconnect.
+    let refused = false;
     let kicks = 0;
     let kickTimer: ReturnType<typeof setTimeout> | null = null;
     let stableTimer: ReturnType<typeof setTimeout> | null = null;
@@ -171,6 +175,22 @@ export function useSocket(
       setSettled(true);
     });
 
+    // The gateway announces some refusals before it disconnects. A college
+    // that has been deactivated is one: every user of it is turned away, and
+    // will be on every attempt, so retrying only knocks on a closed door
+    // three more times. (The event name is Nest's literal `exception`; it is
+    // not one of the app's own events.)
+    socket.on('exception', (e: SocketException) => {
+      if (e?.code !== 'COLLEGE_INACTIVE') return;
+      refused = true;
+      // One ordinary request, now, so the student is told straight away
+      // instead of whenever the next poll happens to run: its 403 is what
+      // makes the client sign out and hand the provider the reason.
+      void client.get('/auth/me').catch(() => {
+        /* the refusal is the point; the provider has already been told */
+      });
+    });
+
     socket.on('disconnect', (reason) => {
       setConnected(false);
       setSettled(true);
@@ -179,6 +199,7 @@ export function useSocket(
       // Every other reason is a transport problem, and the library is
       // already reconnecting with backoff.
       if (reason !== 'io server disconnect') return;
+      if (refused) return;
       if (kicks >= KICK_RETRY_DELAYS_MS.length) return;
 
       const delay = KICK_RETRY_DELAYS_MS[kicks];

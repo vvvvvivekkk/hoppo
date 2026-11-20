@@ -48,7 +48,7 @@ export function Shell({
   const pathname = usePathname();
   const router = useRouter();
   const { itemCount } = useCart();
-  const { user, loading, accountBlocked } = useApi();
+  const { user, loading, serverUnreachable, accountBlocked, collegeInactive } = useApi();
 
   const signedOut = !loading && !user;
 
@@ -56,8 +56,9 @@ export function Shell({
     if (!signedOut) return;
     // A suspended account has no user either, and "your account is on hold"
     // is a different message from "please sign in".
-    router.replace(accountBlocked ? '/suspended' : '/welcome');
-  }, [signedOut, accountBlocked, router]);
+    // The same goes for a college that has been deactivated.
+    router.replace(accountBlocked || collegeInactive ? '/suspended' : '/welcome');
+  }, [signedOut, accountBlocked, collegeInactive, router]);
 
   return (
     <div className="mx-auto min-h-dvh max-w-2xl bg-[var(--color-surface-sunken)]">
@@ -82,7 +83,15 @@ export function Shell({
 
       <main className="px-3 pb-28 pt-3">
         {loading ? (
-          <Spinner label="Loading" />
+          // Said plainly when it is the connection: a spinner that never
+          // ends, with no word of why, reads as a broken app.
+          <Spinner
+            label={
+              serverUnreachable
+                ? 'Cannot reach Hoppo. Check your connection — trying again…'
+                : 'Loading'
+            }
+          />
         ) : signedOut ? (
           <Spinner label="Taking you to sign in" />
         ) : (

@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { AuthShell } from '@/components/shell';
 import { Banner, Button, Field } from '@/components/ui';
-import { blockedReason, describeError, useApi } from '@/lib/api';
+import { blockedReason, collegeInactiveReason, describeError, useApi } from '@/lib/api';
 
 /** S-03: sign in with a mobile number or email, plus a password. */
 export default function Login() {
@@ -31,7 +31,9 @@ export default function Login() {
       // FR-SVER-08: a suspended or closed account gets its own screen, which
       // says who can lift it, rather than a red line under the password box
       // that reads like a typo.
-      if (blockedReason(e)) {
+      // A deactivated college is the same kind of dead end, with a different
+      // reason, and gets the same screen.
+      if (blockedReason(e) || collegeInactiveReason(e)) {
         router.replace('/suspended');
         return;
       }

@@ -27,7 +27,7 @@ import { NameForm, PasswordForm } from '@/components/profile-forms';
  * one and otherwise does not mention it.
  */
 export default function Account() {
-  const { user, loading, client } = useApi();
+  const { user, loading, dropSession } = useApi();
   const cart = useCart();
   /** Set once the account has been deleted; from then on there is no user. */
   const [deleted, setDeleted] = useState<AccountDeletion | null>(null);
@@ -49,11 +49,57 @@ export default function Account() {
         <div className="mt-4">
           <Banner tone="success">{deleted.message}</Banner>
         </div>
+        {/* Every line below is the API's own wording, shown as it came. The
+            headings are deliberately bare: "Kept" and not "kept without your
+            details", because one of the things kept is the audit log, and the
+            caveats say plainly that old entries may still hold a name or an
+            IP address. A tidier heading here would promise more than was done. */}
         <Card className="mt-4 p-4 text-sm">
-          <p className="font-semibold">Erased</p>
-          <p className="mt-0.5 text-[var(--color-ink-soft)]">{deleted.erased.join(', ')}</p>
-          <p className="mt-3 font-semibold">Kept, without your personal details</p>
-          <p className="mt-0.5 text-[var(--color-ink-soft)]">{deleted.retained.join(', ')}</p>
+          <h2 className="font-semibold">Erased</h2>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5 text-[var(--color-ink-soft)]">
+            {deleted.erased.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+
+          <h2 className="mt-4 font-semibold">Kept</h2>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5 text-[var(--color-ink-soft)]">
+            {deleted.retained.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+
+          {/* ID photos and the profile photo live in file storage, outside
+              the database, and removing them can fail on its own. The counts
+              say whether it did. Optional-chained for an API build from
+              before the field existed. */}
+          {deleted.storedFiles && deleted.storedFiles.expected > 0 && (
+            <>
+              <h2 className="mt-4 font-semibold">Stored files</h2>
+              <p
+                className={`mt-1 ${
+                  deleted.storedFiles.removed < deleted.storedFiles.expected
+                    ? 'font-semibold text-[var(--color-waiting)]'
+                    : 'text-[var(--color-ink-soft)]'
+                }`}
+              >
+                {deleted.storedFiles.removed < deleted.storedFiles.expected
+                  ? `${deleted.storedFiles.removed} of ${deleted.storedFiles.expected} stored files (ID photos and profile photo) were removed. Some stored files could not be removed.`
+                  : `${deleted.storedFiles.removed} of ${deleted.storedFiles.expected} stored files (ID photos and profile photo) were removed.`}
+              </p>
+            </>
+          )}
+
+          {(deleted.caveats ?? []).length > 0 && (
+            <>
+              <h2 className="mt-4 font-semibold">What deletion could not do</h2>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-[var(--color-ink-soft)]">
+                {deleted.caveats.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            </>
+          )}
         </Card>
         <Link href="/welcome" className="mt-8 block">
           <Button large tone="secondary" className="w-full">
@@ -260,7 +306,7 @@ export default function Account() {
             // to tell it — a sign-out request would only be refused. This
             // drops what the phone still holds: the tokens and the cart.
             cart.clear();
-            void client.clearTokens();
+            void dropSession();
           }}
         />
       )}

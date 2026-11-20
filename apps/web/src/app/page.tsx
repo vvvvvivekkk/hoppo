@@ -19,7 +19,7 @@ import { Spinner } from '@/components/ui';
  * already fetched, so this is a redirect rather than another round trip.
  */
 export default function Gate() {
-  const { user, loading, accountBlocked } = useApi();
+  const { user, loading, accountBlocked, collegeInactive } = useApi();
   const router = useRouter();
 
   useEffect(() => {
@@ -28,7 +28,7 @@ export default function Gate() {
     // First, and before the signed-out check, because a suspended account
     // *is* signed out: the API refuses its token outright, so there is no
     // user to read a status from. The flag is the only trace of why.
-    if (accountBlocked) {
+    if (accountBlocked || collegeInactive) {
       router.replace('/suspended');
       return;
     }
@@ -64,7 +64,7 @@ export default function Gate() {
     // prompt to verify rides along on the shops list instead, and checkout
     // is where the hard stop lives.
     router.replace('/shops');
-  }, [user, loading, accountBlocked, router]);
+  }, [user, loading, accountBlocked, collegeInactive, router]);
 
   return (
     <AuthShell>
