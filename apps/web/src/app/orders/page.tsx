@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import type { MyOrder } from '@hoppo/api-client';
 import { Shell } from '@/components/shell';
 import { Banner, Button, Card, EmptyState, Spinner, Status } from '@/components/ui';
@@ -109,6 +110,7 @@ export default function Orders() {
 }
 
 function OrderRow({ order, live = false }: { order: MyOrder; live?: boolean }) {
+  const router = useRouter();
   const itemSummary = order.items
     .map((i) => (i.quantity > 1 ? `${i.quantity}× ${i.nameSnapshot}` : i.nameSnapshot))
     .join(', ');
@@ -128,13 +130,17 @@ function OrderRow({ order, live = false }: { order: MyOrder; live?: boolean }) {
               })}
             </p>
             {!live && (
-              <Link
-                href={`/orders/${order.id}/reorder`}
-                className="mt-2 inline-block text-sm font-semibold text-[var(--color-accent)]"
-                onClick={(e) => e.stopPropagation()}
+              <button
+                type="button"
+                className="mt-2 text-sm font-semibold text-[var(--color-accent)]"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  router.push(`/orders/${order.id}/reorder`);
+                }}
               >
                 Reorder
-              </Link>
+              </button>
             )}
           </div>
           <div className="shrink-0 text-right">

@@ -66,6 +66,8 @@ export interface SocketHandlers {
     code: string;
     orderReference: string | null;
   }) => void;
+  /** FR-CHAT-02: a chat message in one of the caller's order rooms. */
+  onChatMessage?: (payload: Record<string, unknown>) => void;
 }
 
 /** A task moved to a new status. Broadcast to the whole college. */
@@ -232,6 +234,7 @@ export function useSocket(
     socket.on(wsEvents.TASK_STATUS_CHANGED, (p) => handlersRef.current.onTaskStatus?.(p));
     socket.on(wsEvents.ORDER_STATUS_CHANGED, (p) => handlersRef.current.onOrderStatus?.(p));
     socket.on(wsEvents.HANDOVER_CODE_ISSUED, (p) => handlersRef.current.onHandoverCode?.(p));
+    socket.on(wsEvents.MESSAGE_NEW, (p) => handlersRef.current.onChatMessage?.(p));
 
     return () => {
       disposed = true;

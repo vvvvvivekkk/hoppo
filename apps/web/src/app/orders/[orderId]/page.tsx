@@ -388,11 +388,16 @@ export default function Order() {
               {data.rider.completedTasks} deliveries
             </p>
             {/* FR-PRIV-03: no mobile number, in either direction. Chat is the
-                channel, and it is not built yet — say so rather than show a
-                dead button. */}
-            <p className="mt-2 text-sm text-[var(--color-ink-faint)]">
-              Numbers stay private. In-app chat is coming in a later phase.
-            </p>
+                channel — only while the delivery is active. */}
+            {!completed && !cancelled && (
+              <Button
+                tone="secondary"
+                className="mt-2 w-full"
+                onClick={() => router.push(`/orders/${orderId}/chat`)}
+              >
+                Chat with rider
+              </Button>
+            )}
           </Card>
         </section>
       )}
