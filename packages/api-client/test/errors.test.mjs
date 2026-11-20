@@ -125,6 +125,37 @@ test('losing an admin race or deleting as a non-student is not an auth failure',
   }
 });
 
+test('ACCOUNT_UNAVAILABLE (a refresh refused for a non-active account) is mapped', () => {
+  // auth.service.ts refresh(): the user is missing or not ACTIVE. The API does
+  // not say which state, so the client must not guess one.
+  const e = err('ACCOUNT_UNAVAILABLE', 401);
+  assert.equal(e.isAuthFailure, true);
+  assert.equal(e.isAccountUnavailable, true);
+  assert.equal(e.accountBlocked, null);
+  // If the API ever names the state in details, it is believed.
+  const named = new ApiError(401, 'ACCOUNT_UNAVAILABLE', 'm', { status: 'DEACTIVATED' });
+  assert.equal(named.accountBlocked, 'DEACTIVATED');
+  assert.equal(new ApiError(401, 'ACCOUNT_UNAVAILABLE', 'm', { status: 'ACTIVE' }).accountBlocked, null);
+});
+
+test('isAccountUnavailable covers every "this account cannot be used" code and nothing else', () => {
+  for (const code of ['ACCOUNT_SUSPENDED', 'ACCOUNT_DEACTIVATED', 'ACCOUNT_UNAVAILABLE']) {
+    assert.equal(err(code, 401).isAccountUnavailable, true, code);
+  }
+  for (const [code, status] of [
+    ['UNAUTHENTICATED', 401],
+    ['REFRESH_INVALID', 401],
+    ['REFRESH_REUSED', 401],
+    ['REFRESH_EXPIRED', 401],
+    ['COLLEGE_INACTIVE', 403],
+  ]) {
+    const e = err(code, status);
+    assert.equal(e.isAccountUnavailable, false, code);
+    // ...but each of them does end the session.
+    assert.equal(e.isAuthFailure, true, code);
+  }
+});
+
 test('the getter removed in round two stays removed', () => {
   assert.equal('isAccountBlocked' in err('ACCOUNT_SUSPENDED', 401), false);
 });

@@ -115,6 +115,18 @@ const CONTRACT_ROUTES = [
   ['superAdmin.createAdmin', [ID, { name: 'A' }], 'POST', `/platform/colleges/${ID}/admins`, [{ name: 'A' }]],
   ['superAdmin.deactivateAdmin', [ID, 'Left the college'], 'POST', `/platform/admins/${ID}/deactivate`, [{ reason: 'Left the college' }]],
   ['superAdmin.reactivateAdmin', [ID], 'POST', `/platform/admins/${ID}/reactivate`, [{}]],
+  // Round 6: A1 reorder / settlements / wallet, A2 chat / rider presence
+  ['orders.reorder', [ID], 'GET', `/orders/${ID}/reorder`, []],
+  ['shops.settlements', [ID], 'GET', `/shops/${ID}/settlements`, [{}]],
+  ['shops.settlements', [ID, { from: '2026-11-01', to: '2026-11-20', limit: 50 }], 'GET', `/shops/${ID}/settlements`, [{ from: '2026-11-01', to: '2026-11-20', limit: 50 }]],
+  ['wallet.statement', [{ from: '2026-03-10', cursor: 'c' }], 'GET', '/wallet/statement', [{ from: '2026-03-10', cursor: 'c' }]],
+  ['wallet.earnings', [], 'GET', '/wallet/earnings', [{}]],
+  ['wallet.withdrawals', [10, 'c'], 'GET', '/wallet/withdrawals', [{ limit: 10, cursor: 'c' }]],
+  ['chat.taskMessages', [ID, { limit: 20, before: 'm' }], 'GET', `/chat/tasks/${ID}/messages`, [{ limit: 20, before: 'm' }]],
+  ['chat.orderMessages', [ID], 'GET', `/chat/orders/${ID}/messages`, [{}]],
+  ['chat.sendToTask', [ID, 'At the back gate', 'c-12345678'], 'POST', `/chat/tasks/${ID}/messages`, [{ body: 'At the back gate', clientMessageId: 'c-12345678' }]],
+  ['chat.sendToOrder', [ID, 'Two minutes.', 'c-87654321'], 'POST', `/chat/orders/${ID}/messages`, [{ body: 'Two minutes.', clientMessageId: 'c-87654321' }]],
+  ['admin.riderPresence', ['2026-11-20T00:00:00+05:30', '2026-11-21T00:00:00+05:30'], 'GET', '/admin/riders/presence', [{ from: '2026-11-20T00:00:00+05:30', to: '2026-11-21T00:00:00+05:30' }]],
   // A5-CONTRACT-admin.md section 8 (round 4)
   ['privacy.accept', ['2026-11-20'], 'POST', '/legal/privacy-notice/accept', [{ version: '2026-11-20' }]],
   ['account.updateProfile', [{ name: 'Asha K', avatarKey: null }], 'PATCH', '/account/profile', [{ name: 'Asha K', avatarKey: null }]],

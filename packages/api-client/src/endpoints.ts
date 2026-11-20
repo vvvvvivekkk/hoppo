@@ -21,6 +21,8 @@ import type {
   Catalog,
   CatalogCategory,
   CatalogItem,
+  ChatHistory,
+  ChatSendResult,
   College,
   CollegeConfig,
   CollegeConfigUpdate,
@@ -47,6 +49,9 @@ import type {
   PlatformCollege,
   PlatformCollegeCreate,
   PrivacyNotice,
+  ReorderDraft,
+  RiderEarnings,
+  RiderPresence,
   PrivacyNoticeAcceptance,
   ProfileUpdate,
   RiderStatus,
@@ -56,10 +61,15 @@ import type {
   ShopQueue,
   ShopQueueItem,
   ShopReinstatement,
+  ShopSettlementQuery,
+  ShopSettlementStatement,
   ShopSuspension,
   StudentReinstatement,
   StudentSuspension,
   VerificationQueueItem,
+  WalletStatement,
+  WalletStatementQuery,
+  WalletWithdrawals,
 } from './types';
 
 /** The API takes several statuses as one comma-separated value. */
@@ -181,6 +191,13 @@ export function endpoints(client: ApiClient) {
 
       /** D-08: the live queue. */
       queue: (listingId: string) => client.get<ShopQueue>(`/shops/${listingId}/orders`),
+
+      /**
+       * D-14: the settlement statement. Owner or ADMIN only — counter staff
+       * get `403 NOT_SHOP_OWNER`. Read-only: nothing here pays anyone.
+       */
+      settlements: (listingId: string, query: ShopSettlementQuery = {}) =>
+        client.get<ShopSettlementStatement>(`/shops/${listingId}/settlements`, { ...query }),
 
       /** D-10: orders that are over (completed and cancelled by default), a page at a time. */
       orderHistory: (listingId: string, query: ShopOrderHistoryQuery = {}) =>
@@ -443,6 +460,13 @@ export function endpoints(client: ApiClient) {
         /** The known action names, for the filter control. */
         actions: () => client.get<{ actions: string[] }>('/admin/audit-log/actions'),
       },
+
+      /**
+       * FR-ADM-05, A-14: active riders per clock hour. `from` inclusive, `to`
+       * exclusive, both ISO date-times with an offset or `Z`; at most 92 days.
+       */
+      riderPresence: (from: string, to: string) =>
+        client.get<RiderPresence>('/admin/riders/presence', { from, to }),
     },
 
     /** FR-TEN-01, FR-ADM-07, A-16, A-18. SUPER_ADMIN only: an ADMIN gets 403. */
@@ -611,6 +635,12 @@ export function endpoints(client: ApiClient) {
 
       detail: (orderId: string) => client.get<OrderDetail>(`/orders/${orderId}`),
 
+      /**
+       * S-21: a past order as a draft cart at today's prices. Places nothing;
+       * show it, let the student edit, then go through `quote` and `place`.
+       */
+      reorder: (orderId: string) => client.get<ReorderDraft>(`/orders/${orderId}/reorder`),
+
       /** FR-ORD-05 */
       cancel: (orderId: string, reason?: string) =>
         client.post<{
@@ -707,6 +737,50 @@ export function endpoints(client: ApiClient) {
           `/tasks/${taskId}/handover-code/reissue`,
           {},
         ),
+    },
+
+    /** FR-PAY-04, S-24. STUDENT, own wallet only. Read-only: nothing requests a withdrawal. */
+    wallet: {
+      /** Oldest first, like a bank statement. */
+      statement: (query: WalletStatementQuery = {}) =>
+        client.get<WalletStatement>('/wallet/statement', { ...query }),
+
+      /** Default range: the current month to date. At most 366 days. */
+      earnings: (query: { from?: string; to?: string } = {}) =>
+        client.get<RiderEarnings>('/wallet/earnings', { ...query }),
+
+      /** Newest first. */
+      withdrawals: (limit?: number, cursor?: string) =>
+        client.get<WalletWithdrawals>('/wallet/withdrawals', { limit, cursor }),
+    },
+
+    /**
+     * FR-DLV-10: text chat between the student who ordered and the rider.
+     * One conversation, reachable by its task (what the rider knows) or its
+     * order (what the student knows).
+     */
+    chat: {
+      /** Newest first; pass the previous `nextCursor` as `before` for older messages. */
+      taskMessages: (taskId: string, query: { limit?: number; before?: string } = {}) =>
+        client.get<ChatHistory>(`/chat/tasks/${taskId}/messages`, { ...query }),
+
+      orderMessages: (orderId: string, query: { limit?: number; before?: string } = {}) =>
+        client.get<ChatHistory>(`/chat/orders/${orderId}/messages`, { ...query }),
+
+      /**
+       * FR-CHAT-04: mint `clientMessageId` once per message (8 to 64
+       * characters of `A-Za-z0-9_-`; a UUID is fine) and send the SAME one on
+       * every retry. A retry answers with the stored message and
+       * `duplicate: true`; treat both as success.
+       */
+      sendToTask: (taskId: string, body: string, clientMessageId: string) =>
+        client.post<ChatSendResult>(`/chat/tasks/${taskId}/messages`, { body, clientMessageId }),
+
+      sendToOrder: (orderId: string, body: string, clientMessageId: string) =>
+        client.post<ChatSendResult>(`/chat/orders/${orderId}/messages`, {
+          body,
+          clientMessageId,
+        }),
     },
 
     uploads: {

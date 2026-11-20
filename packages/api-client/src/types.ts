@@ -675,6 +675,9 @@ export interface AdminOrderLine {
 }
 
 export interface AdminOrderBroadcastRound {
+  /** 1 is the first search; 2, 3, ... after the task went back into the pool. */
+  cycle: number;
+  /** Restarts at 1 in each search, so it is not unique within an order. */
   round: number;
   radiusM: number;
   feeMinor: number;
@@ -722,9 +725,14 @@ export interface AdminOrderDetail extends Omit<AdminOrderListItem, 'placedAt' | 
     cancelledAt: string | null;
   } | null;
   broadcast: {
+    /** Every round of every search, ordered by `cycle` then `round`. */
     rounds: AdminOrderBroadcastRound[];
+    /** Total across all searches. */
     roundsSent: number;
-    /** First round sent to assigned, in seconds; null if never assigned. */
+    /** How many separate searches there have been. */
+    searches: number;
+    roundsInLatestSearch: number;
+    /** First round of the latest search to assigned, in seconds; null if never assigned. */
     secondsToAcceptance: number | null;
   };
   /** Every ledger row for this order, oldest first. */
@@ -1405,4 +1413,337 @@ export interface PlatformAdminCreate {
   email: string;
   /** At least ten characters. There are no email invites: this is the first password. */
   password: string;
+}
+
+// ===========================================================================
+// Reorder (A1-CONTRACT-reorder.md; S-21)
+// ===========================================================================
+
+/**
+ * `GET /orders/:orderId/reorder`: a past order turned into a draft cart at
+ * today's prices. A read — nothing is placed, held or reserved. There is
+ * deliberately no delivery fee or total: send `lines` to `orders.quote`.
+ */
+export interface ReorderDraft {
+  sourceOrder: { id: string; reference: string; placedAt: string };
+  listingId: string;
+  shop: { id: string; name: string };
+  shopIsOpen: boolean;
+  /** Same values as `OrderQuote.closedReason`; null while the shop is open. */
+  closedReason: string | null;
+  /** Ready to send to `orders.quote` as `{ catalogItemId, quantity, note }`. May be empty. */
+  lines: {
+    catalogItemId: string;
+    name: string;
+    quantity: number;
+    unitPriceMinor: number;
+    lineTotalMinor: number;
+    note: string | null;
+    /** For a "was ₹60" label only: the price is never carried over. */
+    previousUnitPriceMinor: number;
+    priceChanged: boolean;
+  }[];
+  /** Items of the old order that are not in `lines`: show them to the student. */
+  unavailable: {
+    /** Null when the item was removed from the menu altogether. */
+    catalogItemId: string | null;
+    name: string;
+    quantity: number;
+    /** UNAVAILABLE: switched off for now. REMOVED: no longer on the menu. */
+    reason: 'UNAVAILABLE' | 'REMOVED';
+  }[];
+  itemsSubtotalMinor: number;
+  itemsSubtotalLabel: string;
+  anyPriceChanged: boolean;
+  /** Null when `lines` is empty. */
+  estimatedPrepMinutes: number | null;
+  /** Null if the old order used a landmark or the point is gone. */
+  suggestedDeliveryPoint: { id: string; name: string } | null;
+  /** At least one line and the shop is open. */
+  canCheckout: boolean;
+}
+
+// ===========================================================================
+// Shop settlement statement (A1-CONTRACT-settlements.md; D-14) — read-only
+// ===========================================================================
+
+export interface ShopSettlementQuery {
+  /** `YYYY-MM-DD`, inclusive, college timezone. Default: this month to date. */
+  from?: string;
+  to?: string;
+  /** Pages `lines` only; the totals always cover the whole period. */
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ShopSettlementLine {
+  orderId: string;
+  reference: string;
+  placedAt: string;
+  completedAt: string;
+  paymentMethod: PaymentMethod;
+  itemsSubtotalMinor: number;
+  itemsSubtotalLabel: string;
+  commissionMinor: number;
+  commissionLabel: string;
+  netToShopMinor: number;
+  netToShopLabel: string;
+  settledBy: 'CASH_AT_COUNTER' | 'PLATFORM';
+}
+
+/**
+ * COMPLETED orders only, dated by `completedAt`. A statement, not a payout:
+ * no route pays a shop or stores bank details, so show `payout.message`
+ * where a "Withdraw" button would go.
+ */
+export interface ShopSettlementStatement {
+  listingId: string;
+  shop: { id: string; name: string };
+  range: ReportRange;
+  basis: { status: 'COMPLETED'; date: 'completedAt' };
+  totals: {
+    ordersDelivered: number;
+    grossItemsMinor: number;
+    grossItemsLabel: string;
+    commissionMinor: number;
+    commissionLabel: string;
+    /** grossItems - commission. */
+    netEarningsMinor: number;
+    netEarningsLabel: string;
+    /** Commission / gross in basis points: 500 is 5.00%. 0 with no sales. */
+    effectiveCommissionBps: number;
+  };
+  byPaymentMethod: {
+    /** Already paid to the shop in cash at the counter; it owes the commission. */
+    cash: {
+      orders: number;
+      grossItemsMinor: number;
+      grossItemsLabel: string;
+      commissionMinor: number;
+      commissionLabel: string;
+      alreadyReceivedByShopMinor: number;
+      alreadyReceivedByShopLabel: string;
+    };
+    /** Paid from the student's wallet; the platform owes the shop. */
+    heldByPlatform: {
+      orders: number;
+      grossItemsMinor: number;
+      grossItemsLabel: string;
+      commissionMinor: number;
+      commissionLabel: string;
+      owedToShopMinor: number;
+      owedToShopLabel: string;
+    };
+  };
+  position: {
+    platformOwesShopMinor: number;
+    platformOwesShopLabel: string;
+    shopOwesPlatformMinor: number;
+    shopOwesPlatformLabel: string;
+    /** Can be negative: a shop selling mostly for cash owes commission. */
+    netPayableToShopMinor: number;
+    netPayableToShopLabel: string;
+  };
+  /** Always NOT_AVAILABLE in this release. */
+  payout: { status: 'NOT_AVAILABLE'; message: string };
+  lines: ShopSettlementLine[];
+  nextCursor: string | null;
+}
+
+// ===========================================================================
+// Wallet statement, rider earnings, withdrawals (A1-CONTRACT-wallet.md) — read-only
+// ===========================================================================
+
+export type WalletEntryType =
+  | 'DELIVERY_FEE_EARNED'
+  | 'ERRAND_REIMBURSEMENT'
+  | 'ORDER_HOLD'
+  | 'ORDER_CAPTURE'
+  | 'ORDER_RELEASE'
+  | 'WITHDRAWAL'
+  | 'ADJUSTMENT';
+
+export interface WalletStatementQuery {
+  /** `YYYY-MM-DD`, inclusive, college timezone. Both optional: the whole ledger. */
+  from?: string;
+  to?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface WalletStatementEntry {
+  id: string;
+  createdAt: string;
+  type: WalletEntryType;
+  direction: 'CREDIT' | 'DEBIT';
+  amountMinor: number;
+  amountLabel: string;
+  /**
+   * Signed: what this line did to the balance. Not always `amountMinor` — a
+   * fee collected in cash, an errand reimbursement and a capture marker are
+   * records only (0, with `affectsBalance: false`). Style those as
+   * informational, not as money in.
+   */
+  balanceChangeMinor: number;
+  affectsBalance: boolean;
+  balanceAfterMinor: number;
+  balanceAfterLabel: string;
+  note: string | null;
+  orderId: string | null;
+  orderReference: string | null;
+  taskId: string | null;
+}
+
+/** `GET /wallet/statement` (FR-PAY-04). Oldest first, like a bank statement. */
+export interface WalletStatement {
+  range: ReportRange;
+  /** Opening and closing describe the range, not the page. */
+  openingBalanceMinor: number;
+  openingBalanceLabel: string;
+  closingBalanceMinor: number;
+  closingBalanceLabel: string;
+  currentBalanceMinor: number;
+  currentBalanceLabel: string;
+  entries: WalletStatementEntry[];
+  nextCursor: string | null;
+}
+
+/** `GET /wallet/earnings` (S-24, FR-WM-08). Default range: this month to date. */
+export interface RiderEarnings {
+  range: ReportRange;
+  deliveries: number;
+  /** Always collectedInCash + creditedToWallet. */
+  feesEarnedMinor: number;
+  feesEarnedLabel: string;
+  /** Fees on cash orders: already in the rider's pocket, never withdrawable. */
+  collectedInCashMinor: number;
+  collectedInCashLabel: string;
+  creditedToWalletMinor: number;
+  creditedToWalletLabel: string;
+  /** Errand reimbursements paid to the rider in person by the requester. */
+  reimbursedDirectlyMinor: number;
+  reimbursedDirectlyLabel: string;
+  /** As of now, not of the period. */
+  wallet: {
+    balanceMinor: number;
+    balanceLabel: string;
+    minWithdrawalMinor: number;
+    minWithdrawalLabel: string;
+    /** Only "balance >= minimum": it does not mean a withdrawal can be made. */
+    meetsMinimum: boolean;
+    pendingWithdrawals: number;
+    pendingWithdrawalMinor: number;
+    pendingWithdrawalLabel: string;
+  };
+  /** Always NOT_AVAILABLE in this release: show `message` in place of a button. */
+  withdrawals: { status: 'NOT_AVAILABLE'; message: string };
+}
+
+export interface WalletWithdrawal {
+  id: string;
+  amountMinor: number;
+  amountLabel: string;
+  status: 'REQUESTED' | 'APPROVED' | 'PAID' | 'REJECTED';
+  /** Masked on purpose. */
+  destination: { bankAccountLast4: string | null; upiIdMasked: string | null };
+  requestedAt: string;
+  handledAt: string | null;
+  payoutReference: string | null;
+  rejectionNote: string | null;
+}
+
+/** `GET /wallet/withdrawals`. Newest first; empty for everyone in this release. */
+export interface WalletWithdrawals {
+  items: WalletWithdrawal[];
+  nextCursor: string | null;
+  /** False in this release: no route requests a withdrawal. */
+  canRequest: boolean;
+}
+
+// ===========================================================================
+// Chat on a delivery (A2-CONTRACT-chat.md; FR-DLV-10, FR-CHAT-04)
+// ===========================================================================
+
+export type ChatRole = 'REQUESTER' | 'RIDER';
+
+export interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderRole: ChatRole;
+  /** Plain text exactly as typed: render as text, never as HTML. Null once deleted. */
+  body: string | null;
+  deleted: boolean;
+  clientMessageId: string | null;
+  sentAt: string;
+}
+
+export interface ChatRoom {
+  taskId: string;
+  orderId: string | null;
+  roomId: string | null;
+  /** NOT_OPEN until a rider accepts; ARCHIVED once the delivery is over (read-only). */
+  state: 'NOT_OPEN' | 'OPEN' | 'ARCHIVED';
+  canSend: boolean;
+  archivedAt: string | null;
+  you: ChatRole;
+  /** No RIDER entry while NOT_OPEN. Never a mobile number. */
+  participants: { userId: string; name: string; role: ChatRole }[];
+}
+
+/** Newest first. Pass `nextCursor` as `before` for the older page. */
+export interface ChatHistory {
+  room: ChatRoom;
+  messages: ChatMessage[];
+  nextCursor: string | null;
+}
+
+/** A retry with the same `clientMessageId` returns the stored message, `duplicate: true`. */
+export interface ChatSendResult {
+  message: ChatMessage;
+  duplicate: boolean;
+}
+
+/**
+ * `message:new` (`wsEvents.MESSAGE_NEW`) as received: a message plus the
+ * conversation it belongs to. The sender's own sockets get it too, so
+ * de-duplicate on `id`.
+ */
+export interface ChatMessageEvent extends ChatMessage {
+  taskId: string;
+  orderId: string | null;
+  roomId: string;
+}
+
+/** What a client emits on `message:new` to send over the socket instead of POST. */
+export type ChatSocketSend = { body: string; clientMessageId: string } & (
+  { taskId: string; orderId?: undefined } | { orderId: string; taskId?: undefined }
+);
+
+/** The acknowledgement to `ChatSocketSend`. */
+export type ChatSocketAck =
+  | { ok: true; message: ChatMessage; duplicate: boolean }
+  | { ok: false; code: string; message: string };
+
+// ===========================================================================
+// Active riders by hour (A2-CONTRACT-rider-presence.md; FR-ADM-05, A-14)
+// ===========================================================================
+
+/**
+ * `GET /admin/riders/presence`. Counts only: no rider is ever named. The
+ * range is widened to whole UTC clock hours; bucket to local time on the
+ * client.
+ */
+export interface RiderPresence {
+  from: string;
+  to: string;
+  /**
+   * The earliest hour presence exists for, or null if none ever has. Hours
+   * before it are "not recorded", not "nobody online": render them as no-data.
+   */
+  recordedSince: string | null;
+  /** Every hour of the range, ascending, 0 where nobody was online. */
+  hours: { hourStart: string; activeRiders: number }[];
+  distinctRiders: number;
+  /** The first hour with the highest count; null when every hour is 0. */
+  peak: { hourStart: string; activeRiders: number } | null;
 }

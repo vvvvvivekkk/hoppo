@@ -37,6 +37,16 @@ import type {
   StudentSuspension,
   TaskOfferWithdrawn,
   TaskStatusEvent,
+  ChatHistory,
+  ChatMessage,
+  ChatMessageEvent,
+  ChatSendResult,
+  ReorderDraft,
+  RiderEarnings,
+  RiderPresence,
+  ShopSettlementStatement,
+  WalletStatement,
+  WalletWithdrawals,
 } from '../src';
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
@@ -202,3 +212,57 @@ assertType<Equal<AccountDeletion['caveats'], string[]>>();
 assertType<Equal<AccountDeletion['erased'], string[]>>();
 // What a NOT_DELIVERED on a wallet order returned to the student.
 assertType<Equal<EscalationResolution['refundedMinor'], number>>();
+
+// ---------------------------------------------------------------------------
+// Round six.
+// ---------------------------------------------------------------------------
+// A1 CHANGES: broadcast rounds are keyed per search.
+type Broadcast = AdminOrderDetail['broadcast'];
+assertType<Equal<Broadcast['rounds'][number]['cycle'], number>>();
+assertType<Equal<Broadcast['searches'], number>>();
+assertType<Equal<Broadcast['roundsInLatestSearch'], number>>();
+assertType<Equal<Broadcast['roundsSent'], number>>();
+
+// A1 reorder: a draft cart, never an order.
+assertType<Equal<Result<Api['orders']['reorder']>, ReorderDraft>>();
+assertType<Equal<ReorderDraft['unavailable'][number]['reason'], 'UNAVAILABLE' | 'REMOVED'>>();
+assertType<Equal<ReorderDraft['unavailable'][number]['catalogItemId'], string | null>>();
+assertType<Equal<ReorderDraft['suggestedDeliveryPoint'], { id: string; name: string } | null>>();
+assertType<Equal<'totalMinor' extends keyof ReorderDraft ? true : false, false>>();
+
+// A1 settlements: a statement; the net position may be negative, payouts are not built.
+assertType<Equal<Result<Api['shops']['settlements']>, ShopSettlementStatement>>();
+assertType<Equal<ShopSettlementStatement['payout']['status'], 'NOT_AVAILABLE'>>();
+assertType<Equal<ShopSettlementStatement['lines'][number]['settledBy'], 'CASH_AT_COUNTER' | 'PLATFORM'>>();
+assertType<Equal<ShopSettlementStatement['position']['netPayableToShopLabel'], string>>();
+assertType<Equal<ShopSettlementStatement['byPaymentMethod']['heldByPlatform']['owedToShopMinor'], number>>();
+
+// A1 wallet: statement, earnings, withdrawals — all read-only.
+type WalletApi = Api['wallet'];
+assertType<Equal<Result<WalletApi['statement']>, WalletStatement>>();
+assertType<Equal<Result<WalletApi['earnings']>, RiderEarnings>>();
+assertType<Equal<Result<WalletApi['withdrawals']>, WalletWithdrawals>>();
+assertType<Equal<WalletStatement['entries'][number]['affectsBalance'], boolean>>();
+assertType<Equal<WalletStatement['entries'][number]['orderReference'], string | null>>();
+assertType<Equal<RiderEarnings['withdrawals']['status'], 'NOT_AVAILABLE'>>();
+assertType<Equal<RiderEarnings['wallet']['meetsMinimum'], boolean>>();
+assertType<Equal<WalletWithdrawals['canRequest'], boolean>>();
+assertType<Equal<'request' extends keyof WalletApi ? true : false, false>>();
+
+// A2 chat.
+assertType<Equal<Result<Api['chat']['taskMessages']>, ChatHistory>>();
+assertType<Equal<Result<Api['chat']['orderMessages']>, ChatHistory>>();
+assertType<Equal<Result<Api['chat']['sendToTask']>, ChatSendResult>>();
+assertType<Equal<Result<Api['chat']['sendToOrder']>, ChatSendResult>>();
+assertType<Equal<ChatHistory['room']['state'], 'NOT_OPEN' | 'OPEN' | 'ARCHIVED'>>();
+assertType<Equal<ChatMessage['body'], string | null>>();
+assertType<Equal<ChatSendResult, { message: ChatMessage; duplicate: boolean }>>();
+assertType<Equal<ChatMessageEvent['taskId'], string>>();
+// The socket copy is a message with its conversation attached.
+assertType<Equal<ChatMessageEvent extends ChatMessage ? true : false, true>>();
+
+// A2 rider presence: counts only, never a rider.
+assertType<Equal<Result<Admin['riderPresence']>, RiderPresence>>();
+assertType<Equal<RiderPresence['recordedSince'], string | null>>();
+assertType<Equal<RiderPresence['peak'], { hourStart: string; activeRiders: number } | null>>();
+assertType<Equal<RiderPresence['hours'][number], { hourStart: string; activeRiders: number }>>();

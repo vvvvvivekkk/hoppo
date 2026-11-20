@@ -44,9 +44,14 @@ export class ApiError extends Error {
   get isAuthFailure(): boolean {
     return (
       this.status === 401 ||
-      ['ACCOUNT_SUSPENDED', 'ACCOUNT_DEACTIVATED', 'REFRESH_INVALID', 'REFRESH_REUSED'].includes(
-        this.code,
-      ) ||
+      [
+        'ACCOUNT_SUSPENDED',
+        'ACCOUNT_DEACTIVATED',
+        'ACCOUNT_UNAVAILABLE',
+        'REFRESH_INVALID',
+        'REFRESH_REUSED',
+        'REFRESH_EXPIRED',
+      ].includes(this.code) ||
       (this.status === 403 && this.code === 'COLLEGE_INACTIVE')
     );
   }
@@ -58,7 +63,26 @@ export class ApiError extends Error {
   get accountBlocked(): 'SUSPENDED' | 'DEACTIVATED' | null {
     if (this.code === 'ACCOUNT_SUSPENDED') return 'SUSPENDED';
     if (this.code === 'ACCOUNT_DEACTIVATED') return 'DEACTIVATED';
+    if (this.code === 'ACCOUNT_UNAVAILABLE') {
+      // The refresh route's refusal for an account that is not ACTIVE. It
+      // does not say which state, and guessing would tell someone whose
+      // account was closed that they were suspended. Believed only if the
+      // API names the state.
+      const status = (this.details as { status?: unknown } | null | undefined)?.status;
+      if (status === 'SUSPENDED' || status === 'DEACTIVATED') return status;
+    }
     return null;
+  }
+
+  /**
+   * The account cannot be used, whatever the exact state: `ACCOUNT_SUSPENDED`
+   * and `ACCOUNT_DEACTIVATED` (every request, and login) and
+   * `ACCOUNT_UNAVAILABLE` (a refresh for an account that is no longer
+   * ACTIVE). Where `accountBlocked` is null, show the API's own `message`
+   * ("This account is no longer active.") rather than a plain sign-out.
+   */
+  get isAccountUnavailable(): boolean {
+    return ['ACCOUNT_SUSPENDED', 'ACCOUNT_DEACTIVATED', 'ACCOUNT_UNAVAILABLE'].includes(this.code);
   }
 
   /**

@@ -64,8 +64,9 @@ export class ApiClient {
 
   /**
    * Why the last refresh was refused, when the API said. A refresh refused
-   * with `COLLEGE_INACTIVE` explains the sign-out better than the expired
-   * 401 that triggered it, so `onAuthFailure` is handed this instead.
+   * because of the account (`ACCOUNT_UNAVAILABLE`) or its college
+   * (`COLLEGE_INACTIVE`) explains the sign-out better than the expired 401
+   * that triggered it, so `onAuthFailure` is handed this instead.
    */
   private refreshRefusal: ApiError | null = null;
 
@@ -129,13 +130,20 @@ export class ApiClient {
       try {
         return await this.unwrap<T>(response);
       } catch (error) {
+        // The refresh route can refuse for five reasons (AuthService.refresh).
+        // Three are about the token — REFRESH_INVALID, REFRESH_REUSED,
+        // REFRESH_EXPIRED — and mean only "log in again", which the request's
+        // own 401 already says. Two are about the account or its college —
+        // ACCOUNT_UNAVAILABLE and COLLEGE_INACTIVE — and logging in again
+        // will not help; those are what the UI needs, so they are reported
+        // in place of the 401. (ACCOUNT_SUSPENDED / ACCOUNT_DEACTIVATED are
+        // covered too, should the refresh route ever answer with them.)
         const refusal = this.refreshRefusal;
+        this.refreshRefusal = null;
+        const explains =
+          refusal !== null && (refusal.isAccountUnavailable || refusal.code === 'COLLEGE_INACTIVE');
         this.options.onAuthFailure?.(
-          refusal?.code === 'COLLEGE_INACTIVE'
-            ? refusal
-            : error instanceof ApiError
-              ? error
-              : undefined,
+          explains ? refusal : error instanceof ApiError ? error : undefined,
         );
         throw error;
       }

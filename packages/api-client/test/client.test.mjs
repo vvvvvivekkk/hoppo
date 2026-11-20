@@ -122,3 +122,66 @@ test('a suspended account still ends the session through the 401 path', async ()
   assert.equal(state.failures.length, 1);
   assert.equal(state.failures[0].accountBlocked, 'SUSPENDED');
 });
+
+const EXPIRED = { code: 'UNAUTHENTICATED', message: 'expired' };
+
+// auth.service.ts refresh() can refuse with: REFRESH_INVALID, REFRESH_REUSED,
+// REFRESH_EXPIRED, ACCOUNT_UNAVAILABLE (all 401) and COLLEGE_INACTIVE (403).
+for (const code of ['ACCOUNT_UNAVAILABLE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_DEACTIVATED']) {
+  test(`a refresh refused with ${code} hands that error to onAuthFailure`, async () => {
+    const { client, state } = setup((path) =>
+      path.endsWith('/auth/refresh')
+        ? json(401, { code, message: 'This account is no longer active.' })
+        : json(401, EXPIRED),
+    );
+
+    // The request itself still fails with what it was answered.
+    await assert.rejects(client.get('/orders'), (e) => e.code === 'UNAUTHENTICATED');
+
+    assert.equal(state.tokens, null);
+    assert.equal(state.cleared, 1);
+    assert.equal(state.failures.length, 1);
+    assert.equal(state.failures[0].code, code);
+    assert.equal(state.failures[0].isAccountUnavailable, true);
+    assert.equal(state.failures[0].message, 'This account is no longer active.');
+  });
+}
+
+for (const code of ['REFRESH_INVALID', 'REFRESH_REUSED', 'REFRESH_EXPIRED']) {
+  test(`a refresh refused with ${code} is "log in again": cleared once, reported as the 401`, async () => {
+    const { client, state } = setup((path) =>
+      path.endsWith('/auth/refresh') ? json(401, { code, message: 'no' }) : json(401, EXPIRED),
+    );
+
+    await assert.rejects(client.get('/orders'), (e) => e.code === 'UNAUTHENTICATED');
+
+    // Exactly what is cleared: the token store, through TokenStore.clear(), once.
+    assert.equal(state.tokens, null);
+    assert.equal(state.cleared, 1);
+    // One onAuthFailure, carrying the request's own 401 — nothing about the account.
+    assert.equal(state.failures.length, 1);
+    assert.equal(state.failures[0].code, 'UNAUTHENTICATED');
+    assert.equal(state.failures[0].accountBlocked, null);
+    // One attempt at the request, one at the refresh, no retry.
+    assert.deepEqual(state.calls, ['/api/v1/orders', '/api/v1/auth/refresh']);
+  });
+}
+
+test('a refusal from an earlier refresh does not leak into a later sign-out', async () => {
+  let refreshAnswer = json(401, { code: 'ACCOUNT_UNAVAILABLE', message: 'gone' });
+  const { client, state } = setup((path) =>
+    path.endsWith('/auth/refresh') ? refreshAnswer : json(401, EXPIRED),
+  );
+
+  await assert.rejects(client.get('/orders'));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  // Signed in again as someone else; this time the refresh simply expired.
+  state.tokens = { accessToken: 'a2', refreshToken: 'r2' };
+  refreshAnswer = json(401, { code: 'REFRESH_EXPIRED', message: 'no' });
+  await assert.rejects(client.get('/orders'));
+
+  assert.equal(state.failures.length, 2);
+  assert.equal(state.failures[0].code, 'ACCOUNT_UNAVAILABLE');
+  assert.equal(state.failures[1].code, 'UNAUTHENTICATED');
+});
