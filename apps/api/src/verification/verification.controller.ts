@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { VerificationService } from './verification.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
+import { clampPageLimit } from '../common/pagination';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import {
   ApproveVerificationDto,
@@ -38,8 +39,14 @@ export class VerificationController {
     return this.verification.submit(user, dto);
   }
 
-  /** FR-WM-02 */
+  /**
+   * FR-WM-02. 200, not Nest's default 201 for a POST: accepting the terms is
+   * an action on the caller's own profile and creates nothing a client is
+   * given a location for — the same reasoning as the action POSTs in the
+   * orders, rider and auth controllers.
+   */
   @Post('rider-terms/accept')
+  @HttpCode(200)
   @ApiOperation({ summary: 'Accept the rider terms of service' })
   acceptRiderTerms(@CurrentUser() user: AuthenticatedUser) {
     return this.verification.acceptRiderTerms(user);
@@ -109,5 +116,38 @@ export class AdminVerificationController {
   @ApiOperation({ summary: 'Lift a suspension' })
   reinstate(@CurrentUser() user: AuthenticatedUser, @Param('studentId') studentId: string) {
     return this.verification.reinstate(user, studentId);
+  }
+}
+
+/** A-04: the student directory and one student's detail. */
+@ApiTags('admin: students')
+@Controller('admin/students')
+@Roles('ADMIN')
+export class AdminStudentsController {
+  constructor(private readonly verification: VerificationService) {}
+
+  @Get()
+  @ApiOperation({ summary: 'Find a student at my college' })
+  list(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('q') q?: string,
+    @Query('status') status?: string,
+    @Query('verificationStatus') verificationStatus?: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.verification.listStudents(user, {
+      q,
+      status,
+      verificationStatus,
+      limit: clampPageLimit(limit),
+      cursor,
+    });
+  }
+
+  @Get(':studentId')
+  @ApiOperation({ summary: 'One student: profile, standing, recent orders and tasks' })
+  detail(@CurrentUser() user: AuthenticatedUser, @Param('studentId') studentId: string) {
+    return this.verification.studentDetail(user, studentId);
   }
 }

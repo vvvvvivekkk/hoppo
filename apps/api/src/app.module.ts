@@ -15,6 +15,7 @@ import { VerificationModule } from './verification/verification.module';
 import { StorageModule } from './storage/storage.module';
 import { GeocodingModule } from './geocoding/geocoding.module';
 import { ShopsModule } from './shops/shops.module';
+import { UsersModule } from './users/users.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { DispatchModule } from './dispatch/dispatch.module';
 import { OrdersModule } from './orders/orders.module';
@@ -57,6 +58,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     AuthModule,
     VerificationModule,
     ShopsModule,
+    UsersModule,
     CatalogModule,
     DispatchModule,
     OrdersModule,

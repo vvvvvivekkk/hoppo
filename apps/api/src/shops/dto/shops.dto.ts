@@ -181,6 +181,12 @@ export class RegisterShopDto {
   @ValidateNested({ each: true })
   @Type(() => ShopDocumentInputDto)
   documents!: ShopDocumentInputDto[];
+
+  /** FR-PRIV-01: the privacy notice version the owner accepted. See RegisterDto. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  privacyNoticeVersion?: string;
 }
 
 export class RejectShopDto {

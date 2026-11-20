@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
@@ -42,6 +42,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
         role: true,
         status: true,
         studentProfile: { select: { verificationStatus: true } },
+        college: { select: { status: true } },
       },
     });
 
@@ -61,6 +62,16 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       throw new UnauthorizedException({
         code: 'ACCOUNT_DEACTIVATED',
         message: 'This account has been closed.',
+      });
+    }
+
+    // FR-ADM-07: a deactivated tenant's users are locked out at once, for the
+    // same reason a suspended account is — their tokens are still valid. A
+    // super administrator has no college and is unaffected.
+    if (user.college?.status === 'INACTIVE') {
+      throw new ForbiddenException({
+        code: 'COLLEGE_INACTIVE',
+        message: 'This college is not currently active on Hoppo.',
       });
     }
 

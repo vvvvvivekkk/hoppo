@@ -90,6 +90,16 @@ export class RegisterDto {
   @IsString()
   @IsNotEmpty({ message: 'Verify your mobile number first' })
   mobileOtpChallengeId!: string;
+
+  /**
+   * FR-PRIV-01: the `version` of the privacy notice the person was shown and
+   * accepted (GET /legal/privacy-notice). Optional until acceptance is made
+   * mandatory; when sent it must be the current version.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  privacyNoticeVersion?: string;
 }
 
 export class LoginDto {
@@ -144,4 +154,25 @@ export class LogoutDto {
   /** FR-AUTH-05: sign out on all devices. */
   @IsOptional()
   allDevices?: boolean;
+}
+
+/** S-50: change the password while signed in. */
+export class ChangePasswordDto {
+  @IsString()
+  @IsNotEmpty({ message: 'Enter your current password' })
+  @MaxLength(128)
+  currentPassword!: string;
+
+  @IsString()
+  @MinLength(10, { message: 'Use at least 10 characters' })
+  @MaxLength(128)
+  newPassword!: string;
+}
+
+/** FR-PRIV-01: accept the notice after registration. */
+export class AcceptPrivacyNoticeDto {
+  @IsString()
+  @IsNotEmpty({ message: 'Say which version of the notice you are accepting' })
+  @MaxLength(40)
+  version!: string;
 }

@@ -222,7 +222,10 @@ describe('GET /admin/college/radius', () => {
 
   it('the controller passes the caller through and is restricted to ADMIN', () => {
     const currentRadius = jest.fn().mockReturnValue({ serviceableRadiusM: 2500 });
-    const controller = new AdminCollegeController({ currentRadius } as unknown as ShopsService);
+    const controller = new AdminCollegeController(
+      { currentRadius } as unknown as ShopsService,
+      {} as never,
+    );
     const admin = user('ADMIN', 'admin-a');
 
     const handler = (controller as unknown as { radius(u: AuthenticatedUser): unknown }).radius;

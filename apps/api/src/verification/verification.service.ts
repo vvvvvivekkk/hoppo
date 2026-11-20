@@ -12,6 +12,7 @@ import { RedisService } from '../redis/redis.service';
 import { AuditAction, AuditService } from '../audit/audit.service';
 import { AuthService } from '../auth/auth.service';
 import { TenantService } from '../common/tenant/tenant.service';
+import { clampPageLimit } from '../common/pagination';
 import { DispatchGateway } from '../dispatch/dispatch.gateway';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import type {
@@ -525,11 +526,12 @@ export class VerificationService {
     }
 
     const released = await this.prisma.$transaction(async (tx) => {
+      const suspendedAt = new Date();
       await tx.user.update({
         where: { id: studentId },
         data: {
           status: 'SUSPENDED',
-          suspendedAt: new Date(),
+          suspendedAt,
           suspendedReason: dto.reason,
         },
       });
@@ -628,7 +630,12 @@ export class VerificationService {
         },
       });
 
-      return { releasedTaskId, returnedIds, escalatedIds: escalated.map((t) => t.id) };
+      return {
+        releasedTaskId,
+        returnedIds,
+        escalatedIds: escalated.map((t) => t.id),
+        suspendedAt,
+      };
     });
 
     const activeTaskId = released.releasedTaskId;
@@ -671,6 +678,10 @@ export class VerificationService {
     return {
       studentId,
       status: 'SUSPENDED',
+      // What a console needs to redraw the row without a second request.
+      reason: dto.reason,
+      suspendedAt: released.suspendedAt,
+      suspendedBy: await this.whoIs(user.userId),
       sessionsRevoked: revoked,
       taskReleased: activeTaskId,
       message: 'Account suspended. Sessions ended, work mode disabled, active task released.',
@@ -743,7 +754,256 @@ export class VerificationService {
       });
     });
 
-    return { studentId, status: 'ACTIVE', message: 'Account reinstated.' };
+    return {
+      studentId,
+      status: 'ACTIVE',
+      reinstatedAt: new Date(),
+      reinstatedBy: await this.whoIs(user.userId),
+      message: 'Account reinstated.',
+    };
+  }
+
+  /** `{ id, name }` of an administrator, for "who did this" in a response. */
+  private async whoIs(userId: string): Promise<{ id: string; name: string } | null> {
+    return this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true } });
+  }
+
+  // =======================================================================
+  // Student directory and detail (A-04)
+  // =======================================================================
+
+  /** Find a student of the caller's college. */
+  async listStudents(
+    user: AuthenticatedUser,
+    opts: {
+      q?: string;
+      status?: string;
+      verificationStatus?: string;
+      limit?: number;
+      cursor?: string;
+    },
+  ) {
+    const limit = clampPageLimit(opts.limit);
+    const q = opts.q?.trim();
+
+    const statuses = ['ACTIVE', 'SUSPENDED', 'DEACTIVATED'] as const;
+    const verifications = ['UNSUBMITTED', 'PENDING', 'VERIFIED', 'REJECTED'] as const;
+    const status = statuses.find((s) => s === opts.status);
+    const verificationStatus = verifications.find((v) => v === opts.verificationStatus);
+    if (opts.status && !status) {
+      throw new BadRequestException({
+        code: 'BAD_REQUEST',
+        message: `status must be one of: ${statuses.join(', ')}`,
+      });
+    }
+    if (opts.verificationStatus && !verificationStatus) {
+      throw new BadRequestException({
+        code: 'BAD_REQUEST',
+        message: `verificationStatus must be one of: ${verifications.join(', ')}`,
+      });
+    }
+
+    const rows = await this.prisma.user.findMany({
+      where: {
+        // C-1: the administrator's own college, always.
+        ...this.tenant.scope(user),
+        role: 'STUDENT',
+        ...(status ? { status } : {}),
+        ...(verificationStatus ? { studentProfile: { verificationStatus } } : {}),
+        ...(q
+          ? {
+              OR: [
+                { name: { contains: q, mode: 'insensitive' as const } },
+                { mobile: { contains: q } },
+                { email: { contains: q, mode: 'insensitive' as const } },
+                { studentProfile: { rollNumber: { contains: q, mode: 'insensitive' as const } } },
+              ],
+            }
+          : {}),
+      },
+      select: {
+        id: true,
+        name: true,
+        mobile: true,
+        email: true,
+        status: true,
+        createdAt: true,
+        studentProfile: {
+          select: { verificationStatus: true, rollNumber: true, department: true },
+        },
+      },
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    return {
+      items: page.map((row) => ({
+        id: row.id,
+        name: row.name,
+        mobile: row.mobile,
+        email: row.email,
+        status: row.status,
+        verificationStatus: row.studentProfile?.verificationStatus ?? null,
+        rollNumber: row.studentProfile?.rollNumber || null,
+        department: row.studentProfile?.department || null,
+        createdAt: row.createdAt,
+      })),
+      nextCursor: hasMore ? page[page.length - 1].id : null,
+    };
+  }
+
+  /**
+   * A-04: one student — profile, standing, and recent order and task history.
+   *
+   * No document URLs: identity documents are reached only through
+   * `viewDocument`, which writes an audit entry per access (NFR-S-03). The
+   * submission ids here are what that route takes.
+   */
+  async studentDetail(user: AuthenticatedUser, studentId: string) {
+    const student = await this.prisma.user.findUnique({
+      where: { id: studentId },
+      select: {
+        id: true,
+        collegeId: true,
+        role: true,
+        name: true,
+        mobile: true,
+        email: true,
+        status: true,
+        createdAt: true,
+        lastLoginAt: true,
+        mobileVerifiedAt: true,
+        suspendedAt: true,
+        suspendedReason: true,
+        studentProfile: {
+          select: {
+            rollNumber: true,
+            department: true,
+            yearOfStudy: true,
+            verificationStatus: true,
+            verifiedAt: true,
+            govtIdType: true,
+            govtIdLast4: true,
+            riderTermsAcceptedAt: true,
+          },
+        },
+        riderState: { select: { workModeOn: true, activeTaskId: true, barredUntil: true } },
+      },
+    });
+
+    // FR-TEN-03: before anything else is read about them.
+    this.tenant.assertSameTenant(user, student, 'Student');
+
+    if (student!.role !== 'STUDENT') {
+      throw new BadRequestException({
+        code: 'NOT_A_STUDENT',
+        message: 'That account is not a student account.',
+      });
+    }
+
+    const [submissions, orders, tasksRequested, tasksDelivered, recentOrders, recentTasks] =
+      await Promise.all([
+        this.prisma.verificationSubmission.findMany({
+          where: { userId: studentId },
+          select: {
+            id: true,
+            status: true,
+            submittedAt: true,
+            decidedAt: true,
+            rejectionReason: true,
+            rejectionNote: true,
+          },
+          orderBy: { submittedAt: 'desc' },
+          take: 20,
+        }),
+        this.prisma.order.count({ where: { studentId } }),
+        this.prisma.task.count({ where: { requesterId: studentId } }),
+        this.prisma.task.count({ where: { riderId: studentId, status: 'COMPLETED' } }),
+        this.prisma.order.findMany({
+          where: { studentId },
+          select: {
+            id: true,
+            reference: true,
+            status: true,
+            totalMinor: true,
+            placedAt: true,
+            shopListing: { select: { shop: { select: { name: true } } } },
+          },
+          orderBy: { placedAt: 'desc' },
+          take: 10,
+        }),
+        this.prisma.task.findMany({
+          where: { OR: [{ requesterId: studentId }, { riderId: studentId }] },
+          select: {
+            id: true,
+            type: true,
+            status: true,
+            feeMinor: true,
+            createdAt: true,
+            requesterId: true,
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }),
+      ]);
+
+    let suspension: {
+      reason: string | null;
+      suspendedAt: Date | null;
+      suspendedBy: { id: string; name: string } | null;
+    } | null = null;
+
+    if (student!.status === 'SUSPENDED') {
+      // Who suspended them is in the audit log, not on the user row.
+      const entry = await this.prisma.auditLog.findFirst({
+        where: { action: AuditAction.STUDENT_SUSPENDED, targetType: 'user', targetId: studentId },
+        orderBy: { createdAt: 'desc' },
+        select: { actor: { select: { id: true, name: true } } },
+      });
+      suspension = {
+        reason: student!.suspendedReason,
+        suspendedAt: student!.suspendedAt,
+        suspendedBy: entry?.actor ?? null,
+      };
+    }
+
+    return {
+      student: {
+        id: student!.id,
+        name: student!.name,
+        mobile: student!.mobile,
+        email: student!.email,
+        status: student!.status,
+        createdAt: student!.createdAt,
+        lastLoginAt: student!.lastLoginAt,
+        mobileVerifiedAt: student!.mobileVerifiedAt,
+      },
+      suspension,
+      profile: student!.studentProfile,
+      rider: student!.riderState,
+      submissions,
+      counts: { orders, tasksRequested, tasksDelivered },
+      recentOrders: recentOrders.map((o) => ({
+        id: o.id,
+        reference: o.reference,
+        status: o.status,
+        totalMinor: o.totalMinor,
+        createdAt: o.placedAt,
+        shopName: o.shopListing.shop.name,
+      })),
+      recentTasks: recentTasks.map((t) => ({
+        id: t.id,
+        type: t.type,
+        status: t.status,
+        role: t.requesterId === studentId ? 'REQUESTER' : 'RIDER',
+        feeMinor: t.feeMinor,
+        createdAt: t.createdAt,
+      })),
+    };
   }
 
   /**

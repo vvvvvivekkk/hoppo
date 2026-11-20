@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import {
+  AdminStudentsController,
   AdminVerificationController,
   VerificationController,
 } from './verification.controller';
@@ -13,7 +14,7 @@ import { DispatchModule } from '../dispatch/dispatch.module';
   // DispatchModule imports nothing from here or from AuthModule, so this is
   // not circular.
   imports: [AuthModule, DispatchModule],
-  controllers: [VerificationController, AdminVerificationController],
+  controllers: [VerificationController, AdminVerificationController, AdminStudentsController],
   providers: [VerificationService],
   exports: [VerificationService],
 })

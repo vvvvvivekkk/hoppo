@@ -21,6 +21,7 @@ import { GeocodingService } from '../geocoding/geocoding.service';
 import { AuditAction, AuditService } from '../audit/audit.service';
 import { TenantService } from '../common/tenant/tenant.service';
 import { clampPageLimit } from '../common/pagination';
+import { acceptedPrivacyVersion } from '../common/legal/privacy-notice';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import type {
   DistanceCheckDto,
@@ -144,6 +145,11 @@ export class ShopsService {
   // =======================================================================
 
   async register(dto: RegisterShopDto) {
+    // FR-PRIV-01, as for student registration.
+    const privacyVersion = acceptedPrivacyVersion(dto.privacyNoticeVersion, {
+      PRIVACY_ACCEPTANCE_REQUIRED: process.env.PRIVACY_ACCEPTANCE_REQUIRED,
+    });
+
     const college = await this.prisma.college.findUnique({
       where: { id: dto.collegeId },
       select: {
@@ -283,6 +289,17 @@ export class ShopsService {
           sizeBytes: d.sizeBytes ?? null,
         })),
       });
+
+      if (privacyVersion) {
+        await this.audit.recordInTransaction(tx, {
+          actorId: owner.id,
+          collegeId: college.id,
+          action: AuditAction.PRIVACY_NOTICE_ACCEPTED,
+          targetType: 'user',
+          targetId: owner.id,
+          detail: { version: privacyVersion, at: 'SHOP_REGISTRATION' },
+        });
+      }
 
       return { owner, shop, listing };
     });
@@ -642,6 +659,10 @@ export class ShopsService {
     return {
       listingId,
       status: 'SUSPENDED',
+      // What a console needs to redraw the row without a second request.
+      reason: dto.reason,
+      suspendedAt: new Date(),
+      suspendedBy: await this.whoIs(user.userId),
       inFlightOrders: inFlight,
       message:
         inFlight > 0
@@ -649,6 +670,252 @@ export class ShopsService {
               inFlight === 1 ? '' : 's'
             } already in progress will be allowed to complete.`
           : 'Shop hidden and new orders blocked.',
+    };
+  }
+
+  /**
+   * Lift a suspension: SUSPENDED back to ACTIVE.
+   *
+   * FR-SHOP-12 gives the administrator the suspension; without a way back a
+   * suspended shop could only return by registering again. The listing goes
+   * back exactly as it was — catalog, hours and rating are untouched by a
+   * suspension — and the suspension reason is cleared from `closureNote`,
+   * which is otherwise the shop's own temporary-closure message.
+   */
+  async reinstate(user: AuthenticatedUser, listingId: string) {
+    const listing = await this.prisma.shopListing.findUnique({
+      where: { id: listingId },
+      select: { id: true, collegeId: true, shopId: true, status: true, closureNote: true },
+    });
+
+    this.tenant.assertSameTenant(user, listing, 'Shop listing');
+
+    if (listing!.status !== 'SUSPENDED') {
+      throw new ConflictException({
+        code: 'NOT_SUSPENDED',
+        message: 'Only a suspended shop can be reinstated.',
+      });
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.shopListing.update({
+        where: { id: listingId },
+        data: { status: 'ACTIVE', closureNote: null },
+      });
+
+      await this.audit.recordInTransaction(tx, {
+        actorId: user.userId,
+        collegeId: listing!.collegeId,
+        action: AuditAction.SHOP_REINSTATED,
+        targetType: 'shop_listing',
+        targetId: listingId,
+        detail: { shopId: listing!.shopId, suspensionReason: listing!.closureNote },
+      });
+    });
+
+    return {
+      listingId,
+      status: 'ACTIVE',
+      reinstatedAt: new Date(),
+      reinstatedBy: await this.whoIs(user.userId),
+      message: 'Shop reinstated. It is visible to students and can receive orders again.',
+    };
+  }
+
+  /** `{ id, name }` of an administrator, for "who did this" in a response. */
+  private async whoIs(userId: string): Promise<{ id: string; name: string } | null> {
+    return this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true } });
+  }
+
+  /** The newest audit entry of one kind about one listing: who, and when. */
+  private async lastAction(listingId: string, action: string) {
+    const entry = await this.prisma.auditLog.findFirst({
+      where: { action, targetType: 'shop_listing', targetId: listingId },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true, actor: { select: { id: true, name: true } } },
+    });
+    return entry ? { at: entry.createdAt, by: entry.actor } : null;
+  }
+
+  /** A-06: every listing of the college, in any state. */
+  async adminList(
+    user: AuthenticatedUser,
+    opts: { status?: string; q?: string; limit?: number; cursor?: string },
+  ) {
+    const limit = clampPageLimit(opts.limit);
+    const statuses = ['PENDING_VERIFICATION', 'ACTIVE', 'SUSPENDED', 'REJECTED'] as const;
+    const status = statuses.find((s) => s === opts.status);
+    if (opts.status && !status) {
+      throw new BadRequestException({
+        code: 'BAD_REQUEST',
+        message: `status must be one of: ${statuses.join(', ')}`,
+      });
+    }
+    const q = opts.q?.trim();
+
+    const rows = await this.prisma.shopListing.findMany({
+      where: {
+        ...this.tenant.scope(user),
+        ...(status ? { status } : {}),
+        ...(q ? { shop: { name: { contains: q, mode: 'insensitive' } } } : {}),
+      },
+      select: {
+        id: true,
+        status: true,
+        distanceFromCollegeM: true,
+        submittedAt: true,
+        flaggedForRadiusReviewAt: true,
+        shop: { select: { id: true, name: true, category: true, locationType: true } },
+      },
+      orderBy: [{ submittedAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    return {
+      items: page.map((row) => ({
+        listingId: row.id,
+        status: row.status,
+        distanceM: row.distanceFromCollegeM,
+        submittedAt: row.submittedAt,
+        flaggedForRadiusReview: row.flaggedForRadiusReviewAt !== null,
+        shop: row.shop,
+      })),
+      nextCursor: hasMore ? page[page.length - 1].id : null,
+    };
+  }
+
+  /**
+   * A-06: one listing with everything an administrator decides on.
+   *
+   * Documents are listed by id and type only. The bytes come from
+   * `viewDocument`, which signs a short-lived URL and audits the access
+   * (NFR-S-03) — this response never carries a file key.
+   */
+  async adminDetail(user: AuthenticatedUser, listingId: string) {
+    const listing = await this.prisma.shopListing.findUnique({
+      where: { id: listingId },
+      select: {
+        id: true,
+        collegeId: true,
+        status: true,
+        distanceFromCollegeM: true,
+        flaggedForRadiusReviewAt: true,
+        submittedAt: true,
+        approvedAt: true,
+        approvedBy: { select: { id: true, name: true } },
+        rejectionReason: true,
+        rejectionNote: true,
+        closureNote: true,
+        ratingSum: true,
+        ratingCount: true,
+        college: { select: { config: { select: { serviceableRadiusM: true } } } },
+        shop: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            ownerName: true,
+            ownerMobile: true,
+            ownerEmail: true,
+            address: true,
+            city: true,
+            state: true,
+            pincode: true,
+            latitude: true,
+            longitude: true,
+            pinAdjusted: true,
+            locationType: true,
+            fssaiLicenceNumber: true,
+            gstin: true,
+            staff: {
+              select: {
+                isOwner: true,
+                user: { select: { id: true, name: true, status: true } },
+              },
+            },
+            documents: {
+              select: {
+                id: true,
+                docType: true,
+                fileName: true,
+                mimeType: true,
+                sizeBytes: true,
+                uploadedAt: true,
+              },
+              orderBy: { uploadedAt: 'asc' },
+            },
+          },
+        },
+        _count: { select: { items: true, orders: true } },
+      },
+    });
+
+    this.tenant.assertSameTenant(user, listing, 'Shop listing');
+
+    const inFlightOrders = await this.prisma.order.count({
+      where: {
+        shopListingId: listingId,
+        status: { in: ['PLACED', 'SHOP_ACCEPTED', 'PREPARING', 'READY', 'PICKED_UP'] },
+      },
+    });
+
+    const suspended =
+      listing!.status === 'SUSPENDED'
+        ? await this.lastAction(listingId, AuditAction.SHOP_SUSPENDED)
+        : null;
+
+    const radiusM = listing!.college.config?.serviceableRadiusM ?? 3000;
+    const { staff, documents, ...shop } = listing!.shop;
+
+    return {
+      listingId: listing!.id,
+      collegeId: listing!.collegeId,
+      status: listing!.status,
+      distanceM: listing!.distanceFromCollegeM,
+      distanceLabel: formatDistance(listing!.distanceFromCollegeM),
+      radiusM,
+      withinRadius: listing!.distanceFromCollegeM <= radiusM,
+      flaggedForRadiusReviewAt: listing!.flaggedForRadiusReviewAt,
+      submittedAt: listing!.submittedAt,
+      approval: listing!.approvedAt
+        ? { approvedAt: listing!.approvedAt, approvedBy: listing!.approvedBy }
+        : null,
+      rejection:
+        listing!.status === 'REJECTED'
+          ? { reason: listing!.rejectionReason, note: listing!.rejectionNote }
+          : null,
+      suspension:
+        listing!.status === 'SUSPENDED'
+          ? {
+              reason: listing!.closureNote,
+              suspendedAt: suspended?.at ?? null,
+              suspendedBy: suspended?.by ?? null,
+            }
+          : null,
+      shop,
+      staff: staff.map((s) => ({
+        userId: s.user.id,
+        name: s.user.name,
+        isOwner: s.isOwner,
+        status: s.user.status,
+      })),
+      documents,
+      counts: {
+        catalogItems: listing!._count.items,
+        orders: listing!._count.orders,
+        inFlightOrders,
+      },
+      rating: {
+        average:
+          listing!.ratingCount > 0
+            ? Number((listing!.ratingSum / listing!.ratingCount).toFixed(1))
+            : null,
+        count: listing!.ratingCount,
+      },
     };
   }
 

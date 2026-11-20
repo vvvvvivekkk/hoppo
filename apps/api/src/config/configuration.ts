@@ -60,6 +60,16 @@ const schema = z.object({
   RAZORPAY_KEY_SECRET: z.string().optional(),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
 
+  // FR-PRIV-01: the grievance contact named in the privacy notice. Optional
+  // here so development starts without one; the notice says so plainly when
+  // it is missing rather than inventing a name.
+  PRIVACY_GRIEVANCE_NAME: z.string().optional(),
+  PRIVACY_GRIEVANCE_EMAIL: z.string().email().optional(),
+  // Whether registration is refused without acceptance of the notice. Off
+  // until the signup screens send `privacyNoticeVersion`. An enum, not
+  // z.coerce.boolean(): that would read the string "false" as true.
+  PRIVACY_ACCEPTANCE_REQUIRED: z.enum(['true', 'false']).default('false'),
+
   SENTRY_DSN: z.string().optional(),
   POSTHOG_API_KEY: z.string().optional(),
 });

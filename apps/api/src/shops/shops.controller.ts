@@ -1,7 +1,25 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Put,
+  Query,
+} from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { ShopsService } from './shops.service';
+import { CollegeAdminService } from './college-admin.service';
+import {
+  CreateDeliveryPointDto,
+  ReorderDeliveryPointsDto,
+  UpdateCollegeConfigDto,
+  UpdateDeliveryPointDto,
+} from './dto/college-admin.dto';
 import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { AllowUnapprovedShop } from '../common/decorators/allow-unapproved-shop.decorator';
@@ -137,6 +155,26 @@ export class AdminShopsController {
     return this.shops.queue(user, clampPageLimit(limit), cursor);
   }
 
+  /** A-06: every listing of my college, whatever its state. */
+  @Get()
+  @ApiOperation({ summary: 'All shop listings of my college, filterable by status and name' })
+  list(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('status') status?: string,
+    @Query('q') q?: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.shops.adminList(user, { status, q, limit: clampPageLimit(limit), cursor });
+  }
+
+  /** A-06 */
+  @Get(':listingId')
+  @ApiOperation({ summary: 'One shop listing: status, owner, documents, counts' })
+  detail(@CurrentUser() user: AuthenticatedUser, @Param('listingId') listingId: string) {
+    return this.shops.adminDetail(user, listingId);
+  }
+
   /** NFR-S-03: access is logged. */
   @Get(':listingId/documents/:documentId')
   @ApiOperation({ summary: 'A signed URL for one shop document (access is audited)' })
@@ -175,6 +213,14 @@ export class AdminShopsController {
   ) {
     return this.shops.suspend(user, listingId, dto);
   }
+
+  /** The way back from FR-SHOP-12's suspension. */
+  @Post(':listingId/reinstate')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Lift a shop suspension' })
+  reinstate(@CurrentUser() user: AuthenticatedUser, @Param('listingId') listingId: string) {
+    return this.shops.reinstate(user, listingId);
+  }
 }
 
 /** College configuration (A-09). */
@@ -182,7 +228,24 @@ export class AdminShopsController {
 @Controller('admin/college')
 @Roles('ADMIN')
 export class AdminCollegeController {
-  constructor(private readonly shops: ShopsService) {}
+  constructor(
+    private readonly shops: ShopsService,
+    private readonly college: CollegeAdminService,
+  ) {}
+
+  /** FR-ADM-03 */
+  @Get('config')
+  @ApiOperation({ summary: "My college's settings, fee bands and the permitted ranges" })
+  config(@CurrentUser() user: AuthenticatedUser) {
+    return this.college.getConfig(user);
+  }
+
+  /** FR-ADM-03. Every change is audited with before and after (FR-ADM-06). */
+  @Patch('config')
+  @ApiOperation({ summary: "Change my college's settings and fee bands" })
+  updateConfig(@CurrentUser() user: AuthenticatedUser, @Body() dto: UpdateCollegeConfigDto) {
+    return this.college.updateConfig(user, dto);
+  }
 
   /**
    * FR-TEN-04: the radius as it stands, so the settings screen can show it
@@ -206,5 +269,67 @@ export class AdminCollegeController {
   @ApiOperation({ summary: 'Approved shops now outside the radius, flagged for review' })
   flagged(@CurrentUser() user: AuthenticatedUser) {
     return this.shops.flaggedForRadiusReview(user);
+  }
+}
+
+/**
+ * Campus delivery points (FR-ORD-02, A-10).
+ *
+ * No DELETE route, deliberately: orders keep the id of the point they were
+ * delivered to, so a point is retired by deactivating it.
+ */
+@ApiTags('admin: delivery points')
+@Controller('admin/delivery-points')
+@Roles('ADMIN')
+export class AdminDeliveryPointsController {
+  constructor(private readonly college: CollegeAdminService) {}
+
+  @Get()
+  @ApiOperation({ summary: 'Every delivery point of my college, inactive ones included' })
+  list(@CurrentUser() user: AuthenticatedUser) {
+    return this.college.listDeliveryPoints(user);
+  }
+
+  @Post()
+  @ApiOperation({ summary: 'Add a delivery point' })
+  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateDeliveryPointDto) {
+    return this.college.createDeliveryPoint(user, dto);
+  }
+
+  // Declared before the `:pointId` routes so "order" is never read as an id.
+  @Put('order')
+  @ApiOperation({ summary: 'Set the display order of every delivery point' })
+  reorder(@CurrentUser() user: AuthenticatedUser, @Body() dto: ReorderDeliveryPointsDto) {
+    return this.college.reorderDeliveryPoints(user, dto.pointIds);
+  }
+
+  @Patch(':pointId')
+  @ApiOperation({ summary: 'Rename or move a delivery point' })
+  update(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('pointId', ParseUUIDPipe) pointId: string,
+    @Body() dto: UpdateDeliveryPointDto,
+  ) {
+    return this.college.updateDeliveryPoint(user, pointId, dto);
+  }
+
+  @Post(':pointId/deactivate')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Retire a delivery point (its order history is kept)' })
+  deactivate(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('pointId', ParseUUIDPipe) pointId: string,
+  ) {
+    return this.college.setDeliveryPointActive(user, pointId, false);
+  }
+
+  @Post(':pointId/activate')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Bring a retired delivery point back' })
+  activate(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('pointId', ParseUUIDPipe) pointId: string,
+  ) {
+    return this.college.setDeliveryPointActive(user, pointId, true);
   }
 }

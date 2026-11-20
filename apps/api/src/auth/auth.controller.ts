@@ -1,14 +1,19 @@
 import { Body, Controller, Get, HttpCode, Post, Query, Req } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
+import { ConfigService } from '@nestjs/config';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Public } from '../common/decorators/public.decorator';
+import { privacyNotice } from '../common/legal/privacy-notice';
+import { readMe } from './me';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AllowUnapprovedShop } from '../common/decorators/allow-unapproved-shop.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user';
 import {
+  AcceptPrivacyNoticeDto,
+  ChangePasswordDto,
   LoginDto,
   LogoutDto,
   RefreshDto,
@@ -163,36 +168,74 @@ export class AuthController {
   @Get('me')
   @ApiOperation({ summary: 'The authenticated user' })
   async me(@CurrentUser() user: AuthenticatedUser) {
-    const record = await this.prisma.user.findUnique({
-      where: { id: user.userId },
-      select: {
-        id: true,
-        name: true,
-        mobile: true,
-        email: true,
-        role: true,
-        status: true,
-        avatarUrl: true,
-        createdAt: true,
-        college: { select: { id: true, name: true, shortName: true } },
-        studentProfile: {
-          select: {
-            rollNumber: true,
-            department: true,
-            yearOfStudy: true,
-            verificationStatus: true,
-            verifiedAt: true,
-            riderTermsAcceptedAt: true,
-            // Deliberately absent: idCardUrl, govtIdLast4. C-3 and NFR-S-03
-            // keep identity documents off every student-facing response.
-          },
-        },
-        riderState: {
-          select: { workModeOn: true, activeTaskId: true, barredUntil: true },
-        },
-      },
-    });
+    return readMe(this.prisma, user.userId);
+  }
 
-    return { user: record };
+  /**
+   * Change my password while signed in (S-50).
+   *
+   * The current password is required: a signed-in session alone — a phone
+   * left unlocked — must not be enough to take the account over. Every
+   * existing session is ended and a fresh token pair returned, so the device
+   * that made the change carries on and every other device has to log in
+   * with the new password.
+   */
+  @AllowUnapprovedShop()
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('password/change')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Change my password; ends my other sessions' })
+  changePassword(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: ChangePasswordDto,
+    @Req() req: Request,
+  ) {
+    return this.auth.changePassword(user.userId, dto, this.ctx(req));
+  }
+}
+
+/**
+ * FR-PRIV-01: the privacy notice shown at registration.
+ *
+ * Public, because it is read before anyone has an account.
+ */
+@ApiTags('legal')
+@Controller('legal')
+export class LegalController {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly auth: AuthService,
+  ) {}
+
+  /**
+   * Accept the current notice after registration: for accounts that predate
+   * the notice, and for everyone when its version changes.
+   *
+   * Any signed-in role, including a shop account still awaiting approval.
+   */
+  @AllowUnapprovedShop()
+  @Post('privacy-notice/accept')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Record my acceptance of the current privacy notice' })
+  accept(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: AcceptPrivacyNoticeDto,
+    @Req() req: Request,
+  ) {
+    return this.auth.acceptPrivacyNotice(user, dto.version, {
+      ipAddress: req.ip ?? null,
+      userAgent: req.get('user-agent') ?? null,
+    });
+  }
+
+  @Public()
+  @Get('privacy-notice')
+  @ApiOperation({ summary: 'The current privacy notice and its version' })
+  privacyNotice() {
+    return privacyNotice({
+      PRIVACY_GRIEVANCE_NAME: this.config.get<string>('PRIVACY_GRIEVANCE_NAME'),
+      PRIVACY_GRIEVANCE_EMAIL: this.config.get<string>('PRIVACY_GRIEVANCE_EMAIL'),
+      PRIVACY_ACCEPTANCE_REQUIRED: this.config.get<string>('PRIVACY_ACCEPTANCE_REQUIRED'),
+    });
   }
 }

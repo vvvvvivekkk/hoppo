@@ -118,4 +118,60 @@ describe('JwtStrategy and shop approval', () => {
     });
     expect(shopAccess.hasApprovedShop).not.toHaveBeenCalled();
   });
+
+  // FR-ADM-07: deactivating a tenant locks its users out at once.
+  it('refuses any account of a deactivated college, with a code', async () => {
+    for (const role of ['STUDENT', 'ADMIN', 'SHOP_OWNER']) {
+      const { strategy, shopAccess } = build(
+        {
+          id: 'u1',
+          collegeId: 'college-a',
+          role,
+          status: 'ACTIVE',
+          studentProfile: null,
+          college: { status: 'INACTIVE' },
+        },
+        true,
+      );
+
+      await expect(strategy.validate({ ...payload, role })).rejects.toMatchObject({
+        status: 403,
+        response: { code: 'COLLEGE_INACTIVE' },
+      });
+      expect(shopAccess.hasApprovedShop).not.toHaveBeenCalled();
+    }
+  });
+
+  it('admits accounts of an active college, and a super administrator with none', async () => {
+    const active = build(
+      {
+        id: 'u1',
+        collegeId: 'college-a',
+        role: 'ADMIN',
+        status: 'ACTIVE',
+        studentProfile: null,
+        college: { status: 'ACTIVE' },
+      },
+      false,
+    );
+    await expect(active.strategy.validate({ ...payload, role: 'ADMIN' })).resolves.toMatchObject({
+      userId: 'u1',
+      role: 'ADMIN',
+    });
+
+    const root = build(
+      {
+        id: 'root',
+        collegeId: null,
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        studentProfile: null,
+        college: null,
+      },
+      false,
+    );
+    await expect(
+      root.strategy.validate({ sub: 'root', cid: null, role: 'SUPER_ADMIN', ver: false }),
+    ).resolves.toMatchObject({ userId: 'root', collegeId: null });
+  });
 });

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -12,6 +13,8 @@ import * as argon2 from 'argon2';
 import { PrismaService } from '../prisma/prisma.service';
 import { OtpService } from '../otp/otp.service';
 import { AuditAction, AuditService } from '../audit/audit.service';
+import { PRIVACY_NOTICE_VERSION, acceptedPrivacyVersion } from '../common/legal/privacy-notice';
+import { readPrivacyAcceptance } from './me';
 import type {
   AccessTokenPayload,
   RefreshTokenPayload,
@@ -96,6 +99,12 @@ export class AuthService {
    * approves the ID card.
    */
   async register(dto: RegisterDto, ctx: SessionContext): Promise<TokenPair & { userId: string }> {
+    // FR-PRIV-01: checked first, so a stale or missing acceptance is refused
+    // before anything is created.
+    const privacyVersion = acceptedPrivacyVersion(dto.privacyNoticeVersion, {
+      PRIVACY_ACCEPTANCE_REQUIRED: this.config.get<string>('PRIVACY_ACCEPTANCE_REQUIRED'),
+    });
+
     // The mobile OTP must have been issued for this number and consumed.
     const challenge = await this.prisma.otpChallenge.findUnique({
       where: { id: dto.mobileOtpChallengeId },
@@ -179,6 +188,23 @@ export class AuthService {
 
       await tx.riderReliability.create({ data: { userId: created.id } });
 
+      // FR-PRIV-01: version and timestamp of the acceptance. Held in the
+      // append-only audit log (the row's createdAt is the timestamp) until
+      // the user table has columns for it; in the same transaction, so an
+      // account cannot exist with its acceptance lost.
+      if (privacyVersion) {
+        await this.audit.recordInTransaction(tx, {
+          actorId: created.id,
+          collegeId: created.collegeId,
+          action: AuditAction.PRIVACY_NOTICE_ACCEPTED,
+          targetType: 'user',
+          targetId: created.id,
+          detail: { version: privacyVersion, at: 'REGISTRATION' },
+          ipAddress: ctx.ipAddress,
+          userAgent: ctx.userAgent,
+        });
+      }
+
       return created;
     });
 
@@ -210,6 +236,7 @@ export class AuthService {
         failedLoginCount: true,
         lockedUntil: true,
         studentProfile: { select: { verificationStatus: true } },
+        college: { select: { status: true } },
       },
     });
 
@@ -259,6 +286,15 @@ export class AuthService {
     if (!passwordOk) {
       await this.recordFailedLogin(user.id, user.failedLoginCount, user.collegeId, ctx);
       throw genericFailure;
+    }
+
+    // FR-ADM-07: after the password is known to be right, so this does not
+    // tell a stranger which college a number belongs to.
+    if (user.college?.status === 'INACTIVE') {
+      throw new ForbiddenException({
+        code: 'COLLEGE_INACTIVE',
+        message: 'This college is not currently active on Hoppo.',
+      });
     }
 
     // Success clears the counter — FR-AUTH-06 says *consecutive* failures.
@@ -640,6 +676,140 @@ export class AuthService {
     });
 
     return { message: 'Your password has been changed. Please log in.' };
+  }
+
+  // =======================================================================
+  // Signed-in password change (S-50)
+  // =======================================================================
+
+  /**
+   * Change the password of a signed-in account.
+   *
+   * Ends every session the account has — including the one making the
+   * request — and issues a new pair for the caller. "Other devices are
+   * signed out" is then true by construction, rather than depending on
+   * working out which refresh token belongs to this device.
+   */
+  async changePassword(
+    userId: string,
+    dto: { currentPassword: string; newPassword: string },
+    ctx: SessionContext,
+  ): Promise<TokenPair & { sessionsRevoked: number; message: string }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        collegeId: true,
+        role: true,
+        passwordHash: true,
+        studentProfile: { select: { verificationStatus: true } },
+      },
+    });
+
+    const currentOk =
+      user !== null &&
+      (await argon2.verify(user.passwordHash, dto.currentPassword).catch(() => false));
+
+    if (!user || !currentOk) {
+      throw new ForbiddenException({
+        code: 'PASSWORD_INCORRECT',
+        message: 'Your current password is not correct.',
+      });
+    }
+
+    if (dto.newPassword === dto.currentPassword) {
+      throw new BadRequestException({
+        code: 'PASSWORD_UNCHANGED',
+        message: 'Choose a password different from your current one.',
+      });
+    }
+
+    const passwordHash = await argon2.hash(dto.newPassword, { type: argon2.argon2id });
+
+    const revoked = await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: userId },
+        data: { passwordHash, failedLoginCount: 0, lockedUntil: null },
+      });
+      const result = await tx.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      await this.audit.recordInTransaction(tx, {
+        actorId: userId,
+        collegeId: user.collegeId,
+        action: AuditAction.PASSWORD_CHANGED,
+        targetType: 'user',
+        targetId: userId,
+        detail: { sessionsRevoked: result.count },
+        ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+      });
+      return result.count;
+    });
+
+    const tokens = await this.issueTokens(
+      {
+        id: user.id,
+        collegeId: user.collegeId,
+        role: user.role,
+        isVerified: user.studentProfile?.verificationStatus === 'VERIFIED',
+      },
+      ctx,
+    );
+
+    return {
+      ...tokens,
+      sessionsRevoked: revoked,
+      message: 'Password changed. Your other devices have been signed out.',
+    };
+  }
+
+  // =======================================================================
+  // Privacy notice acceptance after registration (FR-PRIV-01)
+  // =======================================================================
+
+  /**
+   * Record that a signed-in user accepts the current notice.
+   *
+   * Recorded exactly as registration records it — a PRIVACY_NOTICE_ACCEPTED
+   * audit row whose timestamp is the acceptance time — so /auth/me and the
+   * data export read one kind of record. Accepting a version already
+   * accepted returns the existing acceptance and writes nothing.
+   */
+  async acceptPrivacyNotice(
+    user: { userId: string; collegeId: string | null },
+    version: string,
+    ctx: SessionContext,
+  ): Promise<{ version: string; acceptedAt: Date }> {
+    if (version !== PRIVACY_NOTICE_VERSION) {
+      throw new ConflictException({
+        code: 'PRIVACY_NOTICE_OUTDATED',
+        message: 'The privacy notice has been updated. Please read the current version.',
+        details: { currentVersion: PRIVACY_NOTICE_VERSION },
+      });
+    }
+
+    const existing = await readPrivacyAcceptance(this.prisma, user.userId);
+    if (existing?.version === version) return existing;
+
+    // recordInTransaction rather than record(): record() swallows a failed
+    // write, and "accepted" must not be reported unless it was stored.
+    await this.prisma.$transaction((tx) =>
+      this.audit.recordInTransaction(tx, {
+        actorId: user.userId,
+        collegeId: user.collegeId,
+        action: AuditAction.PRIVACY_NOTICE_ACCEPTED,
+        targetType: 'user',
+        targetId: user.userId,
+        detail: { version, at: 'IN_APP' },
+        ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+      }),
+    );
+
+    const stored = await readPrivacyAcceptance(this.prisma, user.userId);
+    return stored ?? { version, acceptedAt: new Date() };
   }
 
   // =======================================================================

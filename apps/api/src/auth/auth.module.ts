@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
-import { AuthController } from './auth.controller';
+import { AuthController, LegalController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { OtpModule } from '../otp/otp.module';
@@ -15,7 +15,7 @@ import { OtpModule } from '../otp/otp.module';
     JwtModule.register({}),
     OtpModule,
   ],
-  controllers: [AuthController],
+  controllers: [AuthController, LegalController],
   providers: [AuthService, JwtStrategy],
   exports: [AuthService],
 })
