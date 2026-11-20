@@ -317,6 +317,7 @@ export class AdminOrdersService {
             baseFeeMinor: true,
             feeMinor: true,
             broadcastRound: true,
+            broadcastCycle: true,
             distanceM: true,
             // The name of the drop point, not its coordinates.
             dropLabel: true,
@@ -330,6 +331,7 @@ export class AdminOrdersService {
             rider: PERSON,
             broadcasts: {
               select: {
+                cycle: true,
                 round: true,
                 radiusM: true,
                 feeMinor: true,
@@ -338,7 +340,7 @@ export class AdminOrdersService {
                 outcome: true,
                 resolvedAt: true,
               },
-              orderBy: { round: 'asc' },
+              orderBy: [{ cycle: 'asc' }, { round: 'asc' }],
             },
           },
         },
@@ -372,8 +374,17 @@ export class AdminOrdersService {
     });
 
     const task = order.task;
+    // A task that went back into the pool (abandoned, "keep waiting") has
+    // been searched for more than once; each search is a `cycle` with its own
+    // rounds 1..n. `rounds` lists every round of every search, oldest search
+    // first, because the history of failed searches is the point of keeping
+    // the table. The time to acceptance, though, is a statement about the
+    // search that produced the current assignment, so it is measured inside
+    // the latest cycle only — from that search's first round, not from a
+    // round sent for an earlier search that ended long before.
     const rounds = task?.broadcasts ?? [];
-    const firstSentAt = rounds[0]?.sentAt ?? task?.firstBroadcastAt ?? null;
+    const latestSearch = rounds.filter((r) => r.cycle === task?.broadcastCycle);
+    const firstSentAt = latestSearch[0]?.sentAt ?? task?.firstBroadcastAt ?? null;
 
     // Only the steps that happened, in the order they happened.
     const timeline = (
@@ -440,7 +451,12 @@ export class AdminOrdersService {
         : null,
       broadcast: {
         rounds,
+        // Every round ever sent for this order, across all searches.
         roundsSent: rounds.length,
+        // How many separate searches there have been (1 unless it went back
+        // into the pool), and how many rounds the latest one has used.
+        searches: task?.broadcastCycle ?? 0,
+        roundsInLatestSearch: latestSearch.length,
         // FR-ADM-05 "time to rider acceptance", for this one order.
         secondsToAcceptance:
           firstSentAt && task?.assignedAt

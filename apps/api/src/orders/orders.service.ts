@@ -868,6 +868,16 @@ export class OrdersService {
           data: {
             status: 'CREATED',
             broadcastRound: 0,
+            // A new search, so a new cycle. broadcast_log is keyed on
+            // (task, cycle, round): without this the fresh search's round 1
+            // would land on the finished search's round-1 row and rewrite
+            // it, losing the record of how the first search went
+            // (FR-DLV-09). It is part of THIS statement, not one of its own:
+            // the cycle moves if and only if this UPDATE is the one that
+            // returned the task to the pool, and `increment` is computed by
+            // the database from the row as it is, not from a value read
+            // earlier.
+            broadcastCycle: { increment: 1 },
             feeMinor: task?.baseFeeMinor ?? 0,
             currentProximityM: null,
             offerExpiresAt: null,

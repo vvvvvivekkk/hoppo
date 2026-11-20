@@ -764,7 +764,7 @@ describe('GET /admin/orders/:orderId', () => {
       expect(d.dropLabel).toBe('Boys Hostel B');
       expect(d.rider).toMatchObject({ name: 'Ravi Rider' });
 
-      expect(d.broadcast.roundsSent).toBe(1);
+      expect(d.broadcast).toMatchObject({ roundsSent: 1, searches: 1, roundsInLatestSearch: 1 });
       expect(d.broadcast.rounds[0]).toMatchObject({
         round: 1,
         radiusM: 1500,
@@ -805,6 +805,94 @@ describe('GET /admin/orders/:orderId', () => {
       expect(d).toMatchObject({ cancelledBy: 'SHOP', cancelledReason: 'spec', rider: null });
       expect(d.broadcast).toMatchObject({ roundsSent: 0, secondsToAcceptance: null });
       expect(d.walletEntries).toEqual([]);
+    });
+  });
+
+  it('keeps the searches apart: every round is listed, acceptance is timed within the latest search', async () => {
+    await inRolledBackTransaction(async (w) => {
+      // o1's delivery, retold: the first search's round 1 was accepted and the
+      // rider then abandoned it; the task went back into the pool and a second
+      // search (cycle 2) found the rider who delivered.
+      const task = await w.tx.task.findUniqueOrThrow({
+        where: { orderId: w.id.o1 },
+        select: { id: true, assignedAt: true },
+      });
+      const assignedAt = task.assignedAt!;
+      const longAgo = new Date(assignedAt.getTime() - 900_000);
+
+      await w.tx.broadcastLog.updateMany({
+        where: { taskId: task.id, cycle: 1, round: 1 },
+        data: { sentAt: longAgo, resolvedAt: new Date(longAgo.getTime() + 20_000) },
+      });
+      // Same task, same round number, different cycle: only possible because
+      // the unique key is (task, cycle, round).
+      await w.tx.broadcastLog.create({
+        data: {
+          taskId: task.id, cycle: 2, round: 1, radiusM: 1500, feeMinor: 2000, eligibleCount: 2,
+          sentAt: new Date(assignedAt.getTime() - 90_000), outcome: 'EXPIRED',
+          resolvedAt: new Date(assignedAt.getTime() - 30_000),
+        },
+      });
+      await w.tx.broadcastLog.create({
+        data: {
+          taskId: task.id, cycle: 2, round: 2, radiusM: 2500, feeMinor: 2500, eligibleCount: 4,
+          sentAt: new Date(assignedAt.getTime() - 30_000), outcome: 'ACCEPTED',
+          resolvedAt: assignedAt,
+        },
+      });
+      await w.tx.task.update({ where: { id: task.id }, data: { broadcastCycle: 2, broadcastRound: 2 } });
+
+      const d = await w.report.detail(w.adminA, w.id.o1);
+
+      expect(d.broadcast.rounds.map((r) => [r.cycle, r.round, r.outcome])).toEqual([
+        [1, 1, 'ACCEPTED'],
+        [2, 1, 'EXPIRED'],
+        [2, 2, 'ACCEPTED'],
+      ]);
+      expect(d.broadcast).toMatchObject({ roundsSent: 3, searches: 2, roundsInLatestSearch: 2 });
+      // From the second search's first round (90 s before assignment) — not
+      // from the first search's round, which would say 900.
+      expect(d.broadcast.secondsToAcceptance).toBe(90);
+    });
+  });
+
+  it('orders the rounds by search first, then by round — whatever order the rows were written in', async () => {
+    await inRolledBackTransaction(async (w) => {
+      const task = await w.tx.task.findUniqueOrThrow({
+        where: { orderId: w.id.o1 },
+        select: { id: true, assignedAt: true },
+      });
+      const at = (secondsBefore: number) =>
+        new Date(task.assignedAt!.getTime() - secondsBefore * 1000);
+      const row = (cycle: number, round: number, sentAt: Date, outcome: 'EXPIRED' | 'ACCEPTED') =>
+        w.tx.broadcastLog.create({
+          data: {
+            taskId: task.id, cycle, round, radiusM: 1500, feeMinor: 2000, eligibleCount: 1,
+            sentAt, outcome, resolvedAt: sentAt,
+          },
+        });
+
+      // The fixture already holds cycle 1 round 1. The rest go in out of
+      // order on purpose: the second search's round 1 first, then the first
+      // search's round 3, then its round 2. Neither insertion order nor
+      // `round` alone gives the right sequence — sorting by round only would
+      // put cycle 2's round 1 ahead of cycle 1's rounds 2 and 3.
+      await row(2, 1, at(60), 'ACCEPTED');
+      await row(1, 3, at(600), 'EXPIRED');
+      await row(1, 2, at(700), 'EXPIRED');
+      await w.tx.task.update({ where: { id: task.id }, data: { broadcastCycle: 2, broadcastRound: 1 } });
+
+      const d = await w.report.detail(w.adminA, w.id.o1);
+
+      expect(d.broadcast.rounds.map((r) => `${r.cycle}.${r.round}`)).toEqual([
+        '1.1',
+        '1.2',
+        '1.3',
+        '2.1',
+      ]);
+      expect(d.broadcast).toMatchObject({ roundsSent: 4, searches: 2, roundsInLatestSearch: 1 });
+      // Timed inside the latest search: its only round went out 60 s before assignment.
+      expect(d.broadcast.secondsToAcceptance).toBe(60);
     });
   });
 });

@@ -1084,8 +1084,8 @@ model Task {
 model BroadcastLog {
   id     String @id @default(uuid())
   taskId String @map("task_id")
-  /// The task's broadcastCycle when this round was sent. Not yet part of the
-  /// unique key below — see migration 20261121090000_privacy_and_broadcast_cycle.
+  /// The task's broadcastCycle when this round was sent. Part of the unique
+  /// key below since migration 20261121100000_broadcast_log_cycle_key.
   cycle  Int @default(1)
   round  Int
   radiusM Int   @map("radius_m")
@@ -1098,7 +1098,11 @@ model BroadcastLog {
 
   task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
-  @@unique([taskId, round])
+  /// One row per round of each search. `cycle` is in the key so that a task
+  /// which returns to the pool starts a new set of rows instead of rewriting
+  /// the finished search's (FR-DLV-09). In Prisma queries the compound key is
+  /// named `taskId_cycle_round`.
+  @@unique([taskId, cycle, round])
   @@index([taskId])
   @@map("broadcast_log")
 }

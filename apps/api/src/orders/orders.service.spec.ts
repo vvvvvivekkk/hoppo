@@ -50,6 +50,8 @@ function apply(row: Row, data: Row): void {
   for (const [key, value] of Object.entries(data)) {
     if (value !== null && typeof value === 'object' && 'decrement' in value) {
       row[key] -= value.decrement as number;
+    } else if (value !== null && typeof value === 'object' && 'increment' in value) {
+      row[key] += value.increment as number;
     } else {
       row[key] = value;
     }
@@ -73,7 +75,13 @@ function build(seed: { order?: Row; task?: Row; entries?: Row[]; logs?: Row[] } 
     shopListing: { college: { config: null } },
     ...seed.order,
   };
-  const task: Row = { id: 'task-1', status: 'CREATED', baseFeeMinor: 1000, ...seed.task };
+  const task: Row = {
+    id: 'task-1',
+    status: 'CREATED',
+    baseFeeMinor: 1000,
+    broadcastCycle: 1,
+    ...seed.task,
+  };
   const entries: Row[] = seed.entries ?? [
     // The hold written at placement: 5000 in the wallet, 3500 held.
     {
@@ -370,6 +378,82 @@ describe('keep waiting after no rider was found', () => {
     expect(ctx.logs.map((l) => l.outcome)).toEqual(['EXPIRED', 'EXPIRED']);
     expect(ctx.logs[1].resolvedAt).toBeInstanceOf(Date);
     expect(ctx.task).toMatchObject({ status: 'CREATED', broadcastRound: 0, feeMinor: 1000 });
+  });
+});
+
+describe('keep waiting starts a new search cycle', () => {
+  const waiting = () =>
+    build({
+      order: { status: 'PREPARING', paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      task: { status: 'UNFULFILLED', broadcastCycle: 1, broadcastRound: 3 },
+      entries: [],
+      logs: [{ taskId: 'task-1', cycle: 1, round: 3, outcome: 'EXPIRED' }],
+    });
+
+  it('moves the task to the next cycle, so its round 1 cannot land on the old round 1', async () => {
+    const ctx = waiting();
+
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING');
+
+    // Goes red without the increment: the task would re-enter the pool still
+    // on cycle 1 and the dispatcher would rewrite the finished search's rows.
+    expect(ctx.task).toMatchObject({ status: 'CREATED', broadcastRound: 0, broadcastCycle: 2 });
+  });
+
+  it('does it in the same conditional UPDATE that returns the task to the pool', async () => {
+    const ctx = waiting();
+
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING');
+
+    // One write to the task, and it carries both the status predicate and
+    // the increment — not a second statement, and not a value read earlier.
+    expect(ctx.prisma.task.updateMany).toHaveBeenCalledTimes(1);
+    expect(ctx.prisma.task.update).not.toHaveBeenCalled();
+    expect(ctx.prisma.task.updateMany).toHaveBeenCalledWith({
+      where: { id: 'task-1', status: 'UNFULFILLED' },
+      data: expect.objectContaining({
+        status: 'CREATED',
+        broadcastCycle: { increment: 1 },
+      }),
+    });
+  });
+
+  it('counts each return to the pool once, however often it happens', async () => {
+    const ctx = waiting();
+
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING');
+    ctx.task.status = 'UNFULFILLED'; // the second search ran out of riders too
+    await ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING');
+
+    expect(ctx.task.broadcastCycle).toBe(3);
+  });
+
+  it('leaves the cycle alone when the request loses the race', async () => {
+    const ctx = waiting();
+    ctx.afterOrderRead(1, ({ task }) => {
+      task.status = 'CANCELLED';
+    });
+
+    expectConflict(
+      await rejection(ctx.service.resolveUnfulfilled(STUDENT, 'order-1', 'KEEP_WAITING')),
+      'NOT_UNFULFILLED',
+    );
+
+    expect(ctx.task).toMatchObject({ status: 'CANCELLED', broadcastCycle: 1 });
+  });
+
+  it('no other way out of UNFULFILLED starts a new cycle', async () => {
+    const cancelled = waiting();
+    await cancelled.service.resolveUnfulfilled(STUDENT, 'order-1', 'CANCEL');
+    expect(cancelled.task.broadcastCycle).toBe(1);
+
+    const collected = build({
+      order: { status: 'READY', paymentMethod: 'CASH', paymentStatus: 'NOT_REQUIRED' },
+      task: { status: 'UNFULFILLED' },
+      entries: [],
+    });
+    await collected.service.resolveUnfulfilled(STUDENT, 'order-1', 'COLLECT_IN_PERSON');
+    expect(collected.task.broadcastCycle).toBe(1);
   });
 });
 
