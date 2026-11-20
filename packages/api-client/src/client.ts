@@ -62,6 +62,13 @@ interface RequestOptions {
 export class ApiClient {
   private refreshInFlight: Promise<boolean> | null = null;
 
+  /**
+   * Why the last refresh was refused, when the API said. A refresh refused
+   * with `COLLEGE_INACTIVE` explains the sign-out better than the expired
+   * 401 that triggered it, so `onAuthFailure` is handed this instead.
+   */
+  private refreshRefusal: ApiError | null = null;
+
   constructor(private readonly options: ApiClientOptions) {}
 
   get baseUrl(): string {
@@ -122,7 +129,32 @@ export class ApiClient {
       try {
         return await this.unwrap<T>(response);
       } catch (error) {
-        this.options.onAuthFailure?.(error instanceof ApiError ? error : undefined);
+        const refusal = this.refreshRefusal;
+        this.options.onAuthFailure?.(
+          refusal?.code === 'COLLEGE_INACTIVE'
+            ? refusal
+            : error instanceof ApiError
+              ? error
+              : undefined,
+        );
+        throw error;
+      }
+    }
+
+    // FR-ADM-07: a deactivated college's users are answered 403
+    // COLLEGE_INACTIVE on every request. It is a 403, so it never reaches the
+    // branch above, but it means the same as a suspended account's 401: the
+    // session is over and refreshing cannot help (the refresh is refused with
+    // the same code). End it the same way. An anonymous request (login) has
+    // no session to end and just gets the error.
+    if (response.status === 403 && !opts.anonymous) {
+      try {
+        return await this.unwrap<T>(response);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 'COLLEGE_INACTIVE') {
+          await this.options.tokens.clear();
+          this.options.onAuthFailure?.(error);
+        }
         throw error;
       }
     }
@@ -196,6 +228,7 @@ export class ApiClient {
 
     this.refreshInFlight = (async () => {
       const current = this.options.tokens.get();
+      this.refreshRefusal = null;
       if (!current?.refreshToken) return false;
 
       try {
@@ -205,8 +238,18 @@ export class ApiClient {
           body: JSON.stringify({ refreshToken: current.refreshToken }),
         });
 
-        if (!response.ok) return false;
+        if (!response.ok) {
+          const body = (await response.json().catch(() => null)) as ApiErrorBody | null;
+          this.refreshRefusal = new ApiError(
+            response.status,
+            body?.code ?? 'ERROR',
+            body?.message ?? response.statusText,
+            body?.details,
+          );
+          return false;
+        }
 
+        this.refreshRefusal = null;
         const tokens = (await response.json()) as TokenPair;
         await this.options.tokens.set(tokens);
         return true;

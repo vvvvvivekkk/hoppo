@@ -193,3 +193,12 @@ assertType<Equal<Escalation['resolvedAt'], string | null | undefined>>();
 assertType<Equal<Escalation['resolutionNote'], string | null | undefined>>();
 // The contract says an escalated task always names its rider.
 assertType<Equal<null extends Escalation['rider'] ? true : false, false>>();
+
+// ---------------------------------------------------------------------------
+// Round five: account deletion (A5 section 9) and escalation refunds (A2 rev 2).
+// ---------------------------------------------------------------------------
+assertType<Equal<AccountDeletion['storedFiles'], { expected: number; removed: number }>>();
+assertType<Equal<AccountDeletion['caveats'], string[]>>();
+assertType<Equal<AccountDeletion['erased'], string[]>>();
+// What a NOT_DELIVERED on a wallet order returned to the student.
+assertType<Equal<EscalationResolution['refundedMinor'], number>>();

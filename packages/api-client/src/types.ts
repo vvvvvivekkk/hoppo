@@ -858,7 +858,7 @@ export interface Escalation {
     shopName: string;
     items: { name: string; quantity: number }[];
   } | null;
-  /** The outcomes the server will accept right now: render buttons from this. */
+  /** Both outcomes while ESCALATED, empty once resolved: render buttons from this. */
   canResolveAs: EscalationOutcome[];
   /** Both present only once the task has been resolved. */
   resolutionNote?: string | null;
@@ -874,6 +874,7 @@ export interface EscalationResolution {
   resolvedAt: string;
   riderFeeMinor: number;
   settledInCash: boolean;
+  /** NOT_DELIVERED on a wallet-paid order: the total credited back to the student. Otherwise 0. */
   refundedMinor: number;
   message: string;
 }
@@ -1331,9 +1332,17 @@ export interface ProfileUpdate {
 export interface AccountDeletion {
   status: 'DEACTIVATED';
   deletedAt: string;
-  /** Human-readable names of what was scrubbed and what was kept. */
+  /** Human-readable phrases for what was scrubbed and what was kept: show them, never match on them. */
   erased: string[];
   retained: string[];
+  /** Identity documents and profile photo in file storage: how many there were, how many were removed. */
+  storedFiles: { expected: number; removed: number };
+  /**
+   * What the deletion could not do, to show to the user. Always says that
+   * past audit entries cannot be altered; also says so when `storedFiles`
+   * shows files that could not be removed.
+   */
+  caveats: string[];
   message: string;
 }
 

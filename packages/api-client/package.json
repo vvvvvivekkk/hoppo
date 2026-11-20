@@ -7,7 +7,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/errors.test.mjs test/endpoints.test.mjs",
+    "test": "node --test test/errors.test.mjs test/endpoints.test.mjs test/client.test.mjs",
     "lint": "eslint \"src/**/*.ts\" --config ../../eslint.config.mjs --max-warnings 0"
   },
   "dependencies": {

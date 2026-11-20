@@ -33,13 +33,21 @@ export class ApiError extends Error {
    * the test here is the status rather than that string, so it does not
    * depend on the spelling. A 403 such as `PASSWORD_INCORRECT` (a wrong
    * current password) or `SHOP_NOT_APPROVED` is not an auth failure.
+   *
+   * The one 403 that is: `COLLEGE_INACTIVE`, which the API answers on every
+   * request, at login and at refresh once a college has been deactivated
+   * (FR-ADM-07). The tokens are dead and nothing the user does revives them,
+   * exactly as for a suspended account. The same code with a 409 is something
+   * else — a super administrator adding an admin to an inactive college —
+   * and is not a session failure.
    */
   get isAuthFailure(): boolean {
     return (
       this.status === 401 ||
       ['ACCOUNT_SUSPENDED', 'ACCOUNT_DEACTIVATED', 'REFRESH_INVALID', 'REFRESH_REUSED'].includes(
         this.code,
-      )
+      ) ||
+      (this.status === 403 && this.code === 'COLLEGE_INACTIVE')
     );
   }
 

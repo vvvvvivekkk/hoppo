@@ -93,6 +93,38 @@ test('401 UNAUTHENTICATED ends the session; 403 PASSWORD_INCORRECT does not', ()
   assert.equal(wrong.isRetryable, false);
 });
 
+test('403 COLLEGE_INACTIVE ends the session, like a suspended account', () => {
+  // jwt.strategy.ts and auth.service.ts (login, refresh) answer a deactivated
+  // college's users with 403 COLLEGE_INACTIVE: their tokens are dead.
+  const e = err('COLLEGE_INACTIVE', 403);
+  assert.equal(e.isAuthFailure, true);
+  assert.equal(e.isRetryable, false);
+  // It is the college that is blocked, not the account.
+  assert.equal(e.accountBlocked, null);
+  // For comparison, the case it is modelled on.
+  assert.equal(err('ACCOUNT_SUSPENDED', 401).isAuthFailure, true);
+});
+
+test('409 COLLEGE_INACTIVE is a refused action, not a dead session', () => {
+  // platform.service.ts: a super administrator adding an admin to an
+  // inactive college. Their own session is fine.
+  assert.equal(err('COLLEGE_INACTIVE', 409).isAuthFailure, false);
+});
+
+test('losing an admin race or deleting as a non-student is not an auth failure', () => {
+  for (const [code, status] of [
+    ['ALREADY_DECIDED', 409],
+    ['NOT_ACTIVE', 409],
+    ['NOT_SUSPENDED', 409],
+    ['ALREADY_SUSPENDED', 409],
+    ['ALREADY_RESOLVED', 409],
+    ['ACCOUNT_DELETION_NOT_AVAILABLE', 403],
+    ['FORBIDDEN', 403],
+  ]) {
+    assert.equal(err(code, status).isAuthFailure, false, code);
+  }
+});
+
 test('the getter removed in round two stays removed', () => {
   assert.equal('isAccountBlocked' in err('ACCOUNT_SUSPENDED', 401), false);
 });
